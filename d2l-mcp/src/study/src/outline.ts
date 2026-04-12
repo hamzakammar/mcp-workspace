@@ -61,7 +61,7 @@ function formatOutlineForLLM(outline: ParsedOutline): object {
 export const OutlineTools = {
 
   outline_login: {
-    description: `Log in to outline.uwaterloo.ca using your saved WatIAM credentials. Call this if outline tools are failing due to authentication issues. Uses the same username and password already stored for D2L — no extra setup needed. If a Duo push is required, you'll get a notification on your phone.`,
+    description: `Manually trigger a headless login to outline.uwaterloo.ca. WARNING: this will send a Duo push notification to the user's phone. Only call this if the user explicitly asks to reconnect outline or says they are expecting a Duo push. The preferred path is for the user to tap Relogin in the Horizon app — outline connects automatically during D2L VNC login with no Duo push needed.`,
     schema: {},
     handler: async ({ userId }: { userId: string }): Promise<string> => {
       try {

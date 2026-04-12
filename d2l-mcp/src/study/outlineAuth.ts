@@ -407,11 +407,9 @@ export async function getOrRefreshOutlineCookies(userId: string): Promise<string
   const stored = await getOutlineCookies(userId);
   if (stored) return stored;
 
-  console.error(`[OUTLINE_AUTH] No valid stored cookie for user ${userId}, attempting login`);
-  const fresh = await loginToOutline(userId);
-  if (fresh) return fresh;
-
+  // Do NOT fall back to headless login here — it silently triggers a Duo push.
+  // Outline sessions are captured automatically during D2L VNC login.
   throw new Error(
-    "Outline authentication failed. Please connect your outline.uwaterloo.ca account via the app."
+    "Outline not connected. Open the Horizon app and tap Relogin — your course outlines will connect automatically during D2L login."
   );
 }
