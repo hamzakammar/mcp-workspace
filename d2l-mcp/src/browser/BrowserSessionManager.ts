@@ -383,6 +383,51 @@ export class BrowserSessionManager {
       // Clear the duo_required flag since we just successfully re-authed
       await clearDuoRequired(userId).catch(() => {});
 
+      // Piggyback: navigate to outline.uwaterloo.ca in the same browser context.
+      // The active Duo session means the OIDC flow completes without a new push.
+      try {
+        const outlinePage = await context.newPage();
+        await outlinePage.goto("https://outline.uwaterloo.ca/", {
+          waitUntil: "domcontentloaded",
+          timeout: 15000,
+        });
+        await outlinePage.waitForTimeout(2000);
+        const outlineUrl = outlinePage.url();
+        console.error(`[VNC] Outline landing URL for user ${userId}: ${outlineUrl}`);
+
+        if (outlineUrl.includes("outline.uwaterloo.ca") && !outlineUrl.includes("oidc/login")) {
+          const allCookies = await context.cookies(["https://outline.uwaterloo.ca"]);
+          const sessionid = allCookies.find(c => c.name === "sessionid" && c.domain.includes("outline.uwaterloo.ca"))?.value;
+          if (sessionid && sbUrl && sbKey) {
+            await fetch(`${sbUrl}/rest/v1/user_credentials`, {
+              method: "POST",
+              headers: {
+                "apikey": sbKey,
+                "Authorization": `Bearer ${sbKey}`,
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates",
+              },
+              body: JSON.stringify({
+                user_id: userId,
+                service: "outline",
+                host: "outline.uwaterloo.ca",
+                token: JSON.stringify({ sessionid }),
+                duo_required_at: null,
+                updated_at: new Date().toISOString(),
+              }),
+            });
+            console.error(`[VNC] Captured outline.uwaterloo.ca session for user ${userId}`);
+          } else {
+            console.error(`[VNC] No outline sessionid found for user ${userId} — will retry on first outline tool call`);
+          }
+        } else {
+          console.error(`[VNC] Outline OIDC did not complete for user ${userId} (url=${outlineUrl}) — will retry on first use`);
+        }
+        await outlinePage.close();
+      } catch (outlineErr: any) {
+        console.error(`[VNC] Outline capture failed for user ${userId}: ${outlineErr?.message}`);
+      }
+
       // Close after 3s so user can see the logged-in state
       setTimeout(() => BrowserSessionManager.closeSession(sessionId), 3000);
 
