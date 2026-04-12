@@ -2294,4 +2294,146 @@ router.delete("/api-keys/:id", async (req: Request, res: Response) => {
   res.json({ status: "revoked" });
 });
 
+// ─── Outline routes ───────────────────────────────────────────────────────────
+
+/** POST /api/outline/connect — Store outline.uwaterloo.ca credentials and attempt headless login */
+router.post("/outline/connect", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  const { username, password } = req.body || {};
+
+  if (!username || !password) {
+    res.status(400).json({ error: "username and password are required" });
+    return;
+  }
+
+  try {
+    const { error } = await supabase
+      .from("user_credentials")
+      .upsert({
+        user_id: userId,
+        service: "outline",
+        host: "outline.uwaterloo.ca",
+        username,
+        password,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "user_id,service" });
+
+    if (error) {
+      console.error("[API] outline/connect upsert error:", error);
+      res.status(500).json({ error: "Failed to store credentials" });
+      return;
+    }
+
+    // Attempt immediate headless login to verify credentials and capture session cookie
+    let loginStatus = "credentials_stored";
+    try {
+      const { loginToOutline } = await import("../study/outlineAuth.js");
+      const cookie = await loginToOutline(userId);
+      if (cookie) {
+        loginStatus = "connected";
+      } else {
+        loginStatus = "credentials_stored_duo_required";
+      }
+    } catch (loginErr: any) {
+      console.error("[API] outline/connect login attempt error:", loginErr?.message);
+      loginStatus = "credentials_stored_login_pending";
+    }
+
+    res.json({
+      status: loginStatus,
+      message: loginStatus === "connected"
+        ? "Connected to outline.uwaterloo.ca successfully"
+        : "Credentials stored. Login will complete when outline tools are first used.",
+    });
+  } catch (e) {
+    console.error("[API] outline/connect error:", e);
+    res.status(500).json({ error: "Unexpected error", details: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+/** POST /api/outline/connect-cookie — Store outline session cookie directly (from WebView) */
+router.post("/outline/connect-cookie", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  const { cookies } = req.body || {};
+
+  if (!cookies || typeof cookies !== "string") {
+    res.status(400).json({ error: "cookies string is required" });
+    return;
+  }
+
+  const sessionMatch = cookies.match(/sessionid=([^;]+)/);
+  if (!sessionMatch) {
+    res.status(400).json({ error: "Invalid cookies: sessionid not found" });
+    return;
+  }
+  const sessionid = sessionMatch[1];
+
+  // Validate cookie before storing
+  try {
+    const testResp = await fetch("https://outline.uwaterloo.ca/", {
+      headers: { "Cookie": `sessionid=${sessionid}` },
+      redirect: "manual",
+    });
+    const location = testResp.headers.get("location") || "";
+    if (location.includes("oidc/login") || location.includes("duosecurity")) {
+      res.status(400).json({ error: "Cookie is invalid or expired" });
+      return;
+    }
+  } catch (e) {
+    res.status(502).json({ error: "Could not reach outline.uwaterloo.ca to validate cookie" });
+    return;
+  }
+
+  const { error } = await supabase
+    .from("user_credentials")
+    .upsert({
+      user_id: userId,
+      service: "outline",
+      host: "outline.uwaterloo.ca",
+      token: JSON.stringify({ sessionid }),
+      updated_at: new Date().toISOString(),
+    }, { onConflict: "user_id,service" });
+
+  if (error) {
+    console.error("[API] outline/connect-cookie upsert error:", error);
+    res.status(500).json({ error: "Failed to store cookie" });
+    return;
+  }
+
+  res.json({ status: "connected", message: "outline.uwaterloo.ca connected via cookie" });
+});
+
+/** GET /api/outline/status — Check outline connection status */
+router.get("/outline/status", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  try {
+    const { data } = await supabase
+      .from("user_credentials")
+      .select("token, duo_required_at, updated_at")
+      .eq("user_id", userId)
+      .eq("service", "outline")
+      .limit(1);
+
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row) {
+      res.json({ connected: false });
+      return;
+    }
+
+    let hasToken = false;
+    try {
+      const parsed = JSON.parse(row.token || "{}");
+      hasToken = !!parsed.sessionid;
+    } catch { /* no token yet */ }
+
+    res.json({
+      connected: hasToken && !row.duo_required_at,
+      duoRequired: !!row.duo_required_at,
+      lastUpdated: row.updated_at,
+    });
+  } catch (e) {
+    res.json({ connected: false });
+  }
+});
+
 export default router;

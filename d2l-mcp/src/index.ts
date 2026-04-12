@@ -24,6 +24,7 @@ import { PlanningTools } from "./study/src/planning.js";
 import { NotesTools } from "./study/src/notes.js";
 import { SyncTools } from "./study/src/sync.js";
 import { PiazzaTools } from "./study/src/piazza.js";
+import { OutlineTools } from "./study/src/outline.js";
 import { getUserId, runWithUserId } from "./utils/userContext.js";
 import { embedText } from "./rag/embeddings.js";
 import { semanticSearch } from "./rag/vectorStore.js";
@@ -439,6 +440,28 @@ function createServer(): McpServer {
     PiazzaTools.piazza_suggest_for_item.description,
     PiazzaTools.piazza_suggest_for_item.schema,
     wrapStudyToolHandler("piazza_suggest_for_item", PiazzaTools.piazza_suggest_for_item.handler)
+  );
+
+  // Register outline tools (outline.uwaterloo.ca)
+  server.tool(
+    "get_course_outline",
+    OutlineTools.get_course_outline.description,
+    OutlineTools.get_course_outline.schema,
+    wrapStudyToolHandler("get_course_outline", OutlineTools.get_course_outline.handler)
+  );
+
+  server.tool(
+    "get_my_course_outlines",
+    OutlineTools.get_my_course_outlines.description,
+    OutlineTools.get_my_course_outlines.schema,
+    wrapStudyToolHandler("get_my_course_outlines", OutlineTools.get_my_course_outlines.handler)
+  );
+
+  server.tool(
+    "get_cached_outline",
+    OutlineTools.get_cached_outline.description,
+    OutlineTools.get_cached_outline.schema,
+    wrapStudyToolHandler("get_cached_outline", OutlineTools.get_cached_outline.handler)
   );
 
   return server;
