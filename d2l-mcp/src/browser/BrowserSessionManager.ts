@@ -391,7 +391,16 @@ export class BrowserSessionManager {
           waitUntil: "domcontentloaded",
           timeout: 15000,
         });
-        await outlinePage.waitForTimeout(2000);
+        // Wait for OIDC redirect to complete — SSO session is shared with D2L so no Duo push needed.
+        // Give it up to 20s for the redirect chain to finish.
+        try {
+          await outlinePage.waitForURL(
+            url => url.hostname === "outline.uwaterloo.ca" && !url.pathname.includes("oidc"),
+            { timeout: 20000 }
+          );
+        } catch {
+          // Timed out — fall through and check URL anyway
+        }
         const outlineUrl = outlinePage.url();
         console.error(`[VNC] Outline landing URL for user ${userId}: ${outlineUrl}`);
 

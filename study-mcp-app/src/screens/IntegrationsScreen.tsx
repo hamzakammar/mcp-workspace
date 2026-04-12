@@ -1,16 +1,45 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TouchableOpacity,
   ScrollView,
+  ActivityIndicator,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { AntDesign } from '@expo/vector-icons';
+import { outlineService, OutlineStatus } from '../services/outline';
 
 export default function IntegrationsScreen() {
   const navigation = useNavigation<any>();
+  const [outlineStatus, setOutlineStatus] = useState<OutlineStatus | null>(null);
+  const [outlineLoading, setOutlineLoading] = useState(true);
+  const [retrying, setRetrying] = useState(false);
+
+  const fetchOutlineStatus = useCallback(async () => {
+    const status = await outlineService.getStatus();
+    setOutlineStatus(status);
+    setOutlineLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchOutlineStatus();
+  }, [fetchOutlineStatus]);
+
+  const handleRetryOutline = async () => {
+    setRetrying(true);
+    try {
+      await outlineService.connect();
+      await fetchOutlineStatus();
+    } catch {
+      // status fetch will reflect whatever state we're in
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  const outlineConnected = outlineStatus?.connected === true;
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.contentContainer}>
@@ -43,6 +72,49 @@ export default function IntegrationsScreen() {
             <Text style={styles.connectButtonText}>Manage Connection</Text>
             <AntDesign name="arrowright" size={16} color="#fff" />
           </TouchableOpacity>
+        </View>
+
+        {/* Course Outlines Card */}
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <View style={[styles.iconContainer, { backgroundColor: '#f0fdf4' }]}>
+              <AntDesign name="filetext1" size={28} color="#22c55e" />
+            </View>
+            <View style={styles.cardTitleContainer}>
+              <Text style={styles.cardTitle}>Course Outlines</Text>
+              {outlineLoading ? (
+                <ActivityIndicator size="small" color="#22c55e" style={{ alignSelf: 'flex-start', marginTop: 2 }} />
+              ) : (
+                <View style={styles.statusRow}>
+                  <View style={[styles.statusDot, { backgroundColor: outlineConnected ? '#22c55e' : '#94a3b8' }]} />
+                  <Text style={[styles.cardStatus, { color: outlineConnected ? '#22c55e' : '#94a3b8' }]}>
+                    {outlineConnected ? 'Connected' : 'Not connected'}
+                  </Text>
+                </View>
+              )}
+            </View>
+          </View>
+          <Text style={styles.cardDescription}>
+            {outlineConnected
+              ? 'Automatically connected via your D2L login — assessment weights, schedules, and instructor info are available.'
+              : 'Connects automatically when you log in to D2L. If it\'s been a while, tap Retry below.'}
+          </Text>
+          {!outlineLoading && !outlineConnected && (
+            <TouchableOpacity
+              style={[styles.connectButton, { backgroundColor: '#22c55e' }, retrying && styles.buttonDisabled]}
+              onPress={handleRetryOutline}
+              disabled={retrying}
+            >
+              {retrying ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <>
+                  <Text style={styles.connectButtonText}>Retry Connection</Text>
+                  <AntDesign name="reload1" size={16} color="#fff" />
+                </>
+              )}
+            </TouchableOpacity>
+          )}
         </View>
 
         {/* Piazza Card */}
@@ -135,6 +207,16 @@ const styles = StyleSheet.create({
     color: '#1e293b',
     marginBottom: 2,
   },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
   cardStatus: {
     fontSize: 13,
     color: '#6366f1',
@@ -159,5 +241,8 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 15,
     fontWeight: '600',
+  },
+  buttonDisabled: {
+    opacity: 0.6,
   },
 });
