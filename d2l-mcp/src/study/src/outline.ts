@@ -60,6 +60,27 @@ function formatOutlineForLLM(outline: ParsedOutline): object {
 
 export const OutlineTools = {
 
+  outline_login: {
+    description: `Log in to outline.uwaterloo.ca using your saved WatIAM credentials. Call this if outline tools are failing due to authentication issues. Uses the same username and password already stored for D2L — no extra setup needed. If a Duo push is required, you'll get a notification on your phone.`,
+    schema: {},
+    handler: async ({ userId }: { userId: string }): Promise<string> => {
+      try {
+        const { loginToOutline } = await import("../outlineAuth.js");
+        const cookie = await loginToOutline(userId);
+        if (cookie) {
+          return JSON.stringify({ success: true, message: "Logged in to outline.uwaterloo.ca successfully." }, null, 2);
+        }
+        return JSON.stringify({
+          success: false,
+          message: "Login attempted but requires Duo approval. Check your phone for a push notification.",
+          duoRequired: true,
+        }, null, 2);
+      } catch (e: any) {
+        return JSON.stringify({ success: false, error: e.message }, null, 2);
+      }
+    },
+  },
+
   get_course_outline: {
     description: `Fetch and parse a course outline from outline.uwaterloo.ca. Returns structured data including assessments (with weights and due dates), weekly schedule, instructor info, and learning objectives. Requires the course code (e.g. "CS135", "MATH135") and term (e.g. "1251" for Winter 2025, "2509" for Fall 2025). Use get_my_course_outlines to fetch all enrolled courses at once.`,
     schema: {

@@ -75,6 +75,7 @@ async function saveOutlineStateToS3(userId: string, statePath: string): Promise<
 // ─── Credential retrieval ─────────────────────────────────────────────────────
 
 async function getOutlineCredentials(userId: string): Promise<{ username: string; password: string } | null> {
+  // Try outline-specific credentials first
   const { data, error } = await supabase
     .from("user_credentials")
     .select("username, password")
@@ -82,8 +83,24 @@ async function getOutlineCredentials(userId: string): Promise<{ username: string
     .eq("service", "outline")
     .single();
 
-  if (error || !data?.username || !data?.password) return null;
-  return { username: data.username, password: data.password };
+  if (!error && data?.username && data?.password) {
+    return { username: data.username, password: data.password };
+  }
+
+  // Fall back to D2L credentials — same WatIAM username/password
+  const { data: d2l, error: d2lErr } = await supabase
+    .from("user_credentials")
+    .select("username, password")
+    .eq("user_id", userId)
+    .eq("service", "d2l")
+    .single();
+
+  if (!d2lErr && d2l?.username && d2l?.password) {
+    console.error(`[OUTLINE_AUTH] Using D2L credentials for outline login (user ${userId})`);
+    return { username: d2l.username, password: d2l.password };
+  }
+
+  return null;
 }
 
 // ─── Cookie validation ────────────────────────────────────────────────────────
