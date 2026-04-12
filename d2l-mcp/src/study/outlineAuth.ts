@@ -32,26 +32,34 @@ const DUO_WAIT_MS = 35_000;
 // ─── S3 helpers (outline-specific key) ───────────────────────────────────────
 
 async function loadOutlineStateFromS3(userId: string): Promise<string | undefined> {
-  try {
-    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
-    const s3 = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
-    const key = `${S3_STATE_KEY_PREFIX}/${userId}/outline-storage-state.json`;
-    const res = await s3.send(new GetObjectCommand({
-      Bucket: process.env.S3_BUCKET || "study-mcp-notes",
-      Key: key,
-    }));
-    const body = await res.Body?.transformToString();
-    if (!body) return undefined;
-    const tmpPath = path.join(os.tmpdir(), `outline-state-${userId}.json`);
-    await fs.writeFile(tmpPath, body);
-    console.error(`[OUTLINE_AUTH] Loaded outline browser state for user ${userId}`);
-    return tmpPath;
-  } catch (e: any) {
-    if (e?.name !== "NoSuchKey") {
-      console.error(`[OUTLINE_AUTH] Failed to load outline browser state: ${e?.message}`);
+  const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
+  const s3 = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
+  const bucket = process.env.S3_BUCKET || "study-mcp-notes";
+
+  // Try outline-specific state first, then fall back to D2L state.
+  // Both contain ADFS session cookies so outline OIDC completes without a new Duo push.
+  const keys = [
+    `${S3_STATE_KEY_PREFIX}/${userId}/outline-storage-state.json`,
+    `${S3_STATE_KEY_PREFIX}/${userId}/storage-state.json`,
+  ];
+
+  for (const key of keys) {
+    try {
+      const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+      const body = await res.Body?.transformToString();
+      if (!body) continue;
+      const tmpPath = path.join(os.tmpdir(), `outline-state-${userId}.json`);
+      await fs.writeFile(tmpPath, body);
+      console.error(`[OUTLINE_AUTH] Loaded browser state for user ${userId} from ${key}`);
+      return tmpPath;
+    } catch (e: any) {
+      if (e?.name !== "NoSuchKey") {
+        console.error(`[OUTLINE_AUTH] Failed to load browser state from ${key}: ${e?.message}`);
+      }
     }
-    return undefined;
   }
+
+  return undefined;
 }
 
 async function saveOutlineStateToS3(userId: string, statePath: string): Promise<void> {
