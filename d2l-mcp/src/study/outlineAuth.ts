@@ -32,34 +32,26 @@ const DUO_WAIT_MS = 35_000;
 // ─── S3 helpers (outline-specific key) ───────────────────────────────────────
 
 async function loadOutlineStateFromS3(userId: string): Promise<string | undefined> {
-  const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
-  const s3 = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
-  const bucket = process.env.S3_BUCKET || "study-mcp-notes";
-
-  // Try outline-specific state first, then fall back to D2L state.
-  // Both contain ADFS session cookies so outline OIDC completes without a new Duo push.
-  const keys = [
-    `${S3_STATE_KEY_PREFIX}/${userId}/outline-storage-state.json`,
-    `${S3_STATE_KEY_PREFIX}/${userId}/storage-state.json`,
-  ];
-
-  for (const key of keys) {
-    try {
-      const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-      const body = await res.Body?.transformToString();
-      if (!body) continue;
-      const tmpPath = path.join(os.tmpdir(), `outline-state-${userId}.json`);
-      await fs.writeFile(tmpPath, body);
-      console.error(`[OUTLINE_AUTH] Loaded browser state for user ${userId} from ${key}`);
-      return tmpPath;
-    } catch (e: any) {
-      if (e?.name !== "NoSuchKey") {
-        console.error(`[OUTLINE_AUTH] Failed to load browser state from ${key}: ${e?.message}`);
-      }
+  try {
+    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const s3 = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
+    const key = `${S3_STATE_KEY_PREFIX}/${userId}/outline-storage-state.json`;
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET || "study-mcp-notes",
+      Key: key,
+    }));
+    const body = await res.Body?.transformToString();
+    if (!body) return undefined;
+    const tmpPath = path.join(os.tmpdir(), `outline-state-${userId}.json`);
+    await fs.writeFile(tmpPath, body);
+    console.error(`[OUTLINE_AUTH] Loaded outline browser state for user ${userId}`);
+    return tmpPath;
+  } catch (e: any) {
+    if (e?.name !== "NoSuchKey") {
+      console.error(`[OUTLINE_AUTH] Failed to load outline browser state: ${e?.message}`);
     }
+    return undefined;
   }
-
-  return undefined;
 }
 
 async function saveOutlineStateToS3(userId: string, statePath: string): Promise<void> {
@@ -83,7 +75,6 @@ async function saveOutlineStateToS3(userId: string, statePath: string): Promise<
 // ─── Credential retrieval ─────────────────────────────────────────────────────
 
 async function getOutlineCredentials(userId: string): Promise<{ username: string; password: string } | null> {
-  // Try outline-specific credentials first
   const { data, error } = await supabase
     .from("user_credentials")
     .select("username, password")
@@ -91,24 +82,8 @@ async function getOutlineCredentials(userId: string): Promise<{ username: string
     .eq("service", "outline")
     .single();
 
-  if (!error && data?.username && data?.password) {
-    return { username: data.username, password: data.password };
-  }
-
-  // Fall back to D2L credentials — same WatIAM username/password
-  const { data: d2l, error: d2lErr } = await supabase
-    .from("user_credentials")
-    .select("username, password")
-    .eq("user_id", userId)
-    .eq("service", "d2l")
-    .single();
-
-  if (!d2lErr && d2l?.username && d2l?.password) {
-    console.error(`[OUTLINE_AUTH] Using D2L credentials for outline login (user ${userId})`);
-    return { username: d2l.username, password: d2l.password };
-  }
-
-  return null;
+  if (error || !data?.username || !data?.password) return null;
+  return { username: data.username, password: data.password };
 }
 
 // ─── Cookie validation ────────────────────────────────────────────────────────
@@ -407,9 +382,11 @@ export async function getOrRefreshOutlineCookies(userId: string): Promise<string
   const stored = await getOutlineCookies(userId);
   if (stored) return stored;
 
-  // Do NOT fall back to headless login here — it silently triggers a Duo push.
-  // Outline sessions are captured automatically during D2L VNC login.
+  console.error(`[OUTLINE_AUTH] No valid stored cookie for user ${userId}, attempting login`);
+  const fresh = await loginToOutline(userId);
+  if (fresh) return fresh;
+
   throw new Error(
-    "Outline not connected. Open the Horizon app and tap Relogin — your course outlines will connect automatically during D2L login."
+    "Outline authentication failed. Please connect your outline.uwaterloo.ca account via the app."
   );
 }

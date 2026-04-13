@@ -444,13 +444,6 @@ function createServer(): McpServer {
 
   // Register outline tools (outline.uwaterloo.ca)
   server.tool(
-    "outline_login",
-    OutlineTools.outline_login.description,
-    OutlineTools.outline_login.schema,
-    wrapStudyToolHandler("outline_login", OutlineTools.outline_login.handler)
-  );
-
-  server.tool(
     "get_course_outline",
     OutlineTools.get_course_outline.description,
     OutlineTools.get_course_outline.schema,
