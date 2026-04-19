@@ -498,7 +498,7 @@ async function main() {
     // Onboarding page (no auth)
     const publicDir = path.join(process.cwd(), "dist", "public");
     app.use(express.static(publicDir));
-    app.get("/onboard", (_req, res) => {
+    app.get("/onboard", (req, res) => {
       const filePath = path.join(publicDir, "onboard.html");
       console.error(`[ONBOARD] Serving from: ${filePath}`);
       // Always serve the latest onboarding page (avoid stale browser/CDN caches).
@@ -509,6 +509,50 @@ async function main() {
         if (err) {
           console.error(`[ONBOARD] sendFile error:`, err);
           res.status(500).send(`File not found: ${filePath}`);
+        }
+      });
+
+      // Record page view (fire-and-forget)
+      try {
+        import("crypto").then(({ createHash }) => {
+          const raw = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "";
+          const ip_hash = createHash("sha256").update(raw.split(",")[0].trim()).digest("hex").slice(0, 16);
+          const sbUrl = process.env.SUPABASE_URL;
+          const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
+          if (sbUrl && sbKey) {
+            fetch(`${sbUrl}/rest/v1/page_views`, {
+              method: "POST",
+              headers: { "apikey": sbKey, "Authorization": `Bearer ${sbKey}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
+              body: JSON.stringify({ path: "/onboard", ip_hash, user_agent: (req.headers["user-agent"] || "").slice(0, 200) }),
+            }).catch(() => {});
+          }
+        }).catch(() => {});
+      } catch {}
+    });
+
+    // Page view stats (no auth — internal use)
+    app.get("/admin/stats", async (_req, res) => {
+      const sbUrl = process.env.SUPABASE_URL;
+      const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
+      if (!sbUrl || !sbKey) return res.status(500).json({ error: "No Supabase config" });
+      const headers = { "apikey": sbKey, "Authorization": `Bearer ${sbKey}` };
+
+      const [todayResp, weekResp, totalResp, uniqueResp] = await Promise.all([
+        fetch(`${sbUrl}/rest/v1/page_views?path=eq./onboard&created_at=gte.${new Date(new Date().setHours(0,0,0,0)).toISOString()}&select=id`, { headers }),
+        fetch(`${sbUrl}/rest/v1/page_views?path=eq./onboard&created_at=gte.${new Date(Date.now()-7*86400000).toISOString()}&select=id`, { headers }),
+        fetch(`${sbUrl}/rest/v1/page_views?path=eq./onboard&select=id`, { headers }),
+        fetch(`${sbUrl}/rest/v1/page_views?path=eq./onboard&select=ip_hash`, { headers }),
+      ]);
+
+      const [today, week, total, unique] = await Promise.all([todayResp.json(), weekResp.json(), totalResp.json(), uniqueResp.json()]) as [any[], any[], any[], any[]];
+      const uniqueVisitors = new Set(unique.map((r: any) => r.ip_hash)).size;
+
+      res.json({
+        onboard: {
+          today: today.length,
+          last7days: week.length,
+          allTime: total.length,
+          uniqueVisitors,
         }
       });
     });
