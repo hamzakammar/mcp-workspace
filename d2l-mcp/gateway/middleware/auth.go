@@ -20,12 +20,13 @@ const UserIDKey contextKey = "user_id"
 
 // publicRoutes are paths that do NOT require JWT authentication.
 var publicRoutes = map[string]bool{
-	"/health":       true,
-	"/metrics":      true,
-	"/onboard":      true,
-	"/auth/signup":  true,
-	"/auth/signin":  true,
-	"/auth/refresh": true,
+	"/health":        true,
+	"/metrics":       true,
+	"/onboard":       true,
+	"/admin/stats":   true,
+	"/auth/signup":   true,
+	"/auth/signin":   true,
+	"/auth/refresh":  true,
 }
 
 func isPublicRoute(path string) bool {
