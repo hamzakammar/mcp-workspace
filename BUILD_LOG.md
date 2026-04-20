@@ -164,7 +164,17 @@ Added `_urgentReminders` injection to all tool responses in `index.ts`.
 Yes — ECS `study-mcp-backend:100`.
 
 ### Issues found
-Live smoke test blocked by expired D2L sessions across all users (pre-existing). Tool count confirmed at 38 (up from 35 before these changes), confirming all 3 new tools registered.
+**Bug found and fixed:** `_urgentReminders` was not appearing in array-returning tool responses (e.g. `get_course_content`, `get_quizzes`). Root cause: `JSON.stringify` silently drops non-index properties set on JS arrays. Fix: when parsed result is an array, wrap in `{ results: [...], _urgentReminders: [...] }` instead of mutating the array.
+
+Deployed as ECS task `study-mcp-backend:101`.
+
+### Smoke tests (live, 2026-04-20)
+- Task 1: 38 tools registered ✅
+- Task 2: 3 quizzes returned with correct schema, `_urgentReminders: []` ✅
+- Task 3: announcements array returned correctly ✅
+- Task 4: assignment rubric returned (assignment had no instructions/rubric in D2L, but structure correct) ✅
+- Task 5: recommendations + summary returned correctly ✅
+- Task 6: `_urgentReminders: []` present in `get_course_content` response ✅
 
 ### Next task
 All 6 tasks complete.

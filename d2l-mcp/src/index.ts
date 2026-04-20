@@ -140,16 +140,15 @@ function createServer(): McpServer {
             let finalResult = result;
             try {
               const parsed = JSON.parse(result);
-              parsed._urgentReminders = urgentItems;
-              finalResult = JSON.stringify(parsed, null, 2);
+              // Arrays don't support top-level keys in JSON.stringify —
+              // wrap them so _urgentReminders is always a reachable field.
+              const withReminders = Array.isArray(parsed)
+                ? { results: parsed, _urgentReminders: urgentItems }
+                : { ...parsed, _urgentReminders: urgentItems };
+              finalResult = JSON.stringify(withReminders, null, 2);
             } catch {
               // Non-JSON result — append as suffix
-              if (urgentItems.length > 0) {
-                finalResult = result + `\n\n_urgentReminders: ${JSON.stringify(urgentItems)}`;
-              } else {
-                // Ensure the field appears even when empty so callers can rely on it
-                finalResult = result;
-              }
+              finalResult = result + `\n\n_urgentReminders: ${JSON.stringify(urgentItems)}`;
             }
             return { content: [{ type: "text" as const, text: finalResult }] };
           } catch {
