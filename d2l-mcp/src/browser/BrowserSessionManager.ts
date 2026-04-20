@@ -24,7 +24,7 @@ import fs from "fs/promises";
 import os from "os";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { supabase } from "../utils/supabase.js";
-import { clearDuoRequired } from "../auth.js";
+import { clearDuoRequired, markSessionValidated } from "../auth.js";
 
 const SESSIONS_BASE = process.env.SESSIONS_PATH || "/tmp/sessions";
 const SESSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -362,6 +362,7 @@ export class BrowserSessionManager {
               service: "d2l",
               host: d2lHost,
               token,
+              duo_required_at: null,
               updated_at: new Date().toISOString(),
             }),
           });
@@ -380,8 +381,17 @@ export class BrowserSessionManager {
 
       session.status = "authenticated";
 
-      // Clear the duo_required flag since we just successfully re-authed
-      await clearDuoRequired(userId).catch(() => {});
+      // Mark this session as validated in the auth module's in-process cache.
+      // This prevents getToken() from running validateTokenLive() on the very next
+      // tool call — a transient 403 there would re-trigger markDuoRequired() and
+      // overwrite the fresh token we just stored.
+      markSessionValidated(userId);
+
+      // Clear the duo_required flag since we just successfully re-authed.
+      // duo_required_at is also nulled in the upsert above, but belt-and-suspenders.
+      await clearDuoRequired(userId).catch((err) => {
+        console.error(`[VNC] clearDuoRequired failed for user ${userId}:`, err?.message);
+      });
 
       // Close after 3s so user can see the logged-in state
       setTimeout(() => BrowserSessionManager.closeSession(sessionId), 3000);

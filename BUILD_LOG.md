@@ -178,3 +178,28 @@ Deployed as ECS task `study-mcp-backend:101`.
 
 ### Next task
 All 6 tasks complete.
+
+---
+
+## Bug Fix — VNC Re-login Not Restoring Tool Functionality
+**Date:** 2026-04-20
+**Status:** ✅ Done
+
+### Problem
+After a D2L session drops mid-use, tools throw `REAUTH_REQUIRED`. User visits `/onboard`, VNC re-login runs, browser auto-loads D2L (valid cookies), stores fresh token to Supabase, onboard page shows "Connected! Session refreshed." — but tools STILL throw `REAUTH_REQUIRED` on the next call.
+
+### Root Cause
+Two bugs compounded:
+
+1. **`validateTokenLive()` fires on fresh VNC token**: After VNC stores a fresh token, `userValidatedInSession` doesn't contain the userId (was cleared by `forceRefreshToken()`). So the next `getToken()` call runs `validateTokenLive()` again. If that ping returns non-200 (transient network, D2L hiccup, cookie rotation), `getToken()` falls through to `attemptSilentRelogin()` → fails → `markDuoRequired()` → throws `REAUTH_REQUIRED`, overwriting the perfectly valid VNC token in Supabase with a `duo_required_at` timestamp.
+
+2. **`duo_required_at` not cleared atomically**: `_captureAndStore` in `BrowserSessionManager` upserted the token without including `duo_required_at: null` in the payload, then called `clearDuoRequired()` separately. If that separate PATCH failed silently, `duo_required_at` stayed set.
+
+### Fix
+- `auth.ts`: Added `markSessionValidated(userId)` export — adds to `userValidatedInSession`.
+- `BrowserSessionManager._captureAndStore`: After cookie validation passes, calls `markSessionValidated(userId)` so `getToken()` skips re-validation on the immediately following tool call.
+- `BrowserSessionManager._captureAndStore`: Added `duo_required_at: null` to the Supabase upsert payload so it's cleared atomically with the token update.
+- `clearDuoRequired()` call now logs errors instead of silently swallowing them.
+
+### Deployed
+ECS task `study-mcp-backend:102`, running 1/1.

@@ -1317,6 +1317,18 @@ export function clearSessionValidation(userId: string): void {
   userValidatedInSession.delete(userId);
 }
 
+/**
+ * Mark a user's session as validated for this process session.
+ * Called after VNC or headless re-login successfully captures and validates
+ * fresh D2L cookies. Prevents getToken() from running a redundant
+ * validateTokenLive() on the very next tool call (which could fail transiently
+ * and trigger another markDuoRequired + REAUTH_REQUIRED cycle).
+ */
+export function markSessionValidated(userId: string): void {
+  userValidatedInSession.add(userId);
+  console.error(`[AUTH] Session marked as validated for user ${userId} (post-VNC)`);
+}
+
 export function getTokenExpiry(userId?: string): number {
   const cacheKey = userId || "default";
   return userTokenCache[cacheKey]?.expiresAt || 0;
