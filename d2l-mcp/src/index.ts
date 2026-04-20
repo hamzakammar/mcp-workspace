@@ -18,6 +18,10 @@ import { calendarTools } from "./tools/calendar.js";
 import { newsTools } from "./tools/news.js";
 import { enrollmentTools } from "./tools/enrollments.js";
 import { downloadFile, readFile, deleteFile } from "./tools/files.js";
+import { quizTools } from "./tools/quizzes.js";
+import { rubricTools } from "./tools/rubric.js";
+import { priorityTools } from "./tools/priority.js";
+import { D2LClient } from "./client.js";
 import { startSessionRefreshScheduler } from "./jobs/sessionRefresher.js";
 import { piazzaTools } from "./tools/piazza.js";
 import { PlanningTools } from "./study/src/planning.js";
@@ -35,6 +39,63 @@ import d2lAuthRoutes from "./api/d2lAuthRoutes.js";
 import publicAuthRoutes from "./api/publicAuthRoutes.js";
 import { BrowserSessionManager } from "./browser/BrowserSessionManager.js";
 import { fileURLToPath } from "url";
+
+// ---- Urgency surfacing cache (Task 6) ----
+// Caches upcoming-deadline check results per user+course for 15 minutes.
+const urgencyCache: Record<
+  string,
+  { items: UrgentReminder[]; cachedAt: number }
+> = {};
+const URGENCY_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+
+interface UrgentReminder {
+  title: string;
+  dueIn: string;
+  type: string;
+}
+
+function formatDueIn(isoDate: string): string {
+  const diffMs = new Date(isoDate).getTime() - Date.now();
+  if (diffMs <= 0) return 'overdue';
+  const h = Math.round(diffMs / (1000 * 60 * 60));
+  if (h < 24) return `${h}h`;
+  const d = Math.round(h / 24);
+  return `${d}d`;
+}
+
+async function getUrgentReminders(
+  userId: string,
+  orgUnitId: number
+): Promise<UrgentReminder[]> {
+  const cacheKey = `${userId}:${orgUnitId}`;
+  const cached = urgencyCache[cacheKey];
+  if (cached && Date.now() - cached.cachedAt < URGENCY_CACHE_TTL) {
+    return cached.items;
+  }
+  try {
+    const now = new Date();
+    const deadline = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+    const d2lClient = new D2LClient(userId);
+    const events = (await d2lClient.getMyCalendarEvents(
+      orgUnitId,
+      now.toISOString(),
+      deadline.toISOString()
+    )) as { Objects: Array<{ Title: string; EndDateTime: string; AssociatedEntity?: { AssociatedEntityType: string } }> };
+    const items: UrgentReminder[] = (events.Objects || []).map((e) => {
+      const et = e.AssociatedEntity?.AssociatedEntityType || '';
+      const type = et.includes('Dropbox')
+        ? 'assignment'
+        : et.includes('Quiz')
+        ? 'quiz'
+        : 'event';
+      return { title: e.Title, dueIn: formatDueIn(e.EndDateTime), type };
+    });
+    urgencyCache[cacheKey] = { items, cachedAt: Date.now() };
+    return items;
+  } catch {
+    return [];
+  }
+}
 
 function createServer(): McpServer {
   console.error("[INIT] createServer() called - starting MCP server initialization");
@@ -67,6 +128,32 @@ function createServer(): McpServer {
             const host = process.env.API_HOST || "localhost:3000";
             const warning = `⚠️ Your D2L session has expired and requires Duo re-authentication.\nPlease visit https://${host}/onboard to reconnect.\n\n---\n\n`;
             return { content: [{ type: "text" as const, text: warning + result }] };
+          }
+        }
+
+        // Append urgent reminders if args contain orgUnitId (Task 6)
+        const effectiveUserId = userId || "legacy";
+        const orgUnitId = args?.orgUnitId;
+        if (orgUnitId && typeof orgUnitId === "number") {
+          try {
+            const urgentItems = await getUrgentReminders(effectiveUserId, orgUnitId);
+            let finalResult = result;
+            try {
+              const parsed = JSON.parse(result);
+              parsed._urgentReminders = urgentItems;
+              finalResult = JSON.stringify(parsed, null, 2);
+            } catch {
+              // Non-JSON result — append as suffix
+              if (urgentItems.length > 0) {
+                finalResult = result + `\n\n_urgentReminders: ${JSON.stringify(urgentItems)}`;
+              } else {
+                // Ensure the field appears even when empty so callers can rely on it
+                finalResult = result;
+              }
+            }
+            return { content: [{ type: "text" as const, text: finalResult }] };
+          } catch {
+            // Urgency check failed — return original result unchanged
           }
         }
         return { content: [{ type: "text" as const, text: result }] };
@@ -216,10 +303,13 @@ function createServer(): McpServer {
   server.tool(
     "get_announcements",
     newsTools.get_announcements.description,
-    { orgUnitId: newsTools.get_announcements.schema.orgUnitId },
+    {
+      orgUnitId: newsTools.get_announcements.schema.orgUnitId,
+      since: newsTools.get_announcements.schema.since,
+    },
     wrapToolHandler("get_announcements", async (args) => {
       return await newsTools.get_announcements.handler(
-        args as { orgUnitId?: number }
+        args as { orgUnitId?: number; since?: string }
       );
     })
   );
@@ -462,6 +552,46 @@ function createServer(): McpServer {
     OutlineTools.get_cached_outline.description,
     OutlineTools.get_cached_outline.schema,
     wrapStudyToolHandler("get_cached_outline", OutlineTools.get_cached_outline.handler)
+  );
+
+  // Register quiz tools (Task 2)
+  server.tool(
+    "get_quizzes",
+    quizTools.get_quizzes.description,
+    { orgUnitId: quizTools.get_quizzes.schema.orgUnitId },
+    wrapToolHandler("get_quizzes", async (args) => {
+      return await quizTools.get_quizzes.handler(args as { orgUnitId: number });
+    })
+  );
+
+  // Register rubric tool (Task 4)
+  server.tool(
+    "get_assignment_rubric",
+    rubricTools.get_assignment_rubric.description,
+    {
+      orgUnitId: rubricTools.get_assignment_rubric.schema.orgUnitId,
+      folderId: rubricTools.get_assignment_rubric.schema.folderId,
+    },
+    wrapToolHandler("get_assignment_rubric", async (args) => {
+      return await rubricTools.get_assignment_rubric.handler(
+        args as { orgUnitId: number; folderId: number }
+      );
+    })
+  );
+
+  // Register priority tool (Task 5)
+  server.tool(
+    "what_should_i_work_on",
+    priorityTools.what_should_i_work_on.description,
+    {
+      orgUnitId: priorityTools.what_should_i_work_on.schema.orgUnitId,
+      hoursAhead: priorityTools.what_should_i_work_on.schema.hoursAhead,
+    },
+    wrapToolHandler("what_should_i_work_on", async (args) => {
+      return await priorityTools.what_should_i_work_on.handler(
+        args as { orgUnitId: number; hoursAhead?: number }
+      );
+    })
   );
 
   return server;

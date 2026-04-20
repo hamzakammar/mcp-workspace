@@ -102,6 +102,46 @@ function isLoginPage(url: string): boolean {
 // Per-user token cache
 const userTokenCache: Record<string, TokenCache> = {};
 
+// Track which users have had their token validated against D2L in this process session.
+// Avoids repeated live-validation pings on every tool call; resets on PM2 restart.
+const userValidatedInSession = new Set<string>();
+
+/**
+ * Validate a D2L token is still accepted by the server by hitting the lightweight
+ * whoami endpoint. Times out in 5 seconds. Returns true on 200-range response,
+ * false on 401/403. On network errors returns true to fail-open and avoid
+ * unnecessary re-auth when D2L is temporarily unreachable.
+ */
+async function validateTokenLive(token: string, host: string): Promise<boolean> {
+  const d2lHost = host || process.env.D2L_HOST || "learn.uwaterloo.ca";
+  try {
+    const headers: Record<string, string> = {};
+    try {
+      const parsed = JSON.parse(token);
+      if (parsed.d2lSessionVal && parsed.d2lSecureSessionVal) {
+        headers["Cookie"] = `d2lSessionVal=${parsed.d2lSessionVal}; d2lSecureSessionVal=${parsed.d2lSecureSessionVal}`;
+      } else {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+    } catch {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const resp = await fetch(`https://${d2lHost}/d2l/api/lp/1.43/users/whoami`, {
+      headers,
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    console.error(`[AUTH] Live token validation for ${d2lHost}: HTTP ${resp.status}`);
+    return resp.ok;
+  } catch (e: any) {
+    // Network error or timeout — fail open to avoid blocking users when D2L is slow
+    console.error(`[AUTH] Live token validation failed (network/timeout): ${e.message} — assuming valid`);
+    return true;
+  }
+}
+
 /**
  * Mark that a user needs Duo re-authentication.
  * This is checked by the daily health job and MCP tool responses.
@@ -494,12 +534,34 @@ export async function getToken(userId?: string): Promise<string> {
         console.error(`[AUTH] Stored token for user ${userId} is too old (${Math.round(tokenAge / 3600000)}h), attempting silent re-login`);
         // Try headless re-login with stored credentials before giving up
         const refreshed = await attemptSilentRelogin(userId);
-        if (refreshed) return refreshed;
+        if (refreshed) {
+          userValidatedInSession.add(userId);
+          return refreshed;
+        }
         // If silent re-login fails (Duo wall), mark duo_required and throw
         await markDuoRequired(userId);
         throw new Error("REAUTH_REQUIRED");
       } else {
         console.error(`[AUTH] Using stored token for user ${userId} (age: ${Math.round(tokenAge / 3600000)}h)`);
+        // On first use after a PM2 restart / server boot, validate the token is still
+        // accepted by D2L before trusting it.  This catches tokens that expired while
+        // the server was down and avoids a confusing 403 on the first real API call.
+        if (!userValidatedInSession.has(userId)) {
+          console.error(`[AUTH] First use in this process session for user ${userId} — running live token validation`);
+          const isLive = await validateTokenLive(userToken.token, userToken.host);
+          if (!isLive) {
+            console.error(`[AUTH] Token for user ${userId} rejected by D2L — attempting silent re-login`);
+            const refreshed = await attemptSilentRelogin(userId);
+            if (refreshed) {
+              userValidatedInSession.add(userId);
+              clearDuoRequired(userId).catch(() => {});
+              return refreshed;
+            }
+            await markDuoRequired(userId);
+            throw new Error("REAUTH_REQUIRED");
+          }
+          userValidatedInSession.add(userId);
+        }
         // Clear duo_required flag if it was set — token is valid now
         clearDuoRequired(userId).catch(() => {});
         userTokenCache[cacheKey] = {
@@ -1231,6 +1293,7 @@ export async function refreshTokenIfNeeded(userId?: string): Promise<string> {
  */
 export async function forceRefreshToken(userId: string): Promise<string | null> {
   clearTokenCache(userId);
+  userValidatedInSession.delete(userId);
   console.error(`[AUTH] Force-refreshing token for user ${userId} (session died mid-use)`);
   const token = await attemptSilentRelogin(userId);
   if (!token) {
@@ -1243,9 +1306,15 @@ export function clearTokenCache(userId?: string): void {
   const cacheKey = userId || "default";
   if (userId) {
     delete userTokenCache[cacheKey];
+    userValidatedInSession.delete(userId);
   } else {
     userTokenCache[cacheKey] = { token: "", expiresAt: 0 };
   }
+}
+
+/** Reset the per-session validation flag for a user (e.g. after forced token refresh). */
+export function clearSessionValidation(userId: string): void {
+  userValidatedInSession.delete(userId);
 }
 
 export function getTokenExpiry(userId?: string): number {

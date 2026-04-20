@@ -33,7 +33,25 @@ Severity guide:
 
 <!-- Add new entries below this line, newest first. -->
 
-*No debt logged yet. Add your first entry when you defer something.*
+### [DEBT-001] Token validation only on first process-session use, not on every restart-recovery
+- **Severity:** low
+- **Area:** `d2l-mcp/src/auth.ts` — `getToken()`
+- **Logged:** 2026-04-20
+- **Author:** agent
+- **Description:** `validateTokenLive()` is called at most once per user per server process (tracked via `userValidatedInSession`). If the token expires *between two tool calls in the same process session* (e.g. the token was 13.9h old when validated but the process runs for hours), Horizon will hit a 403 on the next real API call and rely on `forceRefreshToken()` in `client.ts` to recover. This is acceptable but not proactive.
+- **Impact:** Users may see a single 403-then-retry latency spike mid-session. Does not cause persistent failures.
+- **Fix:** Add a periodic background revalidation (e.g. check every 2h if token was last validated > 1h ago) — similar to what `sessionRefresher.js` does for the token age check.
+- **Unblocked by:** Nothing; low priority since the 403-retry path already handles it silently.
+
+### [DEBT-002] `get_assignment_rubric` returns all course rubrics, not only rubrics attached to the specific assignment
+- **Severity:** medium
+- **Area:** `d2l-mcp/src/tools/rubric.ts`
+- **Logged:** 2026-04-20
+- **Author:** agent
+- **Description:** The D2L rubrics API (`/rubrics/`) returns all rubrics in the course, not a filtered set tied to the specific folder/assignment. The tool returns all criteria from all rubrics, which may include rubrics for other assignments in the same course.
+- **Impact:** Rubric output may be inaccurate / inflated for multi-rubric courses.
+- **Fix:** Use the assignment-specific rubric association endpoint if available (`/dropbox/folders/{folderId}/rubrics/`), or filter by rubric ID if the dropbox folder response includes associated rubric IDs.
+- **Unblocked by:** Confirming whether D2L exposes per-folder rubric associations via the API.
 
 ---
 

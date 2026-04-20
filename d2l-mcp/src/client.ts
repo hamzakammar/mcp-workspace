@@ -202,6 +202,24 @@ export class D2LClient {
   async getMyEnrollments() {
     return this.get(`/d2l/api/lp/1.43/enrollments/myenrollments/`);
   }
+
+  // Quiz endpoints (LE API v1.67)
+  async getQuizzes(orgUnitId: number) {
+    return this.get(`/d2l/api/le/1.67/${orgUnitId}/quizzes/`);
+  }
+
+  async getQuiz(orgUnitId: number, quizId: number) {
+    return this.get(`/d2l/api/le/1.67/${orgUnitId}/quizzes/${quizId}`);
+  }
+
+  async getQuizAttempts(orgUnitId: number, quizId: number) {
+    return this.get(`/d2l/api/le/1.67/${orgUnitId}/quizzes/${quizId}/attempts/myAttempts/`);
+  }
+
+  // Rubric endpoints (LE API v1.67)
+  async getRubrics(orgUnitId: number) {
+    return this.get(`/d2l/api/le/1.67/${orgUnitId}/rubrics/`);
+  }
 }
 
 // Lazy proxy — picks up the current request's userId from AsyncLocalStorage on each call.
