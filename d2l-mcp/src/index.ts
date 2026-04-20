@@ -21,6 +21,7 @@ import { downloadFile, readFile, deleteFile } from "./tools/files.js";
 import { quizTools } from "./tools/quizzes.js";
 import { rubricTools } from "./tools/rubric.js";
 import { priorityTools } from "./tools/priority.js";
+import { priorityGlobalTools } from "./tools/priorityGlobal.js";
 import { D2LClient } from "./client.js";
 import { startSessionRefreshScheduler } from "./jobs/sessionRefresher.js";
 import { piazzaTools } from "./tools/piazza.js";
@@ -589,6 +590,19 @@ function createServer(): McpServer {
     wrapToolHandler("what_should_i_work_on", async (args) => {
       return await priorityTools.what_should_i_work_on.handler(
         args as { orgUnitId: number; hoursAhead?: number }
+      );
+    })
+  );
+
+  server.tool(
+    "what_should_i_work_on_global",
+    priorityGlobalTools.what_should_i_work_on_global.description,
+    {
+      hoursAhead: priorityGlobalTools.what_should_i_work_on_global.schema.hoursAhead,
+    },
+    wrapToolHandler("what_should_i_work_on_global", async (args) => {
+      return await priorityGlobalTools.what_should_i_work_on_global.handler(
+        args as { hoursAhead?: number }
       );
     })
   );

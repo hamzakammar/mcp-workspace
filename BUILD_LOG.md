@@ -181,6 +181,29 @@ All 6 tasks complete.
 
 ---
 
+## Task 7 — `what_should_i_work_on_global` Tool
+**Date:** 2026-04-20
+**Status:** ✅ Done
+
+### What was built
+New tool `what_should_i_work_on_global` in `d2l-mcp/src/tools/priorityGlobal.ts`.
+- Calls `getMyEnrollments()` to discover all active courses automatically — no `orgUnitId` required
+- Filters to active Course Offerings (not ended, started, accessible) using the same 8-month window logic as the course list endpoint
+- Runs assignment + quiz fetching for every course in parallel via `Promise.all`
+- Merges all per-course recommendations into one unified list sorted by urgency score
+- Returns top 10 with `courseName` and `courseCode` on each item so the user knows which course each item belongs to
+- Returns `coursesChecked` count and a natural-language `summary`
+- `hoursAhead` parameter (default 72h) same as the per-course version
+
+### Tests run
+- [x] Build: TypeScript compiles cleanly
+- [x] Smoke test: both `what_should_i_work_on` and `what_should_i_work_on_global` appear in `tools/list`
+
+### Deployed
+ECS task `study-mcp-backend:103`.
+
+---
+
 ## Bug Fix — VNC Re-login Not Restoring Tool Functionality
 **Date:** 2026-04-20
 **Status:** ✅ Done
