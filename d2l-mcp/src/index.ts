@@ -24,6 +24,8 @@ import { priorityTools } from "./tools/priority.js";
 import { priorityGlobalTools } from "./tools/priorityGlobal.js";
 import { D2LClient } from "./client.js";
 import { startSessionRefreshScheduler } from "./jobs/sessionRefresher.js";
+import { startStorageStateTTLJob } from "./jobs/storageStateTTL.js";
+import { deleteAllUserData } from "./utils/deleteUserData.js";
 import { piazzaTools } from "./tools/piazza.js";
 import { PlanningTools } from "./study/src/planning.js";
 import { NotesTools } from "./study/src/notes.js";
@@ -607,6 +609,49 @@ function createServer(): McpServer {
     })
   );
 
+  // delete_my_data — wipe all user data traces from the system
+  server.tool(
+    "delete_my_data",
+    "Permanently delete all your stored data from Horizon. " +
+      "This removes your D2L and Piazza credentials, session cookies, S3 browser state, and API key. " +
+      "You will need to re-authenticate from scratch after calling this tool. " +
+      "This action cannot be undone.",
+    {},
+    async () => {
+      const userId = getUserId();
+      if (!userId || userId === "legacy") {
+        return {
+          content: [{ type: "text" as const, text: "Error: could not determine your user ID. Please re-authenticate and try again." }],
+        };
+      }
+
+      const result = await deleteAllUserData(userId);
+      const summary = [
+        `Supabase credentials: ${result.deleted.supabaseCredentials ? "✓ deleted" : "✗ failed"}`,
+        `Supabase API key:     ${result.deleted.supabaseApiKey ? "✓ deleted" : "✗ failed"}`,
+        `S3 browser state:     ${result.deleted.s3State ? "✓ deleted" : "✗ failed"}`,
+        `D2L disk session:     ${result.deleted.diskD2lSession ? "✓ deleted" : "✗ failed"}`,
+        `Piazza disk session:  ${result.deleted.diskPiazzaSession ? "✓ deleted" : "✗ failed"}`,
+      ].join("\n");
+
+      const errorsSection = result.errors.length > 0
+        ? `\n\nErrors encountered:\n${result.errors.map((e) => `  • ${e}`).join("\n")}`
+        : "";
+
+      const allOk = result.errors.length === 0;
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: allOk
+              ? `All your data has been deleted from Horizon.\n\n${summary}`
+              : `Partial deletion — some items could not be removed.\n\n${summary}${errorsSection}`,
+          },
+        ],
+      };
+    }
+  );
+
   return server;
 }
 
@@ -620,6 +665,18 @@ async function main() {
     await server.connect(transport);
     console.error("D2L Brightspace MCP server running on stdio");
   } else if (transportType === "http" || transportType === "https") {
+    // Require STUDY_MCP_TOKEN — no unauthenticated mode
+    const mcpToken = process.env.STUDY_MCP_TOKEN;
+    if (!mcpToken) {
+      console.error(
+        "[STARTUP] FATAL: STUDY_MCP_TOKEN is not set.\n" +
+        "The MCP endpoint requires authentication. Generate a token with:\n" +
+        "  node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"\n" +
+        "Then set STUDY_MCP_TOKEN=<generated-token> in your environment."
+      );
+      process.exit(1);
+    }
+
     // Use HTTP transport with StreamableHTTPServerTransport
     const port = process.env.MCP_PORT
       ? parseInt(process.env.MCP_PORT, 10)
@@ -747,10 +804,10 @@ async function main() {
       req: express.Request,
       res: express.Response
     ) => {
-      // Bearer token auth (only if token is set)
-      const token = process.env.STUDY_MCP_TOKEN;
+      // Bearer token auth — always required (STUDY_MCP_TOKEN enforced at startup)
+      const token = process.env.STUDY_MCP_TOKEN!;
       const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-      if (token && (!authHeader || authHeader !== `Bearer ${token}`)) {
+      if (!authHeader || authHeader !== `Bearer ${token}`) {
         res.status(401).json({ error: "Unauthorized" });
         return;
       }
@@ -940,10 +997,10 @@ async function main() {
       req: express.Request,
       res: express.Response
     ) => {
-      // Bearer token auth (only if token is set)
-      const token = process.env.STUDY_MCP_TOKEN;
+      // Bearer token auth — always required (STUDY_MCP_TOKEN enforced at startup)
+      const token = process.env.STUDY_MCP_TOKEN!;
       const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-      if (token && (!authHeader || authHeader !== `Bearer ${token}`)) {
+      if (!authHeader || authHeader !== `Bearer ${token}`) {
         res.status(401).json({ error: "Unauthorized" });
         return;
       }
@@ -988,10 +1045,10 @@ async function main() {
       req: express.Request,
       res: express.Response
     ) => {
-      // Bearer token auth (only if token is set)
-      const token = process.env.STUDY_MCP_TOKEN;
+      // Bearer token auth — always required (STUDY_MCP_TOKEN enforced at startup)
+      const token = process.env.STUDY_MCP_TOKEN!;
       const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-      if (token && (!authHeader || authHeader !== `Bearer ${token}`)) {
+      if (!authHeader || authHeader !== `Bearer ${token}`) {
         res.status(401).json({ error: "Unauthorized" });
         return;
       }
@@ -1034,9 +1091,11 @@ async function main() {
 
     app.delete("/mcp", mcpDeleteHandler);
 
-    const httpServer = app.listen(port, () => {
-      console.error(`D2L Brightspace MCP server running on HTTP port ${port}`);
-      console.error(`Connect to: http://localhost:${port}/mcp`);
+    // Bind to 127.0.0.1 only — the Go gateway proxies inbound traffic.
+    // External clients cannot reach this port directly.
+    const httpServer = app.listen(port, "127.0.0.1", () => {
+      console.error(`D2L Brightspace MCP server running on http://127.0.0.1:${port}`);
+      console.error(`(Accessible via reverse proxy only — not bound to 0.0.0.0)`);
     });
 
     // Forward WebSocket upgrade events to the VNC proxy middleware
@@ -1079,6 +1138,9 @@ async function main() {
     // Session refresh scheduler — headless cookie refresh every 30min,
     // with credential-based fallback when ADFS state expires.
     startSessionRefreshScheduler();
+
+    // Storage state TTL job — daily check; marks duo_required for expired S3 states.
+    startStorageStateTTLJob();
   } else {
     console.error(
       `Invalid MCP_TRANSPORT value: ${transportType}. Must be 'stdio', 'http', or 'https'`

@@ -13,6 +13,9 @@ import { D2LClient } from "../client.js";
 import { getToken } from "../auth.js";
 import { getPiazzaCookieHeader } from "../study/piazzaAuth.js";
 import { registerDeviceToken, sendPushToUser, checkAndNotifyUpdates } from "./push.js";
+import { encryptPassword } from "../utils/kms.js";
+import { logCredentialAccess } from "../utils/auditLog.js";
+import { deleteAllUserData } from "../utils/deleteUserData.js";
 
 const router = Router();
 const rawPdfUpload = express.raw({ type: "*/*", limit: "60mb" });
@@ -41,12 +44,14 @@ router.post("/keys", async (req: Request, res: Response) => {
     const plaintext = "hzn_" + raw.toString("hex");
     const keyHash = createHash("sha256").update(plaintext).digest("hex");
 
+    // Store only the hash — never the plaintext. The key is shown once in this response and never again.
     const resp = await fetch(`${sbUrl}/rest/v1/api_keys`, {
       method: "POST",
       headers: { ...headers, "Prefer": "return=representation" },
-      body: JSON.stringify({ user_id: userId, key_hash: keyHash, key_value: plaintext }),
+      body: JSON.stringify({ user_id: userId, key_hash: keyHash }),
     });
     if (!resp.ok) throw new Error(await resp.text());
+    // Show once — if the user loses this they must delete and regenerate
     res.json({ apiKey: plaintext });
   } catch (e: any) {
     console.error("[API] key create error:", e);
@@ -54,22 +59,48 @@ router.post("/keys", async (req: Request, res: Response) => {
   }
 });
 
-/** GET /api/keys — check if user has an API key, return it if stored */
+/** GET /api/keys — check if user has an API key. Does NOT return the plaintext key (shown once at creation only). */
 router.get("/keys", async (req: Request, res: Response) => {
   const userId = req.userId!;
   try {
     const sbUrl = process.env.SUPABASE_URL;
     const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
     if (!sbUrl || !sbKey) throw new Error("Missing Supabase config");
-    const resp = await fetch(`${sbUrl}/rest/v1/api_keys?user_id=eq.${userId}&select=id,key_value&limit=1`, {
+    const resp = await fetch(`${sbUrl}/rest/v1/api_keys?user_id=eq.${userId}&select=id&limit=1`, {
       headers: { "apikey": sbKey, "Authorization": `Bearer ${sbKey}` },
     });
     if (!resp.ok) throw new Error(await resp.text());
-    const rows = await resp.json() as Array<{ id: string; key_value?: string }>;
+    const rows = await resp.json() as Array<{ id: string }>;
     const hasKey = Array.isArray(rows) && rows.length > 0;
-    const key = hasKey ? (rows[0].key_value || null) : null;
-    res.json({ hasKey, key });
+    res.json({ hasKey });
   } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/**
+ * DELETE /api/disconnect — wipe every trace of the current user.
+ *
+ * Atomically deletes:
+ *   - Supabase user_credentials row (passwords, tokens)
+ *   - Supabase api_keys row
+ *   - S3 browser-state for the user (ADFS + D2L session cookies)
+ *   - Disk Playwright sessions (~/.d2l-session-{userId}, ~/.piazza-session-{userId})
+ *
+ * The response includes a breakdown of what was deleted and any errors.
+ */
+router.delete("/disconnect", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  try {
+    const result = await deleteAllUserData(userId);
+    const allSuccess = result.errors.length === 0;
+    res.status(allSuccess ? 200 : 207).json({
+      ok: allSuccess,
+      deleted: result.deleted,
+      errors: result.errors,
+    });
+  } catch (e: any) {
+    console.error("[API] disconnect error:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -880,7 +911,9 @@ router.post("/d2l/connect", async (req: Request, res: Response) => {
 
   try {
     // First, verify credentials by attempting to authenticate
-    // Temporarily store credentials to test authentication
+    // Store credentials with KMS-encrypted password
+    const encryptedPassword = await encryptPassword(password);
+    await logCredentialAccess(userId, "d2l_password", "write", "POST /d2l/connect");
     const { error: tempError } = await supabase
       .from("user_credentials")
       .upsert({
@@ -888,7 +921,7 @@ router.post("/d2l/connect", async (req: Request, res: Response) => {
         service: "d2l",
         host: host,
         username: username,
-        password: password, // TODO: Encrypt this in production
+        password: encryptedPassword,
         updated_at: new Date().toISOString(),
       }, {
         onConflict: "user_id,service"
@@ -1691,13 +1724,15 @@ router.post("/piazza/connect", async (req: Request, res: Response) => {
   try {
     console.info("[API] Storing Piazza credentials:", { userId, email });
 
+    const encryptedPiazzaPassword = await encryptPassword(password);
+    await logCredentialAccess(userId, "piazza_password", "write", "POST /piazza/connect");
     const { error } = await supabase
       .from("user_credentials")
       .upsert({
         user_id: userId,
         service: "piazza",
         email,
-        password, // TODO: Encrypt this in production
+        password: encryptedPiazzaPassword,
         updated_at: new Date().toISOString(),
       }, {
         onConflict: "user_id,service"

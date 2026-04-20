@@ -22,18 +22,14 @@ import { randomUUID } from "crypto";
 import path from "path";
 import fs from "fs/promises";
 import os from "os";
-import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { supabase } from "../utils/supabase.js";
 import { clearDuoRequired, markSessionValidated } from "../auth.js";
+import { loadStorageStateFromS3, saveStorageStateToS3 } from "../utils/s3Storage.js";
 
 const SESSIONS_BASE = process.env.SESSIONS_PATH || "/tmp/sessions";
 const SESSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const VNC_BASE_PORT = 5900;
 const WS_BASE_PORT = 6080;
-const S3_BUCKET = process.env.S3_BUCKET || "study-mcp-notes";
-const S3_REGION = process.env.AWS_REGION || "us-east-1";
-
-const s3 = new S3Client({ region: S3_REGION });
 
 // Port pool — supports up to 50 concurrent auth sessions
 const MAX_SESSIONS = 50;
@@ -93,43 +89,8 @@ async function waitForXvfb(displayNum: number, timeoutMs = 5000): Promise<void> 
   throw new Error(`Xvfb display :${displayNum} did not start within ${timeoutMs}ms`);
 }
 
-/** Download browser storage state from S3. Returns local temp path or undefined if not found. */
-async function loadStorageStateFromS3(userId: string): Promise<string | undefined> {
-  const key = `browser-state/${userId}/storage-state.json`;
-  try {
-    const res = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }));
-    const body = await res.Body?.transformToString();
-    if (!body) return undefined;
-    const tmpPath = path.join(os.tmpdir(), `browser-state-${userId}.json`);
-    await fs.writeFile(tmpPath, body);
-    console.error(`[VNC] Loaded browser storage state from S3 for user ${userId}`);
-    return tmpPath;
-  } catch (e: any) {
-    if (e?.name === "NoSuchKey") {
-      console.error(`[VNC] No saved browser state for user ${userId} — fresh session`);
-    } else {
-      console.error(`[VNC] Failed to load browser state from S3: ${e?.message}`);
-    }
-    return undefined;
-  }
-}
-
-/** Upload full browser storage state to S3 (persists ADFS + D2L cookies). */
-async function saveStorageStateToS3(userId: string, statePath: string): Promise<void> {
-  const key = `browser-state/${userId}/storage-state.json`;
-  try {
-    const body = await fs.readFile(statePath, "utf-8");
-    await s3.send(new PutObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: key,
-      Body: body,
-      ContentType: "application/json",
-    }));
-    console.error(`[VNC] Saved browser storage state to S3 for user ${userId}`);
-  } catch (e: any) {
-    console.error(`[VNC] Failed to save browser state to S3: ${e?.message}`);
-  }
-}
+// S3 storage state helpers are imported from utils/s3Storage.ts
+// (loadStorageStateFromS3, saveStorageStateToS3) — encrypted + TTL-aware
 
 export class BrowserSessionManager {
 
@@ -311,11 +272,8 @@ export class BrowserSessionManager {
           console.error(`[VNC] Captured cookies are stale (status ${testResp.status}) for user ${userId} — forcing fresh login`);
           // Clear S3 state so next session forces real login
           try {
-            const { DeleteObjectCommand } = await import("@aws-sdk/client-s3");
-            await s3.send(new DeleteObjectCommand({
-              Bucket: S3_BUCKET,
-              Key: `browser-state/${userId}/storage-state.json`,
-            }));
+            const { deleteStorageStateFromS3 } = await import("../utils/s3Storage.js");
+            await deleteStorageStateFromS3(userId);
             console.error(`[VNC] Deleted stale S3 browser state for user ${userId}`);
           } catch (e: any) {
             console.error(`[VNC] Failed to delete S3 state: ${e?.message}`);

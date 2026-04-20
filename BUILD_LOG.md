@@ -204,6 +204,75 @@ ECS task `study-mcp-backend:103`.
 
 ---
 
+## Security Hardening Tasks 1–6
+**Date:** 2026-04-20
+**Status:** ✅ Done (build clean, tests pass — requires KMS key + migration before deploy)
+
+### Task 1 — KMS Password Encryption
+**What was built:**
+- `src/utils/kms.ts` — KMS encrypt/decrypt for passwords (`enc:kms:v1:<base64>` prefix format); envelope encryption (AES-256-GCM + KMS data key) for large payloads (S3 state)
+- `routes.ts`: D2L and Piazza passwords are KMS-encrypted before writing to `user_credentials`
+- `auth.ts` + `piazzaAuth.ts`: passwords are decrypted on read; non-encrypted values (env-var fallback, pre-migration rows) pass through as-is
+- `scripts/migrate-encrypt-passwords.ts`: one-time migration script to re-encrypt all existing plaintext passwords; idempotent, safe to re-run
+- Added `@aws-sdk/client-kms` dependency
+
+**Required before deploy:**
+1. Create AWS KMS symmetric key → set `KMS_KEY_ARN` env var
+2. Add `kms:Encrypt`, `kms:Decrypt`, `kms:GenerateDataKey` to ECS task IAM role
+3. Run `npx tsx scripts/migrate-encrypt-passwords.ts` once
+
+### Task 2 — Real Delete/Revoke
+**What was built:**
+- `src/utils/deleteUserData.ts` — deletes Supabase credentials row, Supabase API key, S3 browser state, `~/.d2l-session-{userId}`, `~/.piazza-session-{userId}` atomically; collects partial-failure errors
+- `DELETE /api/disconnect` endpoint in `routes.ts`
+- `delete_my_data` MCP tool registered in `index.ts`
+
+### Task 3 — Tighten Auth Defaults
+**What was built:**
+- `index.ts`: `STUDY_MCP_TOKEN` is now required at startup (hard exit if missing); all three MCP handlers (POST/GET/DELETE `/mcp`) always enforce the token — no unauthenticated mode
+- `index.ts`: server binds to `127.0.0.1` instead of `0.0.0.0`
+- `routes.ts` POST `/api/keys`: no longer stores `key_value` in the DB — key is shown once in the response only
+- `routes.ts` GET `/api/keys`: no longer returns the key — returns `{ hasKey: boolean }` only
+- Migration `20260420010000_drop_api_key_plaintext.sql`: drops `key_value` column + deletes all existing keys (treat as compromised; users must regenerate)
+
+**Breaking change:** Existing API keys invalidated. Users must regenerate. Set `STUDY_MCP_TOKEN` before deploy.
+
+### Task 4 — Storage State TTLs
+**What was built:**
+- `s3Storage.ts`: `captured_at` stored as S3 object metadata on every save; on load, envelope age is checked — states older than 25 days are treated as expired (returns `undefined`, logs clearly)
+- `src/jobs/storageStateTTL.ts`: daily job that uses `HeadObject` to check S3 metadata for all users with credentials; marks `duo_required_at` + sends push notification for expired states
+- `index.ts`: `startStorageStateTTLJob()` called at startup (runs 10min after start, then every 24h)
+
+### Task 5 — Encrypt S3 Storage State
+**What was built:**
+- `s3Storage.ts` `saveStorageStateToS3`: encrypts the browser state JSON with envelope encryption (AES-256-GCM, KMS-generated data key) before writing to S3. `ContentType: application/octet-stream`. Falls back to unencrypted if `KMS_KEY_ARN` not set (dev mode, logged as warning).
+- `s3Storage.ts` `loadStorageStateFromS3`: detects encrypted envelopes (`v: 2` + `encrypted_key` field) and decrypts; legacy unencrypted objects are used as-is with a warning
+- `BrowserSessionManager.ts`: removed duplicate `loadStorageStateFromS3`/`saveStorageStateToS3` functions; now imports from `utils/s3Storage.ts` (single source of truth)
+- Stale-state deletion in BrowserSessionManager now uses `deleteStorageStateFromS3` from `utils/s3Storage.ts`
+
+### Task 6 — Audit Log
+**What was built:**
+- `src/utils/auditLog.ts` — fire-and-forget `logCredentialAccess(userId, type, action, trigger)` that appends to Supabase `credential_access_log`; never throws, never blocks caller
+- Migration `20260420000000_credential_access_log.sql`: creates `credential_access_log` table with RLS enabled (service-role only; no client access policies)
+- Audit calls added to: `auth.ts` (D2L password read), `piazzaAuth.ts` (Piazza password read), `routes.ts` (D2L + Piazza password write), `deleteUserData.ts` (all-delete), `s3Storage.ts` (state read + write)
+
+### Tests run
+- [x] TypeScript: `tsc --noEmit` → clean
+- [x] Full build: `npm run build` → clean
+- [x] Unit tests: 3 passed, 5 skipped (same as before — no regressions)
+- [ ] Integration tests: skipped (D2L sessions expired — pre-existing)
+- [ ] End-to-end with real KMS key: requires deployment + AWS setup
+
+### Deployment order
+1. Apply Supabase migrations: `20260420000000_credential_access_log.sql`, `20260420010000_drop_api_key_plaintext.sql`
+2. Set `KMS_KEY_ARN` and `STUDY_MCP_TOKEN` in ECS task environment
+3. Attach KMS IAM policy to ECS task role
+4. Deploy new container
+5. Run password migration: `npx tsx scripts/migrate-encrypt-passwords.ts`
+6. Verify: query `user_credentials` — all `password` values should start with `enc:kms:v1:`
+
+---
+
 ## Bug Fix — VNC Re-login Not Restoring Tool Functionality
 **Date:** 2026-04-20
 **Status:** ✅ Done

@@ -4,6 +4,8 @@ import { homedir } from "os";
 import { join } from "path";
 import { existsSync } from "fs";
 import { supabase } from "../utils/supabase.js";
+import { decryptPassword } from "../utils/kms.js";
+import { logCredentialAccess } from "../utils/auditLog.js";
 
 // Get session path for a user (or default)
 function getSessionPath(userId?: string): string {
@@ -25,9 +27,10 @@ async function getPiazzaCredentials(userId?: string): Promise<{ email: string; p
         .single();
 
       if (!error && data) {
+        await logCredentialAccess(userId, "piazza_password", "read", "getPiazzaCredentials");
         return {
           email: data.email,
-          password: data.password,
+          password: data.password ? await decryptPassword(data.password) : data.password,
         };
       }
     } catch (e) {
