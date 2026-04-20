@@ -46,16 +46,19 @@ export async function deleteAllUserData(userId: string): Promise<DeleteUserDataR
   };
 
   const sbUrl = process.env.SUPABASE_URL;
-  const sbKey =
-    process.env.SUPABASE_SERVICE_ROLE_KEY ||
-    process.env.SUPABASE_ANON_KEY ||
-    process.env.SUPABASE_KEY;
+  // Destructive operations require the service role key — anon key has RLS
+  // restrictions that cause DELETEs to return 200 but silently delete nothing.
+  const sbServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  const headers = sbUrl && sbKey
-    ? { apikey: sbKey, Authorization: `Bearer ${sbKey}`, "Content-Type": "application/json" }
+  const headers = sbUrl && sbServiceKey
+    ? { apikey: sbServiceKey, Authorization: `Bearer ${sbServiceKey}`, "Content-Type": "application/json" }
     : null;
 
   // ── 1. Supabase: delete user_credentials ────────────────────────────────
+  if (!sbUrl || !sbServiceKey) {
+    result.errors.push("SUPABASE_SERVICE_ROLE_KEY is not set — skipped Supabase deletion. Anon key is not safe for destructive operations.");
+  }
+
   if (headers && sbUrl) {
     try {
       const resp = await fetch(

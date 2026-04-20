@@ -14,6 +14,7 @@ import {
   STORAGE_STATE_MAX_AGE_DAYS,
 } from "../utils/s3Storage.js";
 import { sendPushToUser } from "../api/push.js";
+import { clearSessionValidation } from "../auth.js";
 
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // run daily
 
@@ -77,6 +78,10 @@ async function markDuoRequired(userId: string): Promise<void> {
         }),
       }
     );
+
+    // Clear in-memory session validation so the next tool call triggers a live
+    // token check rather than skipping it because the user was previously validated.
+    clearSessionValidation(userId);
 
     await sendPushToUser(
       userId,

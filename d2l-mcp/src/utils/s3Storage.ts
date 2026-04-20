@@ -87,8 +87,17 @@ export async function loadStorageStateFromS3(userId: string): Promise<string | u
 
     } else {
       // ── Legacy unencrypted object ─────────────────────────────────────
-      // Use as-is so the user is not immediately broken, but log a warning.
-      // The next successful auth will re-save in encrypted format.
+      // Check TTL using the captured_at S3 object metadata before serving.
+      // GetObjectCommand returns Metadata the same way HeadObject does.
+      const legacyCapturedAt = res.Metadata?.captured_at;
+      if (legacyCapturedAt && isStateExpired(legacyCapturedAt)) {
+        console.error(
+          `[S3] Legacy storage state for user ${userId} is expired (captured ${legacyCapturedAt}). ` +
+          `Treating as not found — duo reauth required.`
+        );
+        return undefined;
+      }
+
       console.error(
         `[S3] WARNING: storage state for user ${userId} is unencrypted (legacy). ` +
         `Will be re-encrypted on next successful auth.`

@@ -804,16 +804,18 @@ async function main() {
       req: express.Request,
       res: express.Response
     ) => {
-      // Bearer token auth — always required (STUDY_MCP_TOKEN enforced at startup)
+      // Auth: accept requests that came through the gateway (X-User-Id injected after JWT
+      // validation) OR direct requests with the STUDY_MCP_TOKEN (localhost only).
       const token = process.env.STUDY_MCP_TOKEN!;
       const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-      if (!authHeader || authHeader !== `Bearer ${token}`) {
+      const xUserId = req.headers["x-user-id"] as string;
+      if (!xUserId && (!authHeader || authHeader !== `Bearer ${token}`)) {
         res.status(401).json({ error: "Unauthorized" });
         return;
       }
 
       // Extract userId from X-User-Id header (injected by Go gateway after JWT verification)
-      const requestUserId = (req.headers["x-user-id"] as string) || "legacy";
+      const requestUserId = xUserId || "legacy";
 
       return runWithUserId(requestUserId, async () => {
       const requestStartTime = Date.now();
@@ -997,10 +999,11 @@ async function main() {
       req: express.Request,
       res: express.Response
     ) => {
-      // Bearer token auth — always required (STUDY_MCP_TOKEN enforced at startup)
+      // Auth: accept requests that came through the gateway (X-User-Id injected after JWT
+      // validation) OR direct requests with the STUDY_MCP_TOKEN (localhost only).
       const token = process.env.STUDY_MCP_TOKEN!;
       const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-      if (!authHeader || authHeader !== `Bearer ${token}`) {
+      if (!req.headers["x-user-id"] && (!authHeader || authHeader !== `Bearer ${token}`)) {
         res.status(401).json({ error: "Unauthorized" });
         return;
       }
@@ -1045,10 +1048,11 @@ async function main() {
       req: express.Request,
       res: express.Response
     ) => {
-      // Bearer token auth — always required (STUDY_MCP_TOKEN enforced at startup)
+      // Auth: accept requests that came through the gateway (X-User-Id injected after JWT
+      // validation) OR direct requests with the STUDY_MCP_TOKEN (localhost only).
       const token = process.env.STUDY_MCP_TOKEN!;
       const authHeader = req.headers["authorization"] || req.headers["Authorization"];
-      if (!authHeader || authHeader !== `Bearer ${token}`) {
+      if (!req.headers["x-user-id"] && (!authHeader || authHeader !== `Bearer ${token}`)) {
         res.status(401).json({ error: "Unauthorized" });
         return;
       }

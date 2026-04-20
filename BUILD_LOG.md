@@ -204,6 +204,21 @@ ECS task `study-mcp-backend:103`.
 
 ---
 
+## Security Bug Fixes (post-hardening)
+**Date:** 2026-04-20
+**Status:** ✅ Done
+
+### Issue 1 — deleteAllUserData used anon key as fallback for DELETE
+`deleteUserData.ts`: removed anon key fallback for Supabase deletes. Now requires `SUPABASE_SERVICE_ROLE_KEY` specifically. If missing, adds a clear error to the result and skips Supabase deletion rather than silently no-oping under RLS.
+
+### Issue 2 — Legacy S3 states skipped TTL check
+`s3Storage.ts`: legacy (unencrypted) objects now check `res.Metadata?.captured_at` from the `GetObjectCommand` response before being served. If present and expired, returns `undefined` and logs clearly. Same behaviour as encrypted envelopes.
+
+### Issue 3 — TTL job left stale in-memory session validation
+`storageStateTTL.ts`: `markDuoRequired` now calls `clearSessionValidation(userId)` after the Supabase PATCH succeeds. Prevents the next tool call from skipping live token validation and using a now-expired token.
+
+---
+
 ## Security Hardening Tasks 1–6
 **Date:** 2026-04-20
 **Status:** ✅ Done (build clean, tests pass — requires KMS key + migration before deploy)
