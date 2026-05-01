@@ -10,6 +10,12 @@ interface RawAssignment {
   Assessment: { ScoreDenominator: number } | null;
 }
 
+interface RawGradeObject {
+  Id: number;
+  Name: string;
+  Weight: number | null;
+}
+
 interface RawQuiz {
   QuizId: number;
   Name: string;
@@ -33,6 +39,7 @@ interface Recommendation {
   weight: number | null;
   reason: string;
   urgencyScore: number;
+  _folderId?: number; // internal — stripped before output
 }
 
 // ---- Helpers ----
@@ -46,6 +53,7 @@ function formatDueIn(isoDate: string): string {
   return `${d} day${d === 1 ? '' : 's'}`;
 }
 
+// weight here is already a percentage (0–100) from GradeObject.Weight, not raw points
 function urgencyScore(
   dueMs: number,
   weight: number | null,
@@ -56,6 +64,20 @@ function urgencyScore(
   const weightFactor = weight != null ? weight / 100 : 0.1;
   const notStartedPenalty = notStarted ? 2 : 1;
   return (weightFactor * notStartedPenalty) / hoursUntilDue;
+}
+
+function matchGradeWeight(
+  name: string,
+  gradeObjects: RawGradeObject[]
+): number | null {
+  const lower = name.toLowerCase();
+  const match = gradeObjects.find(
+    (g) =>
+      g.Name.toLowerCase() === lower ||
+      g.Name.toLowerCase().includes(lower) ||
+      lower.includes(g.Name.toLowerCase())
+  );
+  return match?.Weight ?? null;
 }
 
 export const priorityTools = {
@@ -82,6 +104,19 @@ export const priorityTools = {
 
       const recommendations: Recommendation[] = [];
 
+      // Fetch grade objects once for weight lookup
+      let gradeObjects: RawGradeObject[] = [];
+      try {
+        const raw = (await client.getGradeObjects(orgUnitId)) as
+          | RawGradeObject[]
+          | { Objects: RawGradeObject[] };
+        gradeObjects = Array.isArray(raw)
+          ? raw
+          : (raw as { Objects: RawGradeObject[] }).Objects || [];
+      } catch {
+        // Grade objects unavailable — fall back to default weight
+      }
+
       // ---- Assignments ----
       try {
         const foldersRaw = (await client.getDropboxFolders(
@@ -96,18 +131,23 @@ export const priorityTools = {
           const dueMs = new Date(folder.DueDate).getTime();
           if (dueMs > cutoff || dueMs < Date.now() - 7 * 24 * 60 * 60 * 1000)
             continue;
-          const weight = folder.Assessment?.ScoreDenominator ?? null;
-          const score = urgencyScore(dueMs, weight, true);
+          // Use grade object Weight (% of final grade) instead of raw ScoreDenominator
+          const gradeWeight = matchGradeWeight(folder.Name, gradeObjects);
+          const displayWeight = folder.Assessment?.ScoreDenominator ?? null;
+          const score = urgencyScore(dueMs, gradeWeight, true);
           recommendations.push({
             type: 'assignment',
             name: folder.Name,
             dueIn: formatDueIn(folder.DueDate),
-            weight,
+            weight: displayWeight,
             reason:
-              weight != null
-                ? `Worth ${weight} points, due in ${formatDueIn(folder.DueDate)}`
+              gradeWeight != null
+                ? `Worth ${gradeWeight}% of final grade, due in ${formatDueIn(folder.DueDate)}`
+                : displayWeight != null
+                ? `Worth ${displayWeight} points, due in ${formatDueIn(folder.DueDate)}`
                 : `Due in ${formatDueIn(folder.DueDate)}`,
             urgencyScore: score,
+            _folderId: folder.Id,
           });
         }
       } catch {
@@ -178,9 +218,39 @@ export const priorityTools = {
         // Quizzes unavailable — skip
       }
 
-      // Sort by urgency score descending, take top 5
+      // Sort by urgency score descending, take top candidates
       recommendations.sort((a, b) => b.urgencyScore - a.urgencyScore);
-      const top = recommendations.slice(0, 5);
+      const candidates = recommendations.slice(0, 10);
+
+      // Filter out already-submitted assignments (check submissions only for top candidates)
+      const submissionChecks = await Promise.allSettled(
+        candidates
+          .filter((r) => r.type === 'assignment' && r._folderId != null)
+          .map(async (r) => {
+            try {
+              const raw = (await client.getMySubmissions(orgUnitId, r._folderId!)) as
+                | { HasSubmission?: boolean; Submissions?: unknown[] }
+                | unknown[];
+              const hasSubmission = Array.isArray(raw)
+                ? raw.length > 0
+                : !!(raw.HasSubmission || (raw.Submissions && (raw.Submissions as unknown[]).length > 0));
+              return { name: r.name, submitted: hasSubmission };
+            } catch {
+              return { name: r.name, submitted: false };
+            }
+          })
+      );
+      const submittedNames = new Set<string>();
+      for (const result of submissionChecks) {
+        if (result.status === 'fulfilled' && result.value.submitted) {
+          submittedNames.add(result.value.name);
+        }
+      }
+
+      const top = candidates
+        .filter((r) => !submittedNames.has(r.name))
+        .slice(0, 5)
+        .map(({ _folderId: _f, ...rec }) => rec); // strip internal field
 
       let summary: string;
       if (top.length === 0) {

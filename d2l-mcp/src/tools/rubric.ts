@@ -27,6 +27,9 @@ interface RawDropboxFolder {
   CustomInstructions: { Text: string; Html: string } | null;
   DueDate: string | null;
   Assessment: { ScoreDenominator: number } | null;
+  // D2L may expose rubric associations on the folder
+  RubricId?: number | null;
+  AssociatedRubrics?: Array<{ RubricId: number }> | null;
 }
 
 export const rubricTools = {
@@ -59,15 +62,34 @@ export const rubricTools = {
         maxPoints: number;
       }> = [];
 
+      let rubricNote: string | null = null;
       try {
         const rubricsRaw = (await client.getRubrics(orgUnitId)) as
           | RawRubric[]
           | { Objects: RawRubric[] };
-        const rubrics: RawRubric[] = Array.isArray(rubricsRaw)
+        const allRubrics: RawRubric[] = Array.isArray(rubricsRaw)
           ? rubricsRaw
           : (rubricsRaw as { Objects: RawRubric[] }).Objects || [];
 
-        // Flatten all criteria from all rubrics associated with this course
+        // Filter rubrics to only those associated with this assignment, if D2L provides the link.
+        // D2L may expose this via folder.AssociatedRubrics[] or folder.RubricId.
+        const associatedIds: Set<number> = new Set();
+        if (folder.AssociatedRubrics && folder.AssociatedRubrics.length > 0) {
+          folder.AssociatedRubrics.forEach((r) => associatedIds.add(r.RubricId));
+        } else if (folder.RubricId != null) {
+          associatedIds.add(folder.RubricId);
+        }
+
+        const rubrics =
+          associatedIds.size > 0
+            ? allRubrics.filter((r) => associatedIds.has(r.RubricId))
+            : allRubrics;
+
+        if (associatedIds.size === 0 && allRubrics.length > 0) {
+          rubricNote =
+            'Note: rubric criteria shown are all rubrics in this course — D2L does not expose per-assignment rubric associations via API.';
+        }
+
         for (const rubric of rubrics) {
           for (const criterion of rubric.Criteria || []) {
             const maxPoints = Math.max(
@@ -90,7 +112,7 @@ export const rubricTools = {
         rubricCriteria = [];
       }
 
-      const result = {
+      const result: Record<string, unknown> = {
         name: folder.Name,
         instructions:
           stripHtml(
@@ -101,6 +123,7 @@ export const rubricTools = {
         totalPoints: folder.Assessment?.ScoreDenominator ?? null,
         rubricCriteria,
       };
+      if (rubricNote) result.rubricNote = rubricNote;
 
       return JSON.stringify(result, null, 2);
     },

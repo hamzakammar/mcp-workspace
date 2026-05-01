@@ -337,21 +337,27 @@ export async function refreshD2LSession(userId: string): Promise<RefreshResult> 
   const startTime = Date.now();
   console.error(`[REFRESH] Starting headless refresh for user ${userId}`);
 
-  // 1. Load current credentials from DB (host + token)
+  // 1. Load current credentials from DB (host + token + duo_required_at)
   let d2lHost = process.env.D2L_HOST || "learn.uwaterloo.ca";
   let currentToken: string | null = null;
   try {
     const sbUrl = process.env.SUPABASE_URL;
     const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
     if (sbUrl && sbKey) {
-      const resp = await fetch(`${sbUrl}/rest/v1/user_credentials?user_id=eq.${userId}&service=eq.d2l&select=host,token&limit=1`, {
+      const resp = await fetch(`${sbUrl}/rest/v1/user_credentials?user_id=eq.${userId}&service=eq.d2l&select=host,token,duo_required_at&limit=1`, {
         headers: { "apikey": sbKey, "Authorization": `Bearer ${sbKey}` },
       });
       if (resp.ok) {
-        const rows = await resp.json() as Array<{ host: string; token: string }>;
+        const rows = await resp.json() as Array<{ host: string; token: string; duo_required_at: string | null }>;
         if (rows.length > 0) {
           if (rows[0].host) d2lHost = rows[0].host;
           if (rows[0].token) currentToken = rows[0].token;
+          // Hard stop: if duo_required is already set, don't attempt headless refresh.
+          // Any browser-based attempt would trigger another Duo push on the user's phone.
+          if (rows[0].duo_required_at) {
+            console.error(`[REFRESH] Skipping user ${userId} — duo_required_at is set, manual re-auth needed`);
+            return { success: false, reason: "duo_required" };
+          }
         }
       }
     }
@@ -380,10 +386,13 @@ export async function refreshD2LSession(userId: string): Promise<RefreshResult> 
     console.error(`[REFRESH] API ping failed for user ${userId} — session expired, falling back to browser refresh`);
   }
 
-  // 4. Load saved ADFS browser state from S3
-  const storageStatePath = await loadStorageStateFromS3(userId);
+  // 4. Load saved ADFS browser state from S3.
+  // rejectIfLegacy=true: legacy (unencrypted) states are old enough that ADFS is almost
+  // certainly expired, so using them in a headless browser would trigger a real Duo push
+  // on the user's phone. Skip straight to credential login instead.
+  const storageStatePath = await loadStorageStateFromS3(userId, undefined, { rejectIfLegacy: true });
   if (!storageStatePath) {
-    console.error(`[REFRESH] No stored browser state for user ${userId} — trying credential login`);
+    console.error(`[REFRESH] No usable browser state for user ${userId} — trying credential login`);
     const credResult = await attemptCredentialLogin(userId, d2lHost);
     if (credResult) {
       console.error(`[REFRESH] Credential login succeeded for user ${userId} (no prior S3 state)`);
@@ -412,6 +421,13 @@ export async function refreshD2LSession(userId: string): Promise<RefreshResult> 
     });
 
     const page = await context.newPage();
+
+    // Block Duo push endpoints — if ADFS tries to trigger MFA in headless mode,
+    // abort the request rather than sending a real push to the user's phone.
+    await page.route(/duosecurity\.com|duoapi\.net/, route => {
+      console.error(`[REFRESH] Blocked Duo endpoint in headless browser for user ${userId}: ${route.request().url()}`);
+      route.abort();
+    });
 
     // 4. Navigate to D2L — ADFS cookies should auto-login if still valid
     await page.goto(`https://${d2lHost}/d2l/home`, {
@@ -498,17 +514,21 @@ export async function refreshD2LSession(userId: string): Promise<RefreshResult> 
  * Runs every 30 minutes, checks all users with D2L credentials older than 18 hours.
  */
 export function startSessionRefreshScheduler(): void {
-  console.error("[REFRESH] Session refresh scheduler started (interval: 30min, threshold: 18h)");
+  console.error("[REFRESH] Session refresh scheduler started (interval: 30min, threshold: 12h)");
 
   const runRefreshCycle = async () => {
     try {
       const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
 
+      // Only refresh sessions that are stale AND have not already been flagged for Duo.
+      // Users with duo_required_at set need manual VNC re-auth — retrying headless will
+      // just trigger another Duo push notification on their phone.
       const { data: staleUsers, error } = await supabase
         .from("user_credentials")
         .select("user_id, updated_at")
         .eq("service", "d2l")
-        .lt("updated_at", cutoff);
+        .lt("updated_at", cutoff)
+        .is("duo_required_at", null);
 
       if (error) {
         console.error("[REFRESH] Failed to query stale sessions:", error.message);

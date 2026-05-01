@@ -19,6 +19,8 @@ import {
 } from "../outlineClient.js";
 import { client } from "../../client.js";
 import { marshalEnrollments, type RawEnrollment } from "../../utils/marshal.js";
+import { getD2LToken } from "../../auth.js";
+import { OUTLINE_HOST_MAP, getSupportedSchools } from "../../config/outlineHosts.js";
 
 // ─── DB helpers ───────────────────────────────────────────────────────────────
 
@@ -73,6 +75,16 @@ export const OutlineTools = {
     }): Promise<string> => {
       const resolvedTerm = term || getCurrentTerm();
 
+      // Check if the user's D2L school is supported
+      const tokenRow = await getD2LToken(userId).catch(() => null);
+      const d2lHost = tokenRow?.host || process.env.D2L_HOST || '';
+      if (d2lHost && !OUTLINE_HOST_MAP[d2lHost]) {
+        return JSON.stringify({
+          success: false,
+          error: `Course outline lookup is not yet supported for your school (${d2lHost}). Supported schools: ${getSupportedSchools().join(', ')}.`,
+        }, null, 2);
+      }
+
       let cookieHeader: string;
       try {
         cookieHeader = await getOrRefreshOutlineCookies(userId);
@@ -118,6 +130,16 @@ export const OutlineTools = {
     }): Promise<string> => {
       const resolvedTerm = term || getCurrentTerm();
 
+      // Check if the user's D2L school is supported
+      const tokenRow = await getD2LToken(userId).catch(() => null);
+      const d2lHost = tokenRow?.host || process.env.D2L_HOST || '';
+      if (d2lHost && !OUTLINE_HOST_MAP[d2lHost]) {
+        return JSON.stringify({
+          success: false,
+          error: `Course outline lookup is not yet supported for your school (${d2lHost}). Supported schools: ${getSupportedSchools().join(', ')}.`,
+        }, null, 2);
+      }
+
       let cookieHeader: string;
       try {
         cookieHeader = await getOrRefreshOutlineCookies(userId);
@@ -134,11 +156,20 @@ export const OutlineTools = {
       try {
         const enrollments = await client.getMyEnrollments() as { Items: RawEnrollment[] };
         const courses = marshalEnrollments(enrollments);
-        // D2L course codes look like "CS 135 001" — extract subject+number
+        console.error(`[OUTLINE] D2L enrollments: ${courses.length} total, ${courses.filter(c => c.isActive || c.canAccess).length} active/accessible`);
+        // Extract subject+number from UWaterloo D2L codes — format varies:
+        // "CS 135 001", "CS135001", "ECE222_W26", "1261_CS135_LEC001" etc.
+        // Strategy: find first occurrence of 2–6 uppercase letters followed by 3 digits.
         enrolledCodes = courses
-          .filter(c => c.isActive && c.code)
-          .map(c => c.code.trim().replace(/\s+/g, "").replace(/\d{3}$/, "").toUpperCase())
-          .filter((code, i, arr) => arr.indexOf(code) === i && /^[A-Z]+\d+[A-Z]?$/.test(code));
+          .filter(c => (c.isActive || c.canAccess) && c.code)
+          .map(c => {
+            const normalized = c.code.replace(/\s+/g, "").toUpperCase();
+            const m = normalized.match(/([A-Z]{2,6})(\d{3})/);
+            return m ? `${m[1]}${m[2]}` : null;
+          })
+          .filter((code): code is string => code !== null)
+          .filter((code, i, arr) => arr.indexOf(code) === i);
+        console.error(`[OUTLINE] enrolledCodes: ${enrolledCodes.join(', ') || '(empty)'} — raw sample: ${courses.slice(0, 5).map(c => `"${c.code}"`).join(', ')}`);
       } catch (e: any) {
         console.error("[OUTLINE] Failed to get D2L enrollments:", e.message);
       }
@@ -147,9 +178,11 @@ export const OutlineTools = {
       let availableOnSite: string[] = [];
       try {
         const list = await fetchMyOutlineList(cookieHeader);
+        console.error(`[OUTLINE] Outline site list: ${list.length} items, terms: ${[...new Set(list.map(o => o.term))].join(', ')}`);
         availableOnSite = list
           .filter(o => o.term === resolvedTerm)
           .map(o => o.courseCode.toUpperCase());
+        console.error(`[OUTLINE] availableOnSite for term ${resolvedTerm}: ${availableOnSite.join(', ') || '(empty)'}`);
       } catch (e: any) {
         console.error("[OUTLINE] Could not fetch outline list:", e.message);
       }

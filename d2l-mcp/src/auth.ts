@@ -213,6 +213,14 @@ export async function isDuoRequired(userId: string): Promise<boolean> {
  * Returns the new token JSON string on success, null if re-login cannot complete headlessly.
  */
 async function attemptSilentRelogin(userId: string): Promise<string | null> {
+  // Hard stop: if duo_required_at is already set, launching a headless browser
+  // will hit the ADFS Duo wall and send another push notification. Bail immediately.
+  const alreadyFlagged = await isDuoRequired(userId).catch(() => false);
+  if (alreadyFlagged) {
+    console.error(`[AUTH] Skipping silent re-login for user ${userId} — duo_required_at already set`);
+    return null;
+  }
+
   console.error(`[AUTH] Attempting silent re-login for user ${userId}`);
 
   const creds = await getD2LCredentials(userId);
@@ -221,7 +229,9 @@ async function attemptSilentRelogin(userId: string): Promise<string | null> {
   const NAV_TIMEOUT_MS = 30_000;
 
   // ── Path 1: Try S3 ADFS browser state (works for 30-90 days after a VNC login) ──
-  const storageStatePath = await loadStorageStateFromS3(userId);
+  // rejectIfLegacy: legacy unencrypted states have expired ADFS sessions and would
+  // trigger a real Duo push notification in the headless browser.
+  const storageStatePath = await loadStorageStateFromS3(userId, undefined, { rejectIfLegacy: true });
   if (storageStatePath) {
     console.error(`[AUTH] S3 browser state found for user ${userId}, trying headless S3-state refresh`);
     let browser;

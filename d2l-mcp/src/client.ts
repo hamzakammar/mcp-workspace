@@ -220,6 +220,22 @@ export class D2LClient {
   async getRubrics(orgUnitId: number) {
     return this.get(`/d2l/api/le/1.67/${orgUnitId}/rubrics/`);
   }
+
+  // Submission status — check if the current user has submitted a specific assignment
+  async getMySubmissions(orgUnitId: number, folderId: number) {
+    return this.get(
+      `/d2l/api/le/${API_VERSION}/${orgUnitId}/dropbox/folders/${folderId}/submissions/mysubmissions/`
+    );
+  }
+
+  // Discussion endpoints
+  async getDiscussionForums(orgUnitId: number) {
+    return this.get(`/d2l/api/le/${API_VERSION}/${orgUnitId}/discussions/forums/`);
+  }
+
+  async getDiscussionTopics(orgUnitId: number, forumId: number) {
+    return this.get(`/d2l/api/le/${API_VERSION}/${orgUnitId}/discussions/forums/${forumId}/topics/`);
+  }
 }
 
 // Lazy proxy — picks up the current request's userId from AsyncLocalStorage on each call.

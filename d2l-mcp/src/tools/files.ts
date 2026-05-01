@@ -35,7 +35,7 @@ async function extractContent(data: Buffer, ext: string): Promise<string | null>
         // Clean up temp file
         try {
           fs.unlinkSync(tempFile);
-        } catch {}
+        } catch (err) { console.error('[FILES] Operation failed:', err); }
         
         if (textOutput && textOutput.trim().length > 0) {
           console.error(`[DOCX] Successfully extracted text using macOS textutil`);

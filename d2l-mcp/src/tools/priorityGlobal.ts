@@ -29,6 +29,12 @@ interface RawAttempt {
   IsCompleted: boolean;
 }
 
+interface RawGradeObject {
+  Id: number;
+  Name: string;
+  Weight: number | null;
+}
+
 // ---- Output types ----
 
 interface GlobalRecommendation {
@@ -40,6 +46,8 @@ interface GlobalRecommendation {
   weight: number | null;
   reason: string;
   urgencyScore: number;
+  _orgUnitId?: number; // internal — stripped before output
+  _folderId?: number;  // internal — stripped before output
 }
 
 // ---- Helpers ----
@@ -53,12 +61,24 @@ function formatDueIn(isoDate: string): string {
   return `${d} day${d === 1 ? '' : 's'}`;
 }
 
+// weight here is already a percentage (0–100) from GradeObject.Weight, not raw points
 function urgencyScore(dueMs: number, weight: number | null, notStarted: boolean): number {
   const now = Date.now();
   const hoursUntilDue = Math.max((dueMs - now) / (1000 * 60 * 60), 0.1);
   const weightFactor = weight != null ? weight / 100 : 0.1;
   const notStartedPenalty = notStarted ? 2 : 1;
   return (weightFactor * notStartedPenalty) / hoursUntilDue;
+}
+
+function matchGradeWeight(name: string, gradeObjects: RawGradeObject[]): number | null {
+  const lower = name.toLowerCase();
+  const match = gradeObjects.find(
+    (g) =>
+      g.Name.toLowerCase() === lower ||
+      g.Name.toLowerCase().includes(lower) ||
+      lower.includes(g.Name.toLowerCase())
+  );
+  return match?.Weight ?? null;
 }
 
 async function getCourseRecommendations(
@@ -71,6 +91,19 @@ async function getCourseRecommendations(
   const now = Date.now();
   const pastCutoff = now - 7 * 24 * 60 * 60 * 1000;
 
+  // Fetch grade objects once for weight lookup
+  let gradeObjects: RawGradeObject[] = [];
+  try {
+    const raw = (await client.getGradeObjects(orgUnitId)) as
+      | RawGradeObject[]
+      | { Objects: RawGradeObject[] };
+    gradeObjects = Array.isArray(raw)
+      ? raw
+      : (raw as { Objects: RawGradeObject[] }).Objects || [];
+  } catch {
+    // Grade objects unavailable — fall back to default weight
+  }
+
   // Assignments
   try {
     const foldersRaw = (await client.getDropboxFolders(orgUnitId)) as RawAssignment[];
@@ -79,18 +112,24 @@ async function getCourseRecommendations(
       if (!folder.DueDate) continue;
       const dueMs = new Date(folder.DueDate).getTime();
       if (dueMs > cutoff || dueMs < pastCutoff) continue;
-      const weight = folder.Assessment?.ScoreDenominator ?? null;
+      // Use grade object Weight (% of final grade) instead of raw ScoreDenominator
+      const gradeWeight = matchGradeWeight(folder.Name, gradeObjects);
+      const displayWeight = folder.Assessment?.ScoreDenominator ?? null;
       recs.push({
         type: 'assignment',
         courseName,
         courseCode,
         name: folder.Name,
         dueIn: formatDueIn(folder.DueDate),
-        weight,
-        reason: weight != null
-          ? `Worth ${weight} points, due in ${formatDueIn(folder.DueDate)}`
+        weight: displayWeight,
+        reason: gradeWeight != null
+          ? `Worth ${gradeWeight}% of final grade, due in ${formatDueIn(folder.DueDate)}`
+          : displayWeight != null
+          ? `Worth ${displayWeight} points, due in ${formatDueIn(folder.DueDate)}`
           : `Due in ${formatDueIn(folder.DueDate)}`,
-        urgencyScore: urgencyScore(dueMs, weight, true),
+        urgencyScore: urgencyScore(dueMs, gradeWeight, true),
+        _orgUnitId: orgUnitId,
+        _folderId: folder.Id,
       });
     }
   } catch {
@@ -187,22 +226,64 @@ export const priorityGlobalTools = {
         }, null, 2);
       }
 
-      // 2. Fetch assignments + quizzes for all courses in parallel
-      const perCourseResults = await Promise.all(
-        activeCourses.map((e) =>
-          getCourseRecommendations(
-            e.OrgUnit.Id,
-            e.OrgUnit.Name,
-            e.OrgUnit.Code || '',
-            cutoff
+      // 2. Fetch assignments + quizzes with a concurrency limit of 4 courses at a time
+      // Using Promise.allSettled so one failing course doesn't abort the whole request.
+      const CONCURRENCY = 4;
+      const perCourseResults: GlobalRecommendation[][] = [];
+      for (let i = 0; i < activeCourses.length; i += CONCURRENCY) {
+        const batch = activeCourses.slice(i, i + CONCURRENCY);
+        const batchResults = await Promise.allSettled(
+          batch.map((e) =>
+            getCourseRecommendations(
+              e.OrgUnit.Id,
+              e.OrgUnit.Name,
+              e.OrgUnit.Code || '',
+              cutoff
+            )
           )
-        )
-      );
+        );
+        for (const result of batchResults) {
+          if (result.status === 'fulfilled') {
+            perCourseResults.push(result.value);
+          }
+          // rejected: skip silently — one bad course shouldn't break the whole list
+        }
+      }
 
-      // 3. Flatten, sort by urgency, take top 10
+      // 3. Flatten, sort by urgency, check submissions for top candidates, take top 10
       const all: GlobalRecommendation[] = perCourseResults.flat();
       all.sort((a, b) => b.urgencyScore - a.urgencyScore);
-      const top = all.slice(0, 10);
+      const candidates = all.slice(0, 20); // check submissions for top 20 candidates
+
+      // Filter out already-submitted assignments (only check assignments in top candidates)
+      const submissionChecks = await Promise.allSettled(
+        candidates
+          .filter((r) => r.type === 'assignment' && r._orgUnitId != null && r._folderId != null)
+          .map(async (r) => {
+            try {
+              const raw = (await client.getMySubmissions(r._orgUnitId!, r._folderId!)) as
+                | { HasSubmission?: boolean; Submissions?: unknown[] }
+                | unknown[];
+              const hasSubmission = Array.isArray(raw)
+                ? raw.length > 0
+                : !!(raw.HasSubmission || (raw.Submissions && (raw.Submissions as unknown[]).length > 0));
+              return { name: r.name, courseName: r.courseName, submitted: hasSubmission };
+            } catch {
+              return { name: r.name, courseName: r.courseName, submitted: false };
+            }
+          })
+      );
+      const submittedKeys = new Set<string>();
+      for (const result of submissionChecks) {
+        if (result.status === 'fulfilled' && result.value.submitted) {
+          submittedKeys.add(`${result.value.courseName}::${result.value.name}`);
+        }
+      }
+
+      const top = candidates
+        .filter((r) => !submittedKeys.has(`${r.courseName}::${r.name}`))
+        .slice(0, 10)
+        .map(({ _orgUnitId: _o, _folderId: _f, ...rec }) => rec); // strip internal fields
 
       let summary: string;
       if (top.length === 0) {

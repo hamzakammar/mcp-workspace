@@ -321,16 +321,17 @@ export async function fetchMyOutlineList(cookieHeader: string): Promise<Array<{ 
 }
 
 /**
- * Get the current academic term string in YYMM format.
- * UWaterloo terms: 01=Winter, 05=Spring, 09=Fall
+ * Get the current academic term string in UWaterloo's 4-digit format.
+ * Format: 1YYT — where YY = last 2 digits of year, T = 1 (Winter), 5 (Spring), 9 (Fall)
+ * Examples: 1261 = Winter 2026, 1265 = Spring 2026, 1259 = Fall 2025
  */
 export function getCurrentTerm(): string {
   const now = new Date();
-  const yy = String(now.getFullYear()).slice(2);
+  const yy = String(now.getFullYear() % 100).padStart(2, "0");
   const month = now.getMonth() + 1;
-  let termMonth: string;
-  if (month >= 9) termMonth = "09";
-  else if (month >= 5) termMonth = "05";
-  else termMonth = "01";
-  return `${yy}${termMonth}`;
+  let termIndex: string;
+  if (month >= 9) termIndex = "9";
+  else if (month >= 5) termIndex = "5";
+  else termIndex = "1";
+  return `1${yy}${termIndex}`;
 }

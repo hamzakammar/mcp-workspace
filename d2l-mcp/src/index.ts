@@ -22,6 +22,10 @@ import { quizTools } from "./tools/quizzes.js";
 import { rubricTools } from "./tools/rubric.js";
 import { priorityTools } from "./tools/priority.js";
 import { priorityGlobalTools } from "./tools/priorityGlobal.js";
+import { discussionTools } from "./tools/discussions.js";
+import { statusTools } from "./tools/status.js";
+import { crowdmarkTools } from "./tools/crowdmark.js";
+import { connectTools } from "./tools/connect.js";
 import { D2LClient } from "./client.js";
 import { startSessionRefreshScheduler } from "./jobs/sessionRefresher.js";
 import { startStorageStateTTLJob } from "./jobs/storageStateTTL.js";
@@ -150,8 +154,8 @@ function createServer(): McpServer {
                 : { ...parsed, _urgentReminders: urgentItems };
               finalResult = JSON.stringify(withReminders, null, 2);
             } catch {
-              // Non-JSON result — append as suffix
-              finalResult = result + `\n\n_urgentReminders: ${JSON.stringify(urgentItems)}`;
+              // Non-JSON result — skip injection entirely to avoid malformed output
+              console.error(`[TOOL] ${toolName} returned non-JSON result; skipping _urgentReminders injection`);
             }
             return { content: [{ type: "text" as const, text: finalResult }] };
           } catch {
@@ -606,6 +610,82 @@ function createServer(): McpServer {
       return await priorityGlobalTools.what_should_i_work_on_global.handler(
         args as { hoursAhead?: number }
       );
+    })
+  );
+
+  // Register discussion boards tool (Task 11)
+  server.tool(
+    "get_discussion_boards",
+    discussionTools.get_discussion_boards.description,
+    { orgUnitId: discussionTools.get_discussion_boards.schema.orgUnitId },
+    wrapToolHandler("get_discussion_boards", async (args) => {
+      return await discussionTools.get_discussion_boards.handler(args as { orgUnitId: number });
+    })
+  );
+
+  // Register Crowdmark tools (Task 9)
+  server.tool(
+    "get_crowdmark_assignments",
+    crowdmarkTools.get_crowdmark_assignments.description,
+    {},
+    wrapToolHandler("get_crowdmark_assignments", async () => {
+      return await crowdmarkTools.get_crowdmark_assignments.handler();
+    })
+  );
+
+  server.tool(
+    "get_crowdmark_feedback",
+    crowdmarkTools.get_crowdmark_feedback.description,
+    { assignmentId: crowdmarkTools.get_crowdmark_feedback.schema.assignmentId },
+    wrapToolHandler("get_crowdmark_feedback", async (args) => {
+      return await crowdmarkTools.get_crowdmark_feedback.handler(args as { assignmentId: string });
+    })
+  );
+
+  // Register connect tools (optional integration setup via MCP)
+  server.tool(
+    "connect_crowdmark",
+    connectTools.connect_crowdmark.description,
+    connectTools.connect_crowdmark.schema,
+    wrapToolHandler("connect_crowdmark", async (args) => {
+      return await connectTools.connect_crowdmark.handler(args as { cookie: string });
+    })
+  );
+
+  server.tool(
+    "connect_outline",
+    connectTools.connect_outline.description,
+    connectTools.connect_outline.schema,
+    wrapToolHandler("connect_outline", async (args) => {
+      return await connectTools.connect_outline.handler(args as { cookie: string });
+    })
+  );
+
+  server.tool(
+    "connect_piazza",
+    connectTools.connect_piazza.description,
+    connectTools.connect_piazza.schema,
+    wrapToolHandler("connect_piazza", async (args) => {
+      return await connectTools.connect_piazza.handler(args as { email: string; password: string });
+    })
+  );
+
+  server.tool(
+    "get_connection_guide",
+    connectTools.get_connection_guide.description,
+    connectTools.get_connection_guide.schema,
+    wrapToolHandler("get_connection_guide", async (args) => {
+      return await connectTools.get_connection_guide.handler(args as { service?: string });
+    })
+  );
+
+  // Register horizon status tool (Task 12)
+  server.tool(
+    "get_horizon_status",
+    statusTools.get_horizon_status.description,
+    {},
+    wrapToolHandler("get_horizon_status", async () => {
+      return await statusTools.get_horizon_status.handler();
     })
   );
 

@@ -93,6 +93,81 @@ router.get("/auth/d2l/status/:sessionId", async (req: Request, res: Response) =>
 });
 
 /**
+ * POST /auth/outline/start
+ * Body: { outlineHost?: string }
+ * Returns: { sessionId, vncUrl, message }
+ */
+router.post("/auth/outline/start", authMiddleware, async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  const outlineHost = (req.body?.outlineHost as string) || "outline.uwaterloo.ca";
+
+  try {
+    const reqHost = resolvePublicHost(req);
+    const { sessionId, vncUrl } = await BrowserSessionManager.startOutlineSession(userId, outlineHost, reqHost);
+    res.json({
+      sessionId,
+      vncUrl,
+      message: "Open the vncUrl in your browser to log into the course outline portal. The session will close automatically once you're logged in.",
+    });
+  } catch (err: any) {
+    console.error("[AUTH] Failed to start outline browser session:", err);
+    res.status(500).json({ error: err.message || "Failed to start outline browser session" });
+  }
+});
+
+/**
+ * GET /auth/outline/status/:sessionId
+ * Returns status for a specific outline session (used by dashboard polling).
+ * No auth required — sessionId is the secret.
+ */
+router.get("/auth/outline/status/:sessionId", async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  const session = BrowserSessionManager.getSession(sessionId);
+
+  if (!session) {
+    res.json({ status: "no_session" });
+    return;
+  }
+
+  res.json({
+    sessionId: session.sessionId,
+    status: session.status,
+    createdAt: session.createdAt,
+  });
+});
+
+/**
+ * POST /auth/crowdmark/start
+ * Returns: { sessionId, vncUrl, message }
+ */
+router.post("/auth/crowdmark/start", authMiddleware, async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  try {
+    const reqHost = resolvePublicHost(req);
+    const { sessionId, vncUrl } = await BrowserSessionManager.startCrowdmarkSession(userId, reqHost);
+    res.json({
+      sessionId,
+      vncUrl,
+      message: "Open the vncUrl in your browser to log into Crowdmark. The session will close automatically once you're logged in.",
+    });
+  } catch (err: any) {
+    console.error("[AUTH] Failed to start Crowdmark browser session:", err);
+    res.status(500).json({ error: err.message || "Failed to start Crowdmark browser session" });
+  }
+});
+
+/**
+ * GET /auth/crowdmark/status/:sessionId
+ * No auth required — sessionId is the secret.
+ */
+router.get("/auth/crowdmark/status/:sessionId", async (req: Request, res: Response) => {
+  const { sessionId } = req.params;
+  const session = BrowserSessionManager.getSession(sessionId);
+  if (!session) { res.json({ status: "no_session" }); return; }
+  res.json({ sessionId: session.sessionId, status: session.status, createdAt: session.createdAt });
+});
+
+/**
  * Dynamic noVNC WebSocket proxy.
  * Route: /vnc/:sessionId/websockify
  * Proxies to the user's websockify port.

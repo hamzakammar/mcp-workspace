@@ -2471,4 +2471,122 @@ router.get("/outline/status", async (req: Request, res: Response) => {
   }
 });
 
+/** GET /api/crowdmark/status — Is Crowdmark cookie stored? */
+router.get("/crowdmark/status", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  try {
+    const { data } = await supabase
+      .from("user_credentials")
+      .select("token, updated_at")
+      .eq("user_id", userId)
+      .eq("service", "crowdmark")
+      .single();
+    const connected = !!(data?.token);
+    res.json({ connected, lastUpdated: data?.updated_at || null });
+  } catch {
+    res.json({ connected: false, lastUpdated: null });
+  }
+});
+
+/** GET /api/outline/status — Is Outline cookie stored? */
+router.get("/outline/status", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  try {
+    const sbUrl = process.env.SUPABASE_URL;
+    const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!sbUrl || !sbKey) { res.json({ connected: false }); return; }
+    const r = await fetch(`${sbUrl}/rest/v1/user_credentials?user_id=eq.${userId}&service=eq.outline&select=token,updated_at&limit=1`, {
+      headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` },
+    });
+    const rows = await r.json() as Array<{ token: string; updated_at: string }>;
+    const connected = Array.isArray(rows) && rows.length > 0 && !!rows[0].token;
+    res.json({ connected, lastUpdated: rows[0]?.updated_at || null });
+  } catch {
+    res.json({ connected: false, lastUpdated: null });
+  }
+});
+
+/** POST /api/outline/connect — Store Outline sessionid cookie */
+router.post("/outline/connect", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  const { cookie } = req.body || {};
+  if (!cookie || typeof cookie !== "string") {
+    res.status(400).json({ error: "cookie required (value of sessionid from browser DevTools)" });
+    return;
+  }
+  try {
+    // Validate the cookie works before storing
+    const sessionid = cookie.includes("sessionid=") ? cookie.split("sessionid=")[1].split(";")[0] : cookie;
+    const testRes = await fetch("https://outline.uwaterloo.ca/viewer/org/uwaterloo/", {
+      headers: { Cookie: `sessionid=${sessionid}` },
+      redirect: "manual",
+      signal: AbortSignal.timeout(8_000),
+    }).catch(() => null);
+    if (testRes && (testRes.status === 302 || testRes.status === 301)) {
+      res.status(400).json({ error: "Outline cookie invalid or expired — session was redirected to login. Please copy a fresh sessionid." });
+      return;
+    }
+    const { error } = await supabase
+      .from("user_credentials")
+      .upsert({
+        user_id: userId,
+        service: "outline",
+        token: JSON.stringify({ sessionid }),
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "user_id,service" });
+    if (error) { res.status(500).json({ error: "Failed to store cookie" }); return; }
+    res.json({ success: true, message: "Course outlines connected." });
+  } catch (e) {
+    console.error("[API] outline/connect error:", e);
+    res.status(500).json({ error: "Unexpected error" });
+  }
+});
+
+/** POST /api/crowdmark/connect — Store Crowdmark session cookie for user */
+router.post("/crowdmark/connect", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  const { cookie } = req.body || {};
+
+  if (!cookie || typeof cookie !== "string") {
+    res.status(400).json({ error: "cookie required (value of _crowdmark_session from browser DevTools)" });
+    return;
+  }
+
+  try {
+    const { error } = await supabase
+      .from("user_credentials")
+      .upsert({
+        user_id: userId,
+        service: "crowdmark",
+        token: cookie,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "user_id,service" });
+
+    if (error) {
+      res.status(500).json({ error: "Failed to store Crowdmark cookie" });
+      return;
+    }
+
+    // Quick validation: try to list assignments
+    const cookieHeader = cookie.includes('=') ? cookie : `_crowdmark_session=${cookie}`;
+    try {
+      const testRes = await fetch("https://app.crowdmark.com/api/v2/student/assignments?fields[exam-masters][]=title", {
+        headers: { Cookie: cookieHeader, Accept: "application/json" },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (testRes.status === 401 || testRes.status === 403) {
+        res.status(400).json({ error: "Crowdmark cookie invalid or expired. Please copy a fresh _crowdmark_session cookie." });
+        return;
+      }
+    } catch {
+      // Network error on validation — still store the cookie
+    }
+
+    res.json({ success: true, message: "Crowdmark connected." });
+  } catch (e) {
+    console.error("[API] crowdmark/connect error:", e);
+    res.status(500).json({ error: "Unexpected error" });
+  }
+});
+
 export default router;

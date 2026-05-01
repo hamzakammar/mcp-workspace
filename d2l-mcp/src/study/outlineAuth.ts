@@ -90,17 +90,20 @@ async function getOutlineCredentials(userId: string): Promise<{ username: string
 
 async function validateOutlineCookie(sessionid: string): Promise<boolean> {
   try {
-    const resp = await fetch(`https://${OUTLINE_HOST}/`, {
+    const resp = await fetch(`https://${OUTLINE_HOST}/viewer/org/uwaterloo/`, {
       headers: { "Cookie": `sessionid=${sessionid}` },
       redirect: "manual",
+      signal: AbortSignal.timeout(8_000),
     });
-    // If we get a redirect to the OIDC login, cookie is invalid
     const location = resp.headers.get("location") || "";
-    if (location.includes("oidc/login") || location.includes("duosecurity")) {
+    // Redirect to OIDC login = cookie is invalid or expired
+    if (location.includes("oidc/login") || location.includes("duosecurity") || location.includes("/login")) {
       return false;
     }
-    return resp.status === 200;
-  } catch {
+    // outline.uwaterloo.ca always redirects / — a 200 or any non-login redirect means valid
+    return resp.status === 200 || (resp.status >= 300 && resp.status < 400);
+  } catch (e: any) {
+    console.error(`[OUTLINE_AUTH] Cookie validation network error: ${e?.message}`);
     return false;
   }
 }

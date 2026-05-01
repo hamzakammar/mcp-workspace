@@ -41,8 +41,10 @@ export const STORAGE_STATE_MAX_AGE_DAYS = 25;
 
 const s3 = new S3Client({ region: S3_REGION });
 
-function storageStateKey(userId: string): string {
-  return `browser-state/${userId}/storage-state.json`;
+function storageStateKey(userId: string, service?: string): string {
+  // 'd2l' (default) keeps the original key for backward compatibility.
+  if (!service || service === 'd2l') return `browser-state/${userId}/storage-state.json`;
+  return `browser-state/${userId}/${service}-storage-state.json`;
 }
 
 function isStateExpired(capturedAt: string): boolean {
@@ -57,8 +59,12 @@ function isStateExpired(capturedAt: string): boolean {
  *   - the state is expired (> STORAGE_STATE_MAX_AGE_DAYS days old)
  *   - decryption fails
  */
-export async function loadStorageStateFromS3(userId: string): Promise<string | undefined> {
-  const key = storageStateKey(userId);
+export async function loadStorageStateFromS3(
+  userId: string,
+  service?: string,
+  opts?: { rejectIfLegacy?: boolean }
+): Promise<string | undefined> {
+  const key = storageStateKey(userId, service);
   try {
     const res = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: key }));
     const rawBytes = await res.Body?.transformToByteArray();
@@ -87,8 +93,17 @@ export async function loadStorageStateFromS3(userId: string): Promise<string | u
 
     } else {
       // ── Legacy unencrypted object ─────────────────────────────────────
+      if (opts?.rejectIfLegacy) {
+        // Callers like the session refresher use this to avoid launching a headless browser
+        // with stale unencrypted state — which would trigger a real Duo push notification.
+        console.error(
+          `[S3] Rejecting legacy unencrypted storage state for user ${userId} (rejectIfLegacy=true). ` +
+          `Caller should proceed without browser state.`
+        );
+        return undefined;
+      }
+
       // Check TTL using the captured_at S3 object metadata before serving.
-      // GetObjectCommand returns Metadata the same way HeadObject does.
       const legacyCapturedAt = res.Metadata?.captured_at;
       if (legacyCapturedAt && isStateExpired(legacyCapturedAt)) {
         console.error(
@@ -131,9 +146,10 @@ export async function loadStorageStateFromS3(userId: string): Promise<string | u
 export async function saveStorageStateToS3(
   userId: string,
   statePath: string,
-  capturedAt?: Date
+  capturedAt?: Date,
+  service?: string
 ): Promise<void> {
-  const key = storageStateKey(userId);
+  const key = storageStateKey(userId, service);
   const captureTime = capturedAt ?? new Date();
 
   try {

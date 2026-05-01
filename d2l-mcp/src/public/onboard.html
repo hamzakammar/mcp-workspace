@@ -632,6 +632,28 @@
           <span id="piazzaStatusDot" style="width:8px;height:8px;border-radius:50%;background:#d4d4d4;flex-shrink:0"></span>
           <button id="piazzaReconnectBtn" class="copy-btn" style="font-size:11.5px;padding:4px 10px;display:none" onclick="showPiazzaReconnect()">Connect</button>
         </div>
+
+        <!-- Crowdmark row -->
+        <div id="crowdmarkStatusRow" style="display:flex;align-items:center;gap:10px;padding:10px 13px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)">
+          <span style="font-size:13px;flex-shrink:0;color:var(--muted)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></span>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:500">Crowdmark <span style="font-size:11px;color:var(--muted);font-weight:400">optional</span></div>
+            <div id="crowdmarkStatusText" style="font-size:11.5px;color:var(--muted)">Checking...</div>
+          </div>
+          <span id="crowdmarkStatusDot" style="width:8px;height:8px;border-radius:50%;background:#d4d4d4;flex-shrink:0"></span>
+          <button id="crowdmarkConnectBtn" class="copy-btn" style="font-size:11.5px;padding:4px 10px;display:none" onclick="showCrowdmarkConnect()">Connect</button>
+        </div>
+
+        <!-- Outline row -->
+        <div id="outlineStatusRow" style="display:flex;align-items:center;gap:10px;padding:10px 13px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)">
+          <span style="font-size:13px;flex-shrink:0;color:var(--muted)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:500">Course Outlines <span style="font-size:11px;color:var(--muted);font-weight:400">optional · UW</span></div>
+            <div id="outlineStatusText" style="font-size:11.5px;color:var(--muted)">Checking...</div>
+          </div>
+          <span id="outlineStatusDot" style="width:8px;height:8px;border-radius:50%;background:#d4d4d4;flex-shrink:0"></span>
+          <button id="outlineConnectBtn" class="copy-btn" style="font-size:11.5px;padding:4px 10px;display:none" onclick="showOutlineConnect()">Connect</button>
+        </div>
       </div>
 
       <!-- D2L VNC re-login inline -->
@@ -648,6 +670,64 @@
         <div class="field"><label>Password</label><input type="password" id="piazzaRePw" placeholder="Piazza password" /></div>
         <button class="btn btn-primary" style="font-size:12.5px;padding:8px" onclick="reconnectPiazza(this)">Connect</button>
         <div id="piazzaReconnectStatus" style="font-size:12px;color:var(--muted);margin-top:6px"></div>
+      </div>
+
+      <!-- Crowdmark connect inline (VNC flow) -->
+      <div id="crowdmarkConnectBox" class="hidden" style="margin-top:8px;padding:12px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)">
+        <div style="font-size:12.5px;font-weight:500;margin-bottom:4px">Connect Crowdmark</div>
+        <p style="font-size:11.5px;color:var(--muted);margin-bottom:10px;line-height:1.5">A secure browser will open. Log in to Crowdmark — we'll detect the session automatically.</p>
+        <div id="crowdmarkVncStep" class="hidden">
+          <div class="steps" style="margin:0 0 12px">
+            <div class="step">
+              <div class="step-dot done">✓</div>
+              <div class="step-body"><h4>Session started</h4></div>
+            </div>
+            <div class="step">
+              <div id="crowdmarkStep2dot" class="step-dot active">2</div>
+              <div class="step-body"><h4>Log in to Crowdmark</h4><p>Use your university SSO or email/password.</p></div>
+            </div>
+            <div class="step">
+              <div id="crowdmarkStep3dot" class="step-dot">3</div>
+              <div class="step-body"><h4>Session captured automatically</h4></div>
+            </div>
+          </div>
+          <a id="crowdmarkVncLink" href="#" target="_blank" class="vnc-btn" style="font-size:12.5px;padding:8px 12px;margin-bottom:8px">Open login browser</a>
+          <div id="crowdmarkWaitingStatus" class="waiting" style="font-size:12px">
+            <span class="spin" style="border-top-color:#fbbf24;border-color:rgba(251,191,36,0.2)"></span>
+            Waiting for you to log in…
+          </div>
+        </div>
+        <button id="crowdmarkStartBtn" class="btn btn-primary" style="font-size:12.5px;padding:8px" onclick="startCrowdmarkConnect(this)">Open login browser</button>
+        <div id="crowdmarkConnectStatus" style="font-size:12px;color:var(--muted);margin-top:6px"></div>
+      </div>
+
+      <!-- Outline connect inline (VNC flow) -->
+      <div id="outlineConnectBox" class="hidden" style="margin-top:8px;padding:12px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)">
+        <div style="font-size:12.5px;font-weight:500;margin-bottom:4px">Connect Course Outlines</div>
+        <p style="font-size:11.5px;color:var(--muted);margin-bottom:10px;line-height:1.5">A secure browser will open. Log in with your WatIAM credentials and approve Duo — we'll detect the session automatically.</p>
+        <div id="outlineVncStep" class="hidden">
+          <div class="steps" style="margin:0 0 12px">
+            <div class="step">
+              <div class="step-dot done">✓</div>
+              <div class="step-body"><h4>Session started</h4></div>
+            </div>
+            <div class="step">
+              <div id="outlineStep2dot" class="step-dot active">2</div>
+              <div class="step-body"><h4>Log in with WatIAM + Duo</h4><p>Approve the push notification on your phone.</p></div>
+            </div>
+            <div class="step">
+              <div id="outlineStep3dot" class="step-dot">3</div>
+              <div class="step-body"><h4>Session captured automatically</h4></div>
+            </div>
+          </div>
+          <a id="outlineVncLink" href="#" target="_blank" class="vnc-btn" style="font-size:12.5px;padding:8px 12px;margin-bottom:8px">Open login browser</a>
+          <div id="outlineWaitingStatus" class="waiting" style="font-size:12px">
+            <span class="spin" style="border-top-color:#fbbf24;border-color:rgba(251,191,36,0.2)"></span>
+            Waiting for you to log in…
+          </div>
+        </div>
+        <button id="outlineStartBtn" class="btn btn-primary" style="font-size:12.5px;padding:8px" onclick="startOutlineConnect(this)">Open login browser</button>
+        <div id="outlineConnectStatus" style="font-size:12px;color:var(--muted);margin-top:6px"></div>
       </div>
 
       <div class="divider"></div>
@@ -1316,6 +1396,48 @@
       } catch {
         document.getElementById('piazzaStatusText').textContent = 'Unable to check';
       }
+
+      // Crowdmark status
+      try {
+        const res = await fetch(`${API}/api/crowdmark/status`, { headers: { 'Authorization': `Bearer ${token}` } });
+        const data = await res.json();
+        const dot = document.getElementById('crowdmarkStatusDot');
+        const text = document.getElementById('crowdmarkStatusText');
+        const btn = document.getElementById('crowdmarkConnectBtn');
+        if (data.connected) {
+          dot.style.background = 'var(--success)';
+          text.textContent = 'Connected — grades and feedback available';
+          btn.textContent = 'Reconnect';
+        } else {
+          dot.style.background = '#d4d4d4';
+          text.textContent = 'Not connected — connect to see graded assignments';
+          btn.textContent = 'Connect';
+        }
+        btn.style.display = '';
+      } catch {
+        document.getElementById('crowdmarkStatusText').textContent = 'Unable to check';
+      }
+
+      // Outline status
+      try {
+        const res = await fetch(`${API}/api/outline/status`, { headers: { 'Authorization': `Bearer ${token}` } });
+        const data = await res.json();
+        const dot = document.getElementById('outlineStatusDot');
+        const text = document.getElementById('outlineStatusText');
+        const btn = document.getElementById('outlineConnectBtn');
+        if (data.connected) {
+          dot.style.background = 'var(--success)';
+          text.textContent = 'Connected — course outlines available';
+          btn.textContent = 'Reconnect';
+        } else {
+          dot.style.background = '#d4d4d4';
+          text.textContent = 'Not connected — UW students can connect for syllabus/outline data';
+          btn.textContent = 'Connect';
+        }
+        btn.style.display = '';
+      } catch {
+        document.getElementById('outlineStatusText').textContent = 'Unable to check';
+      }
     }
 
     // D2L re-login via VNC
@@ -1391,6 +1513,136 @@
       } finally {
         btn.disabled = false;
         btn.textContent = 'Connect';
+      }
+    }
+
+    // Crowdmark connect (VNC flow)
+    function showCrowdmarkConnect() {
+      document.getElementById('crowdmarkConnectBox').classList.toggle('hidden');
+    }
+
+    let crowdmarkPollInterval = null;
+    async function startCrowdmarkConnect(btn) {
+      const status = document.getElementById('crowdmarkConnectStatus');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spin"></span> Starting session…';
+      status.textContent = '';
+      try {
+        const res = await fetch(`${API}/auth/crowdmark/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to start session.');
+
+        document.getElementById('crowdmarkVncLink').href = data.vncUrl;
+        document.getElementById('crowdmarkVncStep').classList.remove('hidden');
+        btn.classList.add('hidden');
+        status.textContent = '';
+
+        if (crowdmarkPollInterval) clearInterval(crowdmarkPollInterval);
+        crowdmarkPollInterval = setInterval(async () => {
+          try {
+            const sr = await fetch(`${API}/auth/crowdmark/status/${data.sessionId}`);
+            const sd = await sr.json();
+            if (sd.status === 'authenticated') {
+              clearInterval(crowdmarkPollInterval);
+              crowdmarkPollInterval = null;
+              const d2 = document.getElementById('crowdmarkStep2dot');
+              const d3 = document.getElementById('crowdmarkStep3dot');
+              d2.className = 'step-dot done'; d2.textContent = '✓';
+              d3.className = 'step-dot done'; d3.textContent = '✓';
+              document.getElementById('crowdmarkWaitingStatus').innerHTML = '<span style="color:var(--success)">&#10003;</span> Connected! Session saved.';
+              document.getElementById('crowdmarkStatusDot').style.background = 'var(--success)';
+              document.getElementById('crowdmarkStatusText').textContent = 'Connected — grades and feedback available';
+              document.getElementById('crowdmarkConnectBtn').textContent = 'Reconnect';
+              setTimeout(() => {
+                document.getElementById('crowdmarkConnectBox').classList.add('hidden');
+                document.getElementById('crowdmarkVncStep').classList.add('hidden');
+                btn.classList.remove('hidden');
+                btn.disabled = false;
+                btn.textContent = 'Open login browser';
+              }, 3000);
+            } else if (sd.status === 'failed' || sd.status === 'no_session') {
+              clearInterval(crowdmarkPollInterval);
+              crowdmarkPollInterval = null;
+              document.getElementById('crowdmarkWaitingStatus').innerHTML = '<span style="color:var(--danger)">&#10005;</span> Session failed. Try again.';
+              btn.classList.remove('hidden');
+              btn.disabled = false;
+              btn.textContent = 'Open login browser';
+            }
+          } catch {}
+        }, 2500);
+      } catch (e) {
+        status.innerHTML = `<span style="color:var(--danger)">&#10005;</span> ${e.message}`;
+        btn.disabled = false;
+        btn.textContent = 'Open login browser';
+      }
+    }
+
+    // Outline connect (VNC flow)
+    function showOutlineConnect() {
+      document.getElementById('outlineConnectBox').classList.toggle('hidden');
+    }
+
+    let outlinePollInterval = null;
+    async function startOutlineConnect(btn) {
+      const status = document.getElementById('outlineConnectStatus');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spin"></span> Starting session…';
+      status.textContent = '';
+      try {
+        const res = await fetch(`${API}/auth/outline/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to start session.');
+
+        document.getElementById('outlineVncLink').href = data.vncUrl;
+        document.getElementById('outlineVncStep').classList.remove('hidden');
+        btn.classList.add('hidden');
+        status.textContent = '';
+
+        if (outlinePollInterval) clearInterval(outlinePollInterval);
+        outlinePollInterval = setInterval(async () => {
+          try {
+            const sr = await fetch(`${API}/auth/outline/status/${data.sessionId}`);
+            const sd = await sr.json();
+            if (sd.status === 'authenticated') {
+              clearInterval(outlinePollInterval);
+              outlinePollInterval = null;
+              const d2 = document.getElementById('outlineStep2dot');
+              const d3 = document.getElementById('outlineStep3dot');
+              d2.className = 'step-dot done'; d2.textContent = '✓';
+              d3.className = 'step-dot done'; d3.textContent = '✓';
+              document.getElementById('outlineWaitingStatus').innerHTML = '<span style="color:var(--success)">&#10003;</span> Connected! Session saved.';
+              document.getElementById('outlineStatusDot').style.background = 'var(--success)';
+              document.getElementById('outlineStatusText').textContent = 'Connected — course outlines available';
+              document.getElementById('outlineConnectBtn').textContent = 'Reconnect';
+              setTimeout(() => {
+                document.getElementById('outlineConnectBox').classList.add('hidden');
+                document.getElementById('outlineVncStep').classList.add('hidden');
+                btn.classList.remove('hidden');
+                btn.disabled = false;
+                btn.textContent = 'Open login browser';
+              }, 3000);
+            } else if (sd.status === 'failed' || sd.status === 'no_session') {
+              clearInterval(outlinePollInterval);
+              outlinePollInterval = null;
+              document.getElementById('outlineWaitingStatus').innerHTML = '<span style="color:var(--danger)">&#10005;</span> Session failed. Try again.';
+              btn.classList.remove('hidden');
+              btn.disabled = false;
+              btn.textContent = 'Open login browser';
+            }
+          } catch {}
+        }, 2500);
+      } catch (e) {
+        status.innerHTML = `<span style="color:var(--danger)">&#10005;</span> ${e.message}`;
+        btn.disabled = false;
+        btn.textContent = 'Open login browser';
       }
     }
 

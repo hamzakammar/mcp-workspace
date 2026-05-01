@@ -49,6 +49,14 @@ async function main() {
     );
     console.log("Token (first 50 chars):", token.substring(0, 50) + "...");
   } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    // REAUTH_REQUIRED means Duo MFA is needed — exit cleanly so the server still
+    // starts and PM2 doesn't restart infinitely (which would spam Duo pushes).
+    if (msg === 'REAUTH_REQUIRED' || msg.includes('REAUTH_REQUIRED')) {
+      console.error("[AUTH-CLI] Re-authentication required (Duo MFA needed). Server will start without cached token.");
+      console.error("[AUTH-CLI] Use the VNC login flow or provide D2L_TOKEN to authenticate.");
+      process.exit(0);
+    }
     console.error("Authentication failed:", error);
     if (hasCredentials) {
       console.error("");

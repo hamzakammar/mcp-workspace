@@ -54,6 +54,7 @@ export interface BrowserSession {
   sessionId: string;
   userId: string;
   d2lHost: string;
+  sessionType: 'd2l' | 'outline' | 'crowdmark';
   vncUrl: string;
   wsPort: number;
   vncPort: number;
@@ -95,56 +96,51 @@ async function waitForXvfb(displayNum: number, timeoutMs = 5000): Promise<void> 
 export class BrowserSessionManager {
 
   /**
-   * Start a new browser session for a user.
-   * Restores previous ADFS/D2L cookies from S3 — skips Duo if session still valid.
-   * Returns the noVNC URL the user should open.
+   * Shared helper: spins up Xvfb + x11vnc + websockify + Playwright and
+   * returns a fully initialised BrowserSession (status="waiting").
+   * Callers attach their own login watcher after this returns.
    */
-  static async startSession(userId: string, d2lHost: string, apiHost?: string): Promise<{ sessionId: string; vncUrl: string }> {
+  private static async _startVNCInfra(
+    userId: string,
+    targetUrl: string,
+    apiHost: string | undefined,
+    sessionType: 'd2l' | 'outline' | 'crowdmark',
+  ): Promise<BrowserSession> {
     // Close any existing session for this user
     const existingId = userSessionMap.get(userId);
-    if (existingId) {
-      await BrowserSessionManager.closeSession(existingId);
-    }
+    if (existingId) await BrowserSessionManager.closeSession(existingId);
 
     const sessionId = randomUUID();
-    const displayNum = 10 + activeSessions.size; // :10, :11, etc.
+    const displayNum = 10 + activeSessions.size;
     const vncPort = allocatePort(VNC_BASE_PORT);
     const wsPort = allocatePort(WS_BASE_PORT);
 
     // 1. Start Xvfb virtual display
     const xvfbProc = spawn("Xvfb", [
-      `:${displayNum}`,
-      "-screen", "0", "1280x800x24",
-      "-ac",
+      `:${displayNum}`, "-screen", "0", "1280x800x24", "-ac",
     ], { stdio: ["ignore", "pipe", "pipe"] });
     xvfbProc.stdout?.on("data", (d: Buffer) => console.log(`[XVFB] ${d.toString().trim()}`));
     xvfbProc.stderr?.on("data", (d: Buffer) => console.error(`[XVFB] ${d.toString().trim()}`));
     xvfbProc.on("exit", (code) => console.error(`[XVFB :${displayNum}] exited with code ${code}`));
-
     await waitForXvfb(displayNum, 5000);
 
     // 2. Start x11vnc
     const x11vncProc = spawn("x11vnc", [
-      "-display", `:${displayNum}`,
-      "-rfbport", String(vncPort),
+      "-display", `:${displayNum}`, "-rfbport", String(vncPort),
       "-nopw", "-shared", "-forever", "-quiet",
     ], { stdio: ["ignore", "ignore", "pipe"] });
     x11vncProc.stderr?.on("data", (d: Buffer) => console.error(`[X11VNC] ${d.toString().trim()}`));
     x11vncProc.on("exit", (code) => console.error(`[X11VNC] exited with code ${code}`));
-
     await new Promise(r => setTimeout(r, 300));
 
     // 3. Start websockify (noVNC WebSocket proxy)
     const websockifyProc = spawn("websockify", [
-      "--web", "/usr/share/novnc",
-      String(wsPort),
-      `localhost:${vncPort}`,
+      "--web", "/usr/share/novnc", String(wsPort), `localhost:${vncPort}`,
     ], { stdio: "ignore" });
-
     await new Promise(r => setTimeout(r, 300));
 
-    // 4. Load saved storage state from S3 (restores ADFS session, skips Duo if still valid)
-    const storageStatePath = await loadStorageStateFromS3(userId);
+    // 4. Load saved storage state from S3 (service-specific key — skips Duo if still valid)
+    const storageStatePath = await loadStorageStateFromS3(userId, sessionType);
 
     // 5. Launch Playwright browser
     const browser = await chromium.launch({
@@ -152,52 +148,69 @@ export class BrowserSessionManager {
       headless: false,
       env: { ...process.env, DISPLAY: `:${displayNum}` },
       args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        `--display=:${displayNum}`,
-        "--window-size=1280,800",
-        "--window-position=0,0",
+        "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+        `--display=:${displayNum}`, "--window-size=1280,800", "--window-position=0,0",
       ],
     });
-
     const context = await browser.newContext({
       storageState: storageStatePath,
       viewport: { width: 1280, height: 800 },
     });
-
     const page = await context.newPage();
-    await page.goto(`https://${d2lHost}`);
+    await page.goto(targetUrl);
 
     // 6. Session timeout
     const timeoutHandle = setTimeout(async () => {
       console.error(`[VNC] Session ${sessionId} timed out for user ${userId}`);
       const s = activeSessions.get(sessionId);
-      if (s) {
-        s.status = "failed";
-        await BrowserSessionManager.closeSession(sessionId);
-      }
+      if (s) { s.status = "failed"; await BrowserSessionManager.closeSession(sessionId); }
     }, SESSION_TIMEOUT_MS);
 
     const session: BrowserSession = {
-      sessionId, userId, d2lHost,
+      sessionId, userId, d2lHost: targetUrl, sessionType,
       vncUrl: `https://${apiHost || process.env.API_HOST || "localhost"}/vnc/${sessionId}/vnc.html?autoconnect=true&reconnect=true&path=vnc/${sessionId}/websockify`,
       wsPort, vncPort, displayNum,
       browser, context, page,
       xvfbProc, x11vncProc, websockifyProc,
-      timeoutHandle,
-      status: "waiting",
-      createdAt: Date.now(),
+      timeoutHandle, status: "waiting", createdAt: Date.now(),
     };
 
     activeSessions.set(sessionId, session);
     userSessionMap.set(userId, sessionId);
+    console.error(`[VNC] Started ${sessionType} session ${sessionId} for user ${userId} on display :${displayNum}, wsPort ${wsPort}`);
+    return session;
+  }
 
-    // 7. Watch for login
-    BrowserSessionManager._watchForLogin(sessionId, userId, d2lHost, page, context);
+  /**
+   * Start a D2L login session (VNC browser pointed at d2lHost).
+   * Restores previous ADFS/D2L cookies from S3 — skips Duo if still valid.
+   */
+  static async startSession(userId: string, d2lHost: string, apiHost?: string): Promise<{ sessionId: string; vncUrl: string }> {
+    const session = await BrowserSessionManager._startVNCInfra(userId, `https://${d2lHost}`, apiHost, 'd2l');
+    BrowserSessionManager._watchForLogin(session.sessionId, userId, d2lHost, session.page, session.context);
+    return { sessionId: session.sessionId, vncUrl: session.vncUrl };
+  }
 
-    console.error(`[VNC] Started session ${sessionId} for user ${userId} on display :${displayNum}, wsPort ${wsPort}`);
-    return { sessionId, vncUrl: session.vncUrl };
+  /**
+   * Start an outline.uwaterloo.ca login session.
+   * Navigates to the outline site; detects login by watching for the sessionid cookie.
+   * Restores previous IdP cookies from S3 — may skip Duo if ADFS session still valid.
+   */
+  static async startOutlineSession(userId: string, outlineHost: string, apiHost?: string): Promise<{ sessionId: string; vncUrl: string }> {
+    const session = await BrowserSessionManager._startVNCInfra(userId, `https://${outlineHost}`, apiHost, 'outline');
+    BrowserSessionManager._watchForOutlineLogin(session.sessionId, userId, outlineHost, session.page, session.context);
+    return { sessionId: session.sessionId, vncUrl: session.vncUrl };
+  }
+
+  /**
+   * Start a Crowdmark login session.
+   * Navigates to app.crowdmark.com; detects login by URL (student dashboard).
+   * Captures ALL cookies for the domain — avoids fragile dependency on any single cookie name.
+   */
+  static async startCrowdmarkSession(userId: string, apiHost?: string): Promise<{ sessionId: string; vncUrl: string }> {
+    const session = await BrowserSessionManager._startVNCInfra(userId, 'https://app.crowdmark.com', apiHost, 'crowdmark');
+    BrowserSessionManager._watchForCrowdmarkLogin(session.sessionId, userId, session.page, session.context);
+    return { sessionId: session.sessionId, vncUrl: session.vncUrl };
   }
 
   /**
@@ -232,6 +245,241 @@ export class BrowserSessionManager {
         // Page navigating — ignore
       }
     }, 2000);
+  }
+
+  /**
+   * Poll every 2s for a successful outline login by watching for the sessionid cookie.
+   */
+  private static _watchForOutlineLogin(
+    sessionId: string,
+    userId: string,
+    outlineHost: string,
+    page: Page,
+    context: BrowserContext
+  ) {
+    const cookieDomain = outlineHost.replace(/^https?:\/\//, '');
+    const interval = setInterval(async () => {
+      const session = activeSessions.get(sessionId);
+      if (!session || session.status !== "waiting") {
+        clearInterval(interval);
+        return;
+      }
+      try {
+        const cookies = await context.cookies();
+        const sessionidCookie = cookies.find(
+          c => c.name === "sessionid" && c.domain.includes(cookieDomain.split('/')[0])
+        );
+        if (sessionidCookie) {
+          clearInterval(interval);
+          await BrowserSessionManager._captureAndStoreOutline(sessionId, userId, outlineHost, sessionidCookie.value, context);
+        }
+      } catch {
+        // Page navigating — ignore
+      }
+    }, 2000);
+  }
+
+  /**
+   * Capture the outline sessionid cookie and full storage state, persist to Supabase + S3.
+   */
+  private static async _captureAndStoreOutline(
+    sessionId: string,
+    userId: string,
+    outlineHost: string,
+    sessionidValue: string,
+    context: BrowserContext
+  ) {
+    const session = activeSessions.get(sessionId);
+    if (!session) return;
+
+    try {
+      console.error(`[VNC] Outline login detected for user ${userId}, capturing sessionid...`);
+
+      // Validate the cookie works before storing
+      try {
+        const testUrl = `https://${outlineHost}/viewer/org/uwaterloo/`;
+        const testResp = await fetch(testUrl, {
+          headers: { Cookie: `sessionid=${sessionidValue}` },
+          redirect: "manual",
+          signal: AbortSignal.timeout(8_000),
+        });
+        if (testResp.status === 301 || testResp.status === 302) {
+          console.error(`[VNC] Outline sessionid for user ${userId} failed validation (redirect) — still waiting`);
+          session.status = "waiting";
+          BrowserSessionManager._watchForOutlineLogin(sessionId, userId, outlineHost, session.page, context);
+          return;
+        }
+      } catch (valErr: any) {
+        console.error(`[VNC] Outline cookie validation error: ${valErr.message} — storing anyway`);
+      }
+
+      // Save full IdP storage state to S3 (service='outline' key, may help skip Duo next time)
+      const tmpStatePath = path.join(os.tmpdir(), `outline-state-${sessionId}.json`);
+      await context.storageState({ path: tmpStatePath });
+      await saveStorageStateToS3(userId, tmpStatePath, undefined, 'outline');
+      await fs.unlink(tmpStatePath).catch(() => {});
+
+      // Store sessionid in Supabase under service='outline'
+      const sbUrl = process.env.SUPABASE_URL;
+      const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
+      if (sbUrl && sbKey) {
+        const upsertResp = await fetch(`${sbUrl}/rest/v1/user_credentials`, {
+          method: "POST",
+          headers: {
+            "apikey": sbKey,
+            "Authorization": `Bearer ${sbKey}`,
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates",
+          },
+          body: JSON.stringify({
+            user_id: userId,
+            service: "outline",
+            token: JSON.stringify({ sessionid: sessionidValue }),
+            updated_at: new Date().toISOString(),
+          }),
+        });
+        if (!upsertResp.ok) {
+          const errText = await upsertResp.text();
+          console.error(`[VNC] Failed to store outline credentials for user ${userId}: ${upsertResp.status} ${errText}`);
+        } else {
+          console.error(`[VNC] Successfully stored outline sessionid for user ${userId}`);
+        }
+      }
+
+      session.status = "authenticated";
+      setTimeout(() => BrowserSessionManager.closeSession(sessionId), 3000);
+
+    } catch (err) {
+      console.error(`[VNC] Error capturing outline cookies for user ${userId}:`, err);
+      session.status = "failed";
+      await BrowserSessionManager.closeSession(sessionId);
+    }
+  }
+
+  /**
+   * Poll every 2s for a successful Crowdmark login by watching for the student dashboard URL.
+   * Crowdmark's session cookie name is undocumented and may change — we capture all cookies.
+   */
+  private static _watchForCrowdmarkLogin(
+    sessionId: string,
+    userId: string,
+    page: Page,
+    context: BrowserContext,
+  ) {
+    const interval = setInterval(async () => {
+      const session = activeSessions.get(sessionId);
+      if (!session || session.status !== "waiting") {
+        clearInterval(interval);
+        return;
+      }
+      try {
+        const url = page.url();
+        const isLoggedIn = (
+          url.includes("app.crowdmark.com/student") ||
+          url.includes("app.crowdmark.com/dashboard") ||
+          // Logged-in root with no login/signup/auth in path
+          (url.includes("app.crowdmark.com") &&
+            !url.includes("/login") &&
+            !url.includes("/signup") &&
+            !url.includes("/users/sign") &&
+            !url.includes("/auth") &&
+            !url.includes("sso") &&
+            url !== "https://app.crowdmark.com/" &&
+            url !== "https://app.crowdmark.com")
+        );
+        if (isLoggedIn) {
+          clearInterval(interval);
+          await BrowserSessionManager._captureAndStoreCrowdmark(sessionId, userId, context);
+        }
+      } catch {
+        // Page navigating — ignore
+      }
+    }, 2000);
+  }
+
+  /**
+   * Capture all app.crowdmark.com cookies as a full Cookie header string.
+   * Storing all cookies avoids any dependency on a specific cookie name.
+   */
+  private static async _captureAndStoreCrowdmark(
+    sessionId: string,
+    userId: string,
+    context: BrowserContext,
+  ) {
+    const session = activeSessions.get(sessionId);
+    if (!session) return;
+
+    try {
+      console.error(`[VNC] Crowdmark login detected for user ${userId}, capturing cookies...`);
+
+      const cookies = await context.cookies('https://app.crowdmark.com');
+      console.error(`[VNC] Captured cookie names for user ${userId}: ${cookies.map(c => c.name).join(', ') || '(none)'}`);
+
+      if (!cookies.length) {
+        console.error(`[VNC] No Crowdmark cookies found for user ${userId} — waiting for login`);
+        session.status = "waiting";
+        BrowserSessionManager._watchForCrowdmarkLogin(sessionId, userId, session.page, context);
+        return;
+      }
+
+      // Build a full Cookie header string (e.g. "name1=val1; name2=val2")
+      const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+      // Validate against the real API with the same headers as production
+      try {
+        const testResp = await fetch('https://app.crowdmark.com/api/v2/student/assignments?fields[exam-masters][]=title', {
+          headers: {
+            Cookie: cookieHeader,
+            Accept: 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          signal: AbortSignal.timeout(8_000),
+        });
+        if (testResp.status === 401 || testResp.status === 403) {
+          console.error(`[VNC] Crowdmark cookies for user ${userId} failed auth check (${testResp.status}) — waiting for fresh login`);
+          session.status = "waiting";
+          BrowserSessionManager._watchForCrowdmarkLogin(sessionId, userId, session.page, context);
+          return;
+        }
+      } catch (valErr: any) {
+        console.error(`[VNC] Crowdmark cookie validation error: ${valErr.message} — storing anyway`);
+      }
+
+      // Store in Supabase under service='crowdmark'
+      const sbUrl = process.env.SUPABASE_URL;
+      const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
+      if (sbUrl && sbKey) {
+        const upsertResp = await fetch(`${sbUrl}/rest/v1/user_credentials`, {
+          method: "POST",
+          headers: {
+            "apikey": sbKey,
+            "Authorization": `Bearer ${sbKey}`,
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates",
+          },
+          body: JSON.stringify({
+            user_id: userId,
+            service: "crowdmark",
+            token: cookieHeader,
+            updated_at: new Date().toISOString(),
+          }),
+        });
+        if (!upsertResp.ok) {
+          const errText = await upsertResp.text();
+          console.error(`[VNC] Failed to store Crowdmark cookies for user ${userId}: ${upsertResp.status} ${errText}`);
+        } else {
+          console.error(`[VNC] Successfully stored Crowdmark cookies for user ${userId} (${cookies.length} cookies)`);
+        }
+      }
+
+      session.status = "authenticated";
+      setTimeout(() => BrowserSessionManager.closeSession(sessionId), 3000);
+
+    } catch (err) {
+      console.error(`[VNC] Error capturing Crowdmark cookies for user ${userId}:`, err);
+      session.status = "failed";
+      await BrowserSessionManager.closeSession(sessionId);
+    }
   }
 
   /**
