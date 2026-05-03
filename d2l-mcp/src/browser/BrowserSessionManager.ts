@@ -472,6 +472,17 @@ export class BrowserSessionManager {
         }
       }
 
+      // Save full storage state to S3 so headless re-auth can restore the SSO session
+      try {
+        const tmpStatePath = path.join(os.tmpdir(), `crowdmark-state-${sessionId}.json`);
+        await context.storageState({ path: tmpStatePath });
+        await saveStorageStateToS3(userId, tmpStatePath, undefined, 'crowdmark');
+        await fs.unlink(tmpStatePath).catch(() => {});
+        console.error(`[VNC] Saved Crowdmark browser state to S3 for user ${userId}`);
+      } catch (stateErr: any) {
+        console.error(`[VNC] Failed to save Crowdmark S3 state for user ${userId}: ${stateErr?.message}`);
+      }
+
       session.status = "authenticated";
       setTimeout(() => BrowserSessionManager.closeSession(sessionId), 3000);
 

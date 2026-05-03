@@ -4,6 +4,7 @@ import {
   getCrowdmarkCookie,
   fetchCrowdmarkAssignments,
   fetchCrowdmarkResult,
+  refreshCrowdmarkSession,
   CrowdmarkAuthError,
 } from '../study/crowdmarkClient.js';
 
@@ -39,6 +40,14 @@ export const crowdmarkTools = {
         return JSON.stringify({ success: true, assignments }, null, 2);
       } catch (e: unknown) {
         if (e instanceof CrowdmarkAuthError) {
+          // Try silent headless refresh before giving up
+          const freshCookie = await refreshCrowdmarkSession(userId);
+          if (freshCookie) {
+            try {
+              const assignments = await fetchCrowdmarkAssignments(freshCookie);
+              return JSON.stringify({ success: true, assignments }, null, 2);
+            } catch {}
+          }
           return JSON.stringify({
             success: false,
             error: 'Crowdmark session expired. Please reconnect.',
@@ -72,6 +81,13 @@ export const crowdmarkTools = {
         return JSON.stringify({ success: true, result }, null, 2);
       } catch (e: unknown) {
         if (e instanceof CrowdmarkAuthError) {
+          const freshCookie = await refreshCrowdmarkSession(userId);
+          if (freshCookie) {
+            try {
+              const result = await fetchCrowdmarkResult(freshCookie, args.assignmentId);
+              return JSON.stringify({ success: true, result }, null, 2);
+            } catch {}
+          }
           return JSON.stringify({
             success: false,
             error: 'Crowdmark session expired. Please reconnect.',

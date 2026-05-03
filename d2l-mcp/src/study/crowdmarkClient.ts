@@ -16,10 +16,16 @@
  */
 
 import { supabase } from '../utils/supabase.js';
+import { loadStorageStateFromS3, saveStorageStateToS3 } from '../utils/s3Storage.js';
+import { chromium } from 'playwright';
+import path from 'path';
+import os from 'os';
+import fs from 'fs/promises';
 
 const CROWDMARK_BASE = 'https://app.crowdmark.com';
 const CROWDMARK_SERVICE = 'crowdmark';
 const REQUEST_TIMEOUT_MS = 15_000;
+const CHROMIUM_PATH = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/chromium';
 
 // ─── Token management ─────────────────────────────────────────────────────────
 
@@ -45,6 +51,83 @@ export async function saveCrowdmarkCookie(userId: string, cookie: string): Promi
     token: cookie,
     updated_at: new Date().toISOString(),
   }, { onConflict: 'user_id,service' });
+}
+
+// ─── Headless session refresh ─────────────────────────────────────────────────
+
+/**
+ * Attempt to silently refresh the Crowdmark session using the stored S3
+ * browser state (which contains the SSO session cookies from the last VNC login).
+ * Returns a fresh cookie string on success, null if re-auth needs user action.
+ */
+export async function refreshCrowdmarkSession(userId: string): Promise<string | null> {
+  const storageStatePath = await loadStorageStateFromS3(userId, 'crowdmark');
+  if (!storageStatePath) {
+    console.error(`[CROWDMARK] No S3 browser state for user ${userId} — user must reconnect via VNC`);
+    return null;
+  }
+
+  console.error(`[CROWDMARK] Attempting headless session refresh for user ${userId}`);
+  let browser;
+  try {
+    browser = await chromium.launch({
+      executablePath: CHROMIUM_PATH,
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    });
+
+    const context = await browser.newContext({ storageState: storageStatePath });
+    const page = await context.newPage();
+
+    await page.goto(`${CROWDMARK_BASE}/`, { waitUntil: 'domcontentloaded', timeout: 20_000 });
+    await page.waitForTimeout(2000);
+
+    const landingUrl = page.url();
+
+    // If we landed on a login/SSO page, the S3 session has expired — need user action
+    if (landingUrl.includes('/login') || landingUrl.includes('sso') ||
+        landingUrl.includes('microsoft') || landingUrl.includes('adfs')) {
+      console.error(`[CROWDMARK] SSO session expired for user ${userId} — user must reconnect`);
+      await browser.close();
+      return null;
+    }
+
+    // We're on the app — capture fresh cookies
+    const cookies = await context.cookies(CROWDMARK_BASE);
+    if (!cookies.length) {
+      await browser.close();
+      return null;
+    }
+
+    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+    // Validate
+    const testResp = await fetch(`${CROWDMARK_BASE}/api/v2/student/assignments?fields[exam-masters][]=title`, {
+      headers: { Cookie: cookieHeader, Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      signal: AbortSignal.timeout(8_000),
+    });
+
+    if (testResp.status === 401 || testResp.status === 403) {
+      console.error(`[CROWDMARK] Headless refresh produced invalid cookies for user ${userId}`);
+      await browser.close();
+      return null;
+    }
+
+    // Save updated S3 state + store cookies
+    const tmpStatePath = path.join(os.tmpdir(), `crowdmark-refresh-${userId}.json`);
+    await context.storageState({ path: tmpStatePath });
+    await saveStorageStateToS3(userId, tmpStatePath, undefined, 'crowdmark');
+    await fs.unlink(tmpStatePath).catch(() => {});
+
+    await saveCrowdmarkCookie(userId, cookieHeader);
+    console.error(`[CROWDMARK] Headless refresh succeeded for user ${userId} (${cookies.length} cookies)`);
+    await browser.close();
+    return cookieHeader;
+  } catch (err: any) {
+    console.error(`[CROWDMARK] Headless refresh error for user ${userId}: ${err?.message}`);
+    if (browser) await browser.close().catch(() => {});
+    return null;
+  }
 }
 
 // ─── HTTP helper ──────────────────────────────────────────────────────────────
