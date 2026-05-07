@@ -22,6 +22,9 @@ import { getD2LCredentials } from "../auth.js";
 const CHROMIUM_PATH = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium";
 const REFRESH_INTERVAL_MS = 30 * 60 * 1000; // check every 30 min
 const STALE_THRESHOLD_MS = 12 * 60 * 60 * 1000; // refresh if token older than 12h
+// S3 browser state TTL is 25 days — warn users at 20 days so they can re-auth before expiry
+const S3_STATE_WARN_DAYS = 20;
+const S3_STATE_WARN_MS = S3_STATE_WARN_DAYS * 24 * 60 * 60 * 1000;
 const NAV_TIMEOUT_MS = 30_000; // 30s page load timeout
 
 export interface RefreshResult {
@@ -554,6 +557,38 @@ export function startSessionRefreshScheduler(): void {
           ).catch(err => {
             console.error(`[REFRESH] Failed to send push to user ${user.user_id}:`, err?.message);
           });
+        }
+      }
+
+      // Proactive S3 state expiry warning: sessions updated 20+ days ago are approaching
+      // the 25-day S3 browser state TTL. Warn before the session actually fails.
+      const warnCutoff = new Date(Date.now() - S3_STATE_WARN_MS).toISOString();
+      const { data: agingUsers, error: warnError } = await supabase
+        .from("user_credentials")
+        .select("user_id, updated_at")
+        .eq("service", "d2l")
+        .lt("updated_at", warnCutoff)
+        .is("duo_required_at", null)
+        .is("notification_sent_at", null);
+
+      if (warnError) {
+        console.error("[REFRESH] Failed to query aging sessions:", warnError.message);
+      } else if (agingUsers && agingUsers.length > 0) {
+        console.error(`[REFRESH] Found ${agingUsers.length} session(s) approaching S3 state expiry — sending proactive warnings`);
+        for (const user of agingUsers) {
+          sendPushToUser(
+            user.user_id,
+            "D2L Re-authentication Needed Soon",
+            "Your D2L session will expire in the next few days. Open Horizon to reconnect before it fails.",
+            { type: "reauth_warning" }
+          ).catch(err => {
+            console.error(`[REFRESH] Failed to send proactive warning to user ${user.user_id}:`, err?.message);
+          });
+
+          // Mark warning sent so we don't spam the user every 30 min
+          await supabase.from("user_credentials").update({
+            notification_sent_at: new Date().toISOString(),
+          }).eq("user_id", user.user_id).eq("service", "d2l");
         }
       }
     } catch (err: any) {
