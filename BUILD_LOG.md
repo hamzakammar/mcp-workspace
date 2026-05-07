@@ -310,3 +310,147 @@ Two bugs compounded:
 
 ### Deployed
 ECS task `study-mcp-backend:102`, running 1/1.
+
+---
+
+## Bug Fix Sprint — Tasks 1–12
+**Date:** 2026-04-30
+**Status:** ✅ Done — 44 tools deployed (up from 40)
+
+---
+
+### Task 1 — Fix urgency scoring in priority.ts and priorityGlobal.ts
+**Problem:** `urgencyScore()` used `ScoreDenominator` (raw points) as weight. A 100-point assignment worth 2% scored higher than a 5-point quiz worth 20%.
+
+**Fix:**
+- Added `RawGradeObject` interface and `matchGradeWeight()` helper to both files
+- `getCourseRecommendations()` now fetches `GET /d2l/api/le/1.57/{orgUnitId}/grades/` once per course
+- Each assignment is matched to its grade object by name (case-insensitive `includes`)
+- `urgencyScore()` receives the `Weight` percentage field (0–100) instead of raw points
+- Falls back to `weight=0.1` if no grade object match found
+- `reason` field updated: "Worth X% of final grade" when weight is known
+
+---
+
+### Task 2 — Fix parallel D2L requests in priorityGlobal.ts
+**Problem:** `Promise.all` fired assignment+quiz requests for all active courses simultaneously (24+ concurrent calls).
+
+**Fix:**
+- Replaced `Promise.all` with a batched loop processing 4 courses at a time (`CONCURRENCY = 4`)
+- Switched to `Promise.allSettled` so one failing course doesn't abort the whole request
+- Failed courses are skipped silently; successful results are accumulated normally
+
+---
+
+### Task 3 — Fix rubric.ts to filter by assignment
+**Problem:** `get_assignment_rubric` fetched ALL rubrics for the course and flattened all criteria together.
+
+**Fix:**
+- Extended `RawDropboxFolder` interface with optional `RubricId` and `AssociatedRubrics` fields
+- Handler now builds a `Set<number>` of associated rubric IDs from the folder response
+- If D2L provides associations, only those rubrics' criteria are returned
+- If D2L does not provide associations, all rubrics are returned with a `rubricNote` explaining the limitation
+- `rubricNote` field is conditionally included in JSON output
+
+---
+
+### Task 4 — Fix session refresher log mismatch
+**Problem:** Startup log said "threshold: 18h" but `STALE_THRESHOLD_MS = 12h`.
+
+**Fix:** One-line change in `sessionRefresher.ts:501` — changed "18h" → "12h".
+
+---
+
+### Task 5 — Add submission status to priority tools
+**Problem:** Both priority tools surfaced already-submitted assignments.
+
+**Fix:**
+- Added `getMySubmissions(orgUnitId, folderId)` to `client.ts` → `GET /d2l/api/le/1.57/{orgUnitId}/dropbox/folders/{folderId}/submissions/mysubmissions/`
+- Added `_folderId` (internal) to `Recommendation` and `GlobalRecommendation` interfaces
+- After initial scoring and sorting, checks submissions for assignment candidates only (top 10/20)
+- Uses `Promise.allSettled` so one failing submission check doesn't break the whole response
+- Submitted assignments filtered out before final slice; `_folderId`/`_orgUnitId` stripped from output
+
+---
+
+### Task 6 — Fix _urgentReminders injection for non-JSON tool responses
+**Problem:** Non-JSON results got `\n\n_urgentReminders: [...]` appended, producing malformed output.
+
+**Fix:** In `index.ts wrapToolHandler`, the `catch` block now skips injection entirely and logs `[TOOL] <name> returned non-JSON result; skipping _urgentReminders injection` instead of string-concatenating.
+
+---
+
+### Task 7 — Fix silent catch in files.ts
+**Problem:** `files.ts:38` had `} catch {}` swallowing errors from `fs.unlinkSync(tempFile)`.
+
+**Fix:** Changed to `} catch (err) { console.error('[FILES] Operation failed:', err); }`.
+
+---
+
+### Task 8 — Create docs/debt.md and docs/plans/
+**Created:**
+- `docs/debt.md` — 6 known deferred items (discussion boards, grade weight matching, integration tests, S3 migration, rubric API limitations, outline/Crowdmark scope)
+- `docs/plans/roadmap.md` — Phase 1 (done), Phase 2 (current), Phase 3 (upcoming)
+- `docs/plans/crowdmark-research.md` — research findings (see Task 9)
+- `docs/plans/outline-research.md` — research findings (see Task 10)
+
+---
+
+### Task 9 — Crowdmark integration
+**Research findings:** No public API. Internal REST API reverse-engineered by community. Student tier uses session cookies. Key endpoints:
+- `GET /api/v2/student/assignments` — list assignments
+- `GET /api/v1/student/results/{id}` — graded result with TA annotations
+
+**Implementation:**
+- `src/study/crowdmarkClient.ts` — `getCrowdmarkCookie`, `saveCrowdmarkCookie`, `fetchCrowdmarkAssignments`, `fetchCrowdmarkResult`, `CrowdmarkAuthError`
+- `src/tools/crowdmark.ts` — `get_crowdmark_assignments`, `get_crowdmark_feedback` handlers
+- `src/api/routes.ts` — `POST /api/crowdmark/connect` endpoint to store session cookie
+- Registered both tools in `index.ts`
+- Auth errors return `hint` field with instructions for copying `_crowdmark_session` cookie from DevTools
+
+---
+
+### Task 10 — Outline integration for non-UW schools
+**Research findings:** No cross-institutional outline API. McMaster/UBC/UToronto/Manitoba/Queen's have no public outline viewers — outlines are PDFs inside the LMS. OpenSyllabus has no public REST API. UWaterloo is the only school with a structured viewer.
+
+**Implementation:**
+- `src/config/outlineHosts.ts` — `OUTLINE_HOST_MAP` mapping D2L host → outline config; `getSupportedSchools()` helper
+- `get_course_outline` and `get_my_course_outlines` now check the user's D2L host before attempting fetch
+- Returns clear error message for unsupported schools: "Supported schools: [list]"
+- Easy to extend by adding entries to `OUTLINE_HOST_MAP`
+
+---
+
+### Task 11 — Discussion board tool
+**Implementation:**
+- Added `getDiscussionForums(orgUnitId)` and `getDiscussionTopics(orgUnitId, forumId)` to `client.ts`
+- `src/tools/discussions.ts` — `get_discussion_boards` handler: fetches all visible forums + topics for a course
+- Returns `{ forums: [...], forumCount }` with per-topic `postCount`, `unreadPostCount`, `lastPostDate`
+- Hidden forums/topics filtered out; topic fetch failures per-forum are handled gracefully
+
+---
+
+### Task 12 — Horizon status tool
+**Implementation:**
+- `src/tools/status.ts` — `get_horizon_status` tool
+- Returns: `d2l_connected`, `session_healthy` (live whoami ping), `duo_reauth_required`, `courses_accessible`, `piazza_connected`, `last_session_refresh`, `days_until_duo_required` (25-day TTL math)
+- Uses `getD2LToken()` for token row, `isDuoRequired()` for Duo flag, Supabase query for Piazza, live D2L ping for session health
+
+---
+
+### Tests run
+- [x] TypeScript: `tsc --noEmit` → clean (all tasks)
+- [x] Build: `npm run build` → clean
+- [x] Unit tests: 3 passed, 5 skipped (no regressions)
+- [ ] Integration tests: skipped (D2L sessions expired — pre-existing)
+
+### Deployed
+ECS task `study-mcp-backend` — new revision deployed 2026-04-30.
+
+### Smoke test
+```
+Tool count: 44 (up from 40)
+New tools: get_crowdmark_assignments, get_crowdmark_feedback, get_discussion_boards, get_horizon_status
+```
+
+All 44 tools registered and accessible at https://horizon.hamzaammar.ca/mcp.

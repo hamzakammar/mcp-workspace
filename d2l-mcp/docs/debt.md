@@ -29,8 +29,8 @@ When `KMS_KEY_ARN` is set, new browser states are encrypted. Existing unencrypte
 
 ## Integrations
 
-### Crowdmark integration not implemented
-Crowdmark is used by some UW courses for graded feedback. No public API exists (as of research in 2026-04). See `docs/plans/crowdmark-research.md` for details.
+### ~~Crowdmark integration not implemented~~ — DONE (2026-05)
+VNC-based cookie capture, headless S3-state auto-refresh, and correct JSON:API response parser are all implemented. Sessions auto-refresh silently via stored UWaterloo SSO state. See `src/study/crowdmarkClient.ts` and `src/browser/BrowserSessionManager.ts`.
 
 ### Outline integration hardcoded to UW
 `outlineClient.ts` is hardcoded to `outline.uwaterloo.ca`. Non-UW students on D2L get no outline data. A school-to-outline-URL config map has been planned but not yet implemented. See `docs/plans/outline-research.md` and `src/config/outlineHosts.ts` (Phase 2).
