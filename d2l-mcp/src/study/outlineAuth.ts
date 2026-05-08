@@ -96,12 +96,21 @@ async function validateOutlineCookie(sessionid: string): Promise<boolean> {
       signal: AbortSignal.timeout(8_000),
     });
     const location = resp.headers.get("location") || "";
-    // Redirect to OIDC login = cookie is invalid or expired
+    // Hard redirect to OIDC login = cookie invalid
     if (location.includes("oidc/login") || location.includes("duosecurity") || location.includes("/login")) {
       return false;
     }
-    // outline.uwaterloo.ca always redirects / — a 200 or any non-login redirect means valid
-    return resp.status === 200 || (resp.status >= 300 && resp.status < 400);
+    // JS-redirect page: site returns 200 with a page that redirects to OIDC via JS
+    if (resp.status === 200) {
+      const html = await resp.text();
+      if (html.includes('id="redirect-parent"') && (html.includes('/oidc/') || html.includes('duosecurity'))) {
+        console.error(`[OUTLINE_AUTH] Cookie validation: JS redirect to OIDC — sessionid invalid`);
+        return false;
+      }
+      return true;
+    }
+    // Any non-login redirect (e.g. to the viewer home) = valid
+    return resp.status >= 300 && resp.status < 400;
   } catch (e: any) {
     console.error(`[OUTLINE_AUTH] Cookie validation network error: ${e?.message}`);
     return false;

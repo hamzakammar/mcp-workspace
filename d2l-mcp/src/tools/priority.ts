@@ -71,12 +71,24 @@ function matchGradeWeight(
   gradeObjects: RawGradeObject[]
 ): number | null {
   const lower = name.toLowerCase();
-  const match = gradeObjects.find(
+  // Tier 1: exact match or substring containment
+  let match = gradeObjects.find(
     (g) =>
       g.Name.toLowerCase() === lower ||
       g.Name.toLowerCase().includes(lower) ||
       lower.includes(g.Name.toLowerCase())
   );
+  if (match) return match.Weight ?? null;
+
+  // Tier 2: number-extraction fallback — if both names share the same integer,
+  // treat as a match (handles "A1" vs "Assignment 1", "Quiz2" vs "Quiz 2", etc.)
+  const nameNums = lower.match(/\d+/g);
+  if (nameNums) {
+    match = gradeObjects.find((g) => {
+      const gNums = g.Name.toLowerCase().match(/\d+/g);
+      return gNums && nameNums.some(n => gNums.includes(n));
+    });
+  }
   return match?.Weight ?? null;
 }
 

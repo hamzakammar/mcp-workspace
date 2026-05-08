@@ -90,7 +90,7 @@ async function fetchWithCookie(url: string, cookieHeader: string): Promise<strin
     redirect: "manual",
   });
 
-  // Redirect to OIDC login = session expired
+  // Hard redirect to OIDC login (302/301) = session expired
   if (resp.status === 302 || resp.status === 301) {
     const loc = resp.headers.get("location") || "";
     if (loc.includes("oidc/login") || loc.includes("duosecurity")) {
@@ -102,7 +102,15 @@ async function fetchWithCookie(url: string, cookieHeader: string): Promise<strin
     throw new Error(`outline.uwaterloo.ca returned ${resp.status} for ${url}`);
   }
 
-  return resp.text();
+  const html = await resp.text();
+
+  // The site sometimes returns a 200 page that performs a JS redirect to OIDC login
+  // (instead of a 302). Detect by the redirect-parent element pointing to /oidc/.
+  if (html.includes('id="redirect-parent"') && (html.includes('/oidc/') || html.includes('duosecurity'))) {
+    throw new OutlineAuthError();
+  }
+
+  return html;
 }
 
 // ─── HTML parsing ─────────────────────────────────────────────────────────────
@@ -112,25 +120,50 @@ function parseAssessments($: cheerio.CheerioAPI): Assessment[] {
 
   // Look for a table with a header row containing "weight" or "component"
   $("table").each((_, table) => {
+    // Include th elements anywhere in the table (thead or tbody), and also td in thead
     const headers = $(table).find("th, thead td").map((_, el) => $(el).text().trim().toLowerCase()).get();
-    const hasWeight = headers.some(h => h.includes("weight") || h.includes("%"));
-    const hasComponent = headers.some(h => h.includes("component") || h.includes("assessment") || h.includes("activity") || h.includes("item"));
+    const hasWeight = headers.some(h =>
+      h.includes("weight") || h.includes("%") || h.includes("value") || h.includes("mark") || h.includes("grade") || h.includes("worth")
+    );
+    const hasComponent = headers.some(h =>
+      h.includes("component") || h.includes("assessment") || h.includes("activity") ||
+      h.includes("item") || h.includes("evaluation") || h.includes("task") || h.includes("assignment")
+    );
     if (!hasWeight && !hasComponent) return;
 
-    $(table).find("tbody tr, tr").each((i, row) => {
+    // Find column positions — prefer named columns, fall back to positional
+    const nameIdx = headers.findIndex(h =>
+      h.includes("component") || h.includes("assessment") || h.includes("item") ||
+      h.includes("activity") || h.includes("evaluation") || h.includes("task") || h.includes("assignment") || h === "name"
+    );
+    const weightIdx = headers.findIndex(h =>
+      h.includes("weight") || h.includes("%") || h.includes("value") || h.includes("mark") || h.includes("worth") || h.includes("grade")
+    );
+    const dateIdx = headers.findIndex(h =>
+      h.includes("date") || h.includes("due") || h.includes("deadline")
+    );
+    const notesIdx = headers.findIndex(h =>
+      h.includes("note") || h.includes("comment") || h.includes("remark") || h.includes("detail")
+    );
+
+    $(table).find("tbody tr, tr").each((_, row) => {
       const cells = $(row).find("td").map((_, el) => $(el).text().trim()).get();
       if (cells.length < 2) return;
 
       // Skip header rows that sneak into tbody
       const firstCell = cells[0].toLowerCase();
-      if (firstCell === "component" || firstCell === "assessment" || firstCell === "item" || firstCell === "activity") return;
+      const skipWords = ["component", "assessment", "item", "activity", "evaluation", "task", "name"];
+      if (skipWords.includes(firstCell)) return;
       if (!cells[0]) return;
 
+      const ni = nameIdx >= 0 ? nameIdx : 0;
+      const wi = weightIdx >= 0 ? weightIdx : 1;
+
       results.push({
-        name: cells[0],
-        weight: cells[1] || "",
-        date: cells[2] || undefined,
-        notes: cells[3] || undefined,
+        name: cells[ni] || cells[0],
+        weight: cells[wi] || "",
+        date: dateIdx >= 0 ? (cells[dateIdx] || undefined) : (cells[2] || undefined),
+        notes: notesIdx >= 0 ? (cells[notesIdx] || undefined) : (cells[3] || undefined),
       });
     });
   });
@@ -143,8 +176,13 @@ function parseSchedule($: cheerio.CheerioAPI): ScheduleRow[] {
 
   $("table").each((_, table) => {
     const headers = $(table).find("th, thead td").map((_, el) => $(el).text().trim().toLowerCase()).get();
-    const hasTopic = headers.some(h => h.includes("topic") || h.includes("lecture") || h.includes("module"));
-    const hasWeekOrDate = headers.some(h => h.includes("week") || h.includes("date"));
+    const hasTopic = headers.some(h =>
+      h.includes("topic") || h.includes("lecture") || h.includes("module") ||
+      h.includes("content") || h.includes("description") || h.includes("section")
+    );
+    const hasWeekOrDate = headers.some(h =>
+      h.includes("week") || h.includes("date") || h.includes("class") || h.includes("session")
+    );
     if (!hasTopic && !hasWeekOrDate) return;
 
     $(table).find("tbody tr, tr").each((_, row) => {
@@ -216,6 +254,30 @@ function parseInstructors($: cheerio.CheerioAPI): Instructor[] {
       });
 
       if (instructor.name) results.push(instructor);
+    });
+  }
+
+  // Fallback: table-based instructor info (some outlines use a staff table)
+  if (results.length === 0) {
+    $("table").each((_, table) => {
+      const headers = $(table).find("th, thead td").map((_, el) => $(el).text().trim().toLowerCase()).get();
+      if (!headers.some(h => h.includes("instructor") || h.includes("professor") || h.includes("lecturer") || h.includes("name"))) return;
+
+      const emailIdx = headers.findIndex(h => h.includes("email"));
+      const nameIdx = headers.findIndex(h => h.includes("name") || h.includes("instructor") || h.includes("professor") || h.includes("lecturer"));
+      const officeIdx = headers.findIndex(h => h.includes("office") && !h.includes("hour"));
+      const hoursIdx = headers.findIndex(h => h.includes("hour"));
+
+      $(table).find("tbody tr").each((_, row) => {
+        const cells = $(row).find("td").map((_, el) => $(el).text().trim()).get();
+        if (cells.length === 0 || !cells[nameIdx >= 0 ? nameIdx : 0]) return;
+        results.push({
+          name: cells[nameIdx >= 0 ? nameIdx : 0],
+          email: emailIdx >= 0 ? (cells[emailIdx] || undefined) : undefined,
+          office: officeIdx >= 0 ? (cells[officeIdx] || undefined) : undefined,
+          officeHours: hoursIdx >= 0 ? (cells[hoursIdx] || undefined) : undefined,
+        });
+      });
     });
   }
 
