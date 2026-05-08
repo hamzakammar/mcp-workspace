@@ -794,9 +794,6 @@ async function main() {
     // Health check (no auth) for ALB / load balancers
     app.get("/health", (_req, res) => res.json({ ok: true }));
 
-    // Root redirect → onboarding page
-    app.get("/", (_req, res) => res.redirect(301, "/onboard"));
-
     // Onboarding page (no auth)
     const publicDir = path.join(process.cwd(), "dist", "public");
     app.use(express.static(publicDir));
