@@ -2589,4 +2589,40 @@ router.post("/crowdmark/connect", async (req: Request, res: Response) => {
   }
 });
 
+/** GET /api/notion/status — Is Notion token stored? */
+router.get("/notion/status", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  try {
+    const { data } = await supabase
+      .from("user_credentials")
+      .select("token, updated_at")
+      .eq("user_id", userId)
+      .eq("service", "notion")
+      .single();
+    const connected = !!(data?.token);
+    res.json({ connected, lastUpdated: data?.updated_at || null });
+  } catch {
+    res.json({ connected: false, lastUpdated: null });
+  }
+});
+
+/** GET /api/notion/oauth-url — Build the Notion OAuth authorization URL for the current user */
+router.get("/notion/oauth-url", async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  const clientId = process.env.NOTION_CLIENT_ID;
+  const redirectUri = process.env.NOTION_REDIRECT_URI
+    || (process.env.API_HOST
+      ? `https://${process.env.API_HOST}/auth/notion/callback`
+      : "https://horizon.hamzaammar.ca/auth/notion/callback");
+
+  if (!clientId) {
+    res.status(503).json({ error: "Notion OAuth is not configured on this server." });
+    return;
+  }
+
+  const state = Buffer.from(JSON.stringify({ userId, ts: Date.now() })).toString("base64url");
+  const url = `https://api.notion.com/v1/oauth/authorize?client_id=${encodeURIComponent(clientId)}&response_type=code&owner=user&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
+  res.json({ url });
+});
+
 export default router;

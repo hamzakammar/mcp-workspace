@@ -654,6 +654,17 @@
           <span id="outlineStatusDot" style="width:8px;height:8px;border-radius:50%;background:#d4d4d4;flex-shrink:0"></span>
           <button id="outlineConnectBtn" class="copy-btn" style="font-size:11.5px;padding:4px 10px;display:none" onclick="showOutlineConnect()">Connect</button>
         </div>
+
+        <!-- Notion row -->
+        <div id="notionStatusRow" style="display:flex;align-items:center;gap:10px;padding:10px 13px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)">
+          <span style="font-size:13px;flex-shrink:0;color:var(--muted)"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M4.459 4.208c.746.606 1.026.56 2.428.466l13.215-.793c.28 0 .047-.28-.046-.326L17.86 1.968c-.42-.326-.981-.7-2.055-.607L3.01 2.295c-.466.046-.56.28-.374.466zm.793 3.08v13.904c0 .747.373 1.027 1.214.98l14.523-.84c.841-.046.935-.56.935-1.167V6.354c0-.606-.233-.933-.748-.887l-15.177.887c-.56.047-.747.327-.747.933zm14.337.745c.093.42 0 .84-.42.888l-.7.14v10.264c-.608.327-1.168.514-1.635.514-.748 0-.935-.234-1.495-.933l-4.577-7.186v6.952L12.21 19s0 .84-1.168.84l-3.222.186c-.093-.186 0-.653.327-.746l.84-.233V9.854L7.822 9.76c-.094-.42.14-1.026.793-1.073l3.456-.233 4.764 7.279v-6.44l-1.215-.14c-.093-.514.28-.887.747-.933zM1.936 1.035l13.31-.98c1.634-.14 2.055-.047 3.082.7l4.249 2.986c.7.513.934.653.934 1.213v16.378c0 1.026-.373 1.634-1.68 1.726l-15.458.934c-.98.047-1.448-.093-1.962-.747l-3.129-4.06c-.56-.747-.793-1.306-.793-1.96V2.667c0-.839.374-1.54 1.447-1.632z"/></svg></span>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:500">Notion <span style="font-size:11px;color:var(--muted);font-weight:400">optional</span></div>
+            <div id="notionStatusText" style="font-size:11.5px;color:var(--muted)">Checking...</div>
+          </div>
+          <span id="notionStatusDot" style="width:8px;height:8px;border-radius:50%;background:#d4d4d4;flex-shrink:0"></span>
+          <button id="notionConnectBtn" class="copy-btn" style="font-size:11.5px;padding:4px 10px;display:none" onclick="showNotionConnect()">Connect</button>
+        </div>
       </div>
 
       <!-- D2L VNC re-login inline -->
@@ -699,6 +710,14 @@
         </div>
         <button id="crowdmarkStartBtn" class="btn btn-primary" style="font-size:12.5px;padding:8px" onclick="startCrowdmarkConnect(this)">Open login browser</button>
         <div id="crowdmarkConnectStatus" style="font-size:12px;color:var(--muted);margin-top:6px"></div>
+      </div>
+
+      <!-- Notion connect inline -->
+      <div id="notionConnectBox" class="hidden" style="margin-top:8px;padding:12px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)">
+        <div style="font-size:12.5px;font-weight:500;margin-bottom:4px">Connect Notion</div>
+        <p style="font-size:11.5px;color:var(--muted);margin-bottom:10px;line-height:1.5">Sync your D2L assignments into a Notion database. Click below to authorise with Notion — you'll be redirected back automatically.</p>
+        <button id="notionOauthBtn" class="btn btn-primary" style="font-size:12.5px;padding:8px" onclick="startNotionOAuth()">Authorise with Notion</button>
+        <div id="notionConnectStatus" style="font-size:12px;color:var(--muted);margin-top:6px"></div>
       </div>
 
       <!-- Outline connect inline (VNC flow) -->
@@ -1228,6 +1247,21 @@
       loadNotes();
       loadConnectionStatus();
       ensureApiKey();
+
+      // Handle OAuth callback query params
+      try {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('notion') === 'connected') {
+          // Will be picked up by checkConnections() which runs on load
+          // Optionally show a brief toast
+          setTimeout(() => {
+            const dot = document.getElementById('notionStatusDot');
+            const text = document.getElementById('notionStatusText');
+            if (dot) dot.style.background = 'var(--success)';
+            if (text) text.textContent = 'Just connected!';
+          }, 500);
+        }
+      } catch {}
       if (notesPoll) clearInterval(notesPoll);
       notesPoll = setInterval(() => {
         if (token && !document.getElementById('stepSuccess').classList.contains('hidden')) loadNotes();
@@ -1438,6 +1472,27 @@
       } catch {
         document.getElementById('outlineStatusText').textContent = 'Unable to check';
       }
+
+      // Notion status
+      try {
+        const res = await fetch(`${API}/api/notion/status`, { headers: { 'Authorization': `Bearer ${token}` } });
+        const data = await res.json();
+        const dot = document.getElementById('notionStatusDot');
+        const text = document.getElementById('notionStatusText');
+        const btn = document.getElementById('notionConnectBtn');
+        if (data.connected) {
+          dot.style.background = 'var(--success)';
+          text.textContent = 'Connected — use sync_to_notion in Claude to sync assignments';
+          btn.textContent = 'Reconnect';
+        } else {
+          dot.style.background = '#d4d4d4';
+          text.textContent = 'Not connected — sync D2L assignments to Notion';
+          btn.textContent = 'Connect';
+        }
+        btn.style.display = '';
+      } catch {
+        document.getElementById('notionStatusText').textContent = 'Unable to check';
+      }
     }
 
     // D2L re-login via VNC
@@ -1584,6 +1639,29 @@
     // Outline connect (VNC flow)
     function showOutlineConnect() {
       document.getElementById('outlineConnectBox').classList.toggle('hidden');
+    }
+
+    function showNotionConnect() {
+      document.getElementById('notionConnectBox').classList.remove('hidden');
+    }
+
+    async function startNotionOAuth() {
+      const btn = document.getElementById('notionOauthBtn');
+      const status = document.getElementById('notionConnectStatus');
+      btn.disabled = true;
+      status.textContent = 'Requesting authorisation URL...';
+      try {
+        const res = await fetch(`${API}/api/notion/oauth-url`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        const data = await res.json();
+        if (!data.url) throw new Error(data.error || 'No URL returned');
+        status.textContent = 'Redirecting to Notion...';
+        window.location.href = data.url;
+      } catch (e) {
+        status.textContent = `Error: ${e.message}`;
+        btn.disabled = false;
+      }
     }
 
     let outlinePollInterval = null;
