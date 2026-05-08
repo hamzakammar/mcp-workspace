@@ -171,7 +171,7 @@ export const connectTools = {
   get_connection_guide: {
     description: `Get step-by-step instructions for connecting any optional Horizon integration. Returns instructions for Piazza, Crowdmark, and course outlines — either for the web dashboard or for connecting directly through Claude (MCP). Call this when a user asks how to connect a service or when a tool returns an auth error.`,
     schema: {
-      service: z.enum(['piazza', 'crowdmark', 'outline', 'all']).optional().describe('Which service to get instructions for. Defaults to all.'),
+      service: z.enum(['piazza', 'crowdmark', 'outline', 'notion', 'all']).optional().describe('Which service to get instructions for. Defaults to all.'),
     },
     handler: async (args: { service?: string }): Promise<string> => {
       const guides: Record<string, object> = {
