@@ -1,10 +1,11 @@
 /**
  * Public auth routes for the onboarding page.
- * No JWT required — these handle signup/signin and return tokens.
+ * No JWT required — these handle signup/signin, return tokens, and OAuth callbacks.
  */
 
 import { Router, Request, Response } from "express";
 import { createClient } from "@supabase/supabase-js";
+import { saveNotionToken } from "../study/notionAuth.js";
 
 const router = Router();
 
@@ -140,6 +141,92 @@ router.post("/reset-password", async (req: Request, res: Response) => {
     res.json({ ok: true });
   } catch (e: any) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+/**
+ * GET /auth/notion/callback — Notion OAuth callback.
+ *
+ * Notion redirects here after the user authorises the integration.
+ * Exchanges the one-time `code` for an access token and stores it.
+ * The `state` parameter encodes the userId so we know whose token to save.
+ *
+ * Security notes:
+ *   - state is verified to contain a recent timestamp (< 10 min)
+ *   - The Notion client secret is server-side only (never in the browser)
+ */
+router.get("/notion/callback", async (req: Request, res: Response) => {
+  const { code, state, error: oauthError } = req.query as Record<string, string>;
+
+  if (oauthError) {
+    res.status(400).send(`Notion OAuth error: ${oauthError}`);
+    return;
+  }
+
+  if (!code || !state) {
+    res.status(400).send("Missing code or state parameter.");
+    return;
+  }
+
+  // Decode and validate state
+  let userId: string;
+  try {
+    const decoded = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
+    userId = decoded.userId;
+    const age = Date.now() - (decoded.ts ?? 0);
+    if (!userId || age > 10 * 60 * 1000) {
+      throw new Error("state expired or invalid");
+    }
+  } catch {
+    res.status(400).send("Invalid state parameter. Please restart the connection flow.");
+    return;
+  }
+
+  const clientId = process.env.NOTION_CLIENT_ID;
+  const clientSecret = process.env.NOTION_CLIENT_SECRET;
+  const redirectUri = process.env.NOTION_REDIRECT_URI
+    || (process.env.API_HOST
+      ? `https://${process.env.API_HOST}/auth/notion/callback`
+      : 'https://horizon.hamzaammar.ca/auth/notion/callback');
+
+  if (!clientId || !clientSecret) {
+    res.status(500).send("Notion OAuth is not configured on this server.");
+    return;
+  }
+
+  try {
+    // Exchange code for access token
+    const tokenResp = await fetch("https://api.notion.com/v1/oauth/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Basic " + Buffer.from(`${clientId}:${clientSecret}`).toString("base64"),
+      },
+      body: JSON.stringify({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+      }),
+    });
+
+    if (!tokenResp.ok) {
+      const body = await tokenResp.text();
+      console.error("[NOTION_CALLBACK] Token exchange failed:", body);
+      res.status(502).send("Failed to exchange Notion authorisation code. Please try again.");
+      return;
+    }
+
+    const tokenData = await tokenResp.json() as { access_token: string };
+    await saveNotionToken(userId, tokenData.access_token);
+
+    // Redirect back to the onboard page with a success flag
+    const onboardBase = process.env.API_HOST
+      ? `https://${process.env.API_HOST}/onboard`
+      : "https://horizon.hamzaammar.ca/onboard";
+    res.redirect(`${onboardBase}?notion=connected`);
+  } catch (e: any) {
+    console.error("[NOTION_CALLBACK] Error:", e);
+    res.status(500).send(`Internal error: ${e.message}`);
   }
 });
 

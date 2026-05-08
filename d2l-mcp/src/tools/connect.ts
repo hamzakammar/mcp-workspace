@@ -134,6 +134,40 @@ export const connectTools = {
     },
   },
 
+  connect_notion: {
+    description: `Connect your Notion workspace so Horizon can sync your D2L assignments into a Notion database. This uses Notion OAuth — the tool returns an authorization URL to open in your browser. After approving, you'll be redirected back and your token will be saved automatically. You'll then need your Notion database ID (from the database URL) to use sync_to_notion.`,
+    schema: {},
+    handler: async (): Promise<string> => {
+      const userId = getUserId();
+      if (!userId || userId === 'legacy') {
+        return JSON.stringify({ success: false, error: 'Could not determine user ID. Make sure you are authenticated.' });
+      }
+
+      const clientId = process.env.NOTION_CLIENT_ID;
+      const redirectUri = process.env.NOTION_REDIRECT_URI
+        || (process.env.API_HOST
+          ? `https://${process.env.API_HOST}/api/notion/callback`
+          : 'https://horizon.hamzaammar.ca/api/notion/callback');
+
+      if (!clientId) {
+        return JSON.stringify({
+          success: false,
+          error: 'Notion OAuth is not configured on this server. Contact the administrator.',
+        });
+      }
+
+      const state = Buffer.from(JSON.stringify({ userId, ts: Date.now() })).toString('base64url');
+      const authUrl = `https://api.notion.com/v1/oauth/authorize?client_id=${encodeURIComponent(clientId)}&response_type=code&owner=user&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
+
+      return JSON.stringify({
+        success: true,
+        action: 'open_url',
+        url: authUrl,
+        message: 'Open the URL below in your browser to authorize Notion. After approving, your token will be saved and you can use sync_to_notion.',
+      }, null, 2);
+    },
+  },
+
   get_connection_guide: {
     description: `Get step-by-step instructions for connecting any optional Horizon integration. Returns instructions for Piazza, Crowdmark, and course outlines — either for the web dashboard or for connecting directly through Claude (MCP). Call this when a user asks how to connect a service or when a tool returns an auth error.`,
     schema: {
@@ -188,6 +222,23 @@ export const connectTools = {
             url: DASHBOARD_URL,
             steps: ['Visit the Horizon dashboard', 'Find "UW Course Outlines" in Connections', 'Follow the cookie instructions and paste the value'],
           },
+        },
+      };
+
+      guides['notion'] = {
+        name: 'Notion',
+        connectViaClaude: {
+          tool: 'connect_notion',
+          steps: [
+            '1. Run connect_notion (no arguments needed)',
+            '2. Open the returned URL in your browser and authorize Horizon',
+            '3. Copy your Notion database ID from the database URL',
+            '4. Run sync_to_notion with your database ID',
+          ],
+        },
+        connectViaDashboard: {
+          url: DASHBOARD_URL,
+          steps: ['Visit the Horizon dashboard', 'Find "Notion" in Connections', 'Click Connect and authorize'],
         },
       };
 

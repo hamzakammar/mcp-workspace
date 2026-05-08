@@ -26,6 +26,7 @@ import { discussionTools } from "./tools/discussions.js";
 import { statusTools } from "./tools/status.js";
 import { crowdmarkTools } from "./tools/crowdmark.js";
 import { connectTools } from "./tools/connect.js";
+import { notionTools } from "./tools/notion.js";
 import { D2LClient } from "./client.js";
 import { startSessionRefreshScheduler } from "./jobs/sessionRefresher.js";
 import { startStorageStateTTLJob } from "./jobs/storageStateTTL.js";
@@ -676,6 +677,24 @@ function createServer(): McpServer {
     connectTools.get_connection_guide.schema,
     wrapToolHandler("get_connection_guide", async (args) => {
       return await connectTools.get_connection_guide.handler(args as { service?: string });
+    })
+  );
+
+  server.tool(
+    "connect_notion",
+    connectTools.connect_notion.description,
+    connectTools.connect_notion.schema,
+    wrapToolHandler("connect_notion", async () => {
+      return await connectTools.connect_notion.handler();
+    })
+  );
+
+  server.tool(
+    "sync_to_notion",
+    notionTools.sync_to_notion.description,
+    notionTools.sync_to_notion.schema,
+    wrapToolHandler("sync_to_notion", async (args) => {
+      return await notionTools.sync_to_notion.handler(args as { databaseId: string });
     })
   );
 
