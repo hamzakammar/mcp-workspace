@@ -211,8 +211,10 @@ function parseSchedule($: cheerio.CheerioAPI): ScheduleRow[] {
 function parseInstructors($: cheerio.CheerioAPI): Instructor[] {
   const results: Instructor[] = [];
 
-  // Look for sections/divs with instructor-related text
-  const instructorHeadings = $("h2, h3, h4, dt, th, strong, b").filter((_, el) => {
+  // Look for headings with instructor-related text.
+  // Intentionally excludes <dt> — DL-based outlines are handled by the key-value
+  // fallback below, which correctly extracts email/office without regex false-positives.
+  const instructorHeadings = $("h2, h3, h4, th, strong, b").filter((_, el) => {
     const text = $(el).text().trim().toLowerCase();
     return text.includes("instructor") || text === "professor" || text === "lecturer" || text === "ta" || text === "teaching assistant";
   });

@@ -273,7 +273,7 @@ async function attemptCredentialLogin(
  * Returns the token to persist (possibly updated with rotated cookies from Set-Cookie headers),
  * or null if the session is dead.
  */
-async function pingD2LSession(
+export async function pingD2LSession(
   userId: string,
   d2lHost: string,
   currentToken: string

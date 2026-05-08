@@ -29,7 +29,7 @@ interface RawAttempt {
   IsCompleted: boolean;
 }
 
-interface RawGradeObject {
+export interface RawGradeObject {
   Id: number;
   Name: string;
   Weight: number | null;
@@ -50,9 +50,9 @@ interface GlobalRecommendation {
   _folderId?: number;  // internal — stripped before output
 }
 
-// ---- Helpers ----
+// ---- Helpers (exported for testing) ----
 
-function formatDueIn(isoDate: string): string {
+export function formatDueIn(isoDate: string): string {
   const diffMs = new Date(isoDate).getTime() - Date.now();
   if (diffMs <= 0) return 'overdue';
   const h = Math.round(diffMs / (1000 * 60 * 60));
@@ -62,7 +62,7 @@ function formatDueIn(isoDate: string): string {
 }
 
 // weight here is already a percentage (0–100) from GradeObject.Weight, not raw points
-function urgencyScore(dueMs: number, weight: number | null, notStarted: boolean): number {
+export function urgencyScore(dueMs: number, weight: number | null, notStarted: boolean): number {
   const now = Date.now();
   const hoursUntilDue = Math.max((dueMs - now) / (1000 * 60 * 60), 0.1);
   const weightFactor = weight != null ? weight / 100 : 0.1;
@@ -70,15 +70,23 @@ function urgencyScore(dueMs: number, weight: number | null, notStarted: boolean)
   return (weightFactor * notStartedPenalty) / hoursUntilDue;
 }
 
-function matchGradeWeight(name: string, gradeObjects: RawGradeObject[]): number | null {
+function wordBoundaryIncludes(haystack: string, needle: string): boolean {
+  const idx = haystack.indexOf(needle);
+  if (idx === -1) return false;
+  const afterIdx = idx + needle.length;
+  const charAfter = haystack[afterIdx];
+  return afterIdx >= haystack.length || !/\w/.test(charAfter);
+}
+
+export function matchGradeWeight(name: string, gradeObjects: RawGradeObject[]): number | null {
   const lower = name.toLowerCase();
-  // Tier 1: exact match or substring containment
-  let match = gradeObjects.find(
-    (g) =>
-      g.Name.toLowerCase() === lower ||
-      g.Name.toLowerCase().includes(lower) ||
-      lower.includes(g.Name.toLowerCase())
-  );
+  // Tier 1: exact match or whole-word substring containment
+  let match = gradeObjects.find((g) => {
+    const gLower = g.Name.toLowerCase();
+    return gLower === lower ||
+      wordBoundaryIncludes(gLower, lower) ||
+      wordBoundaryIncludes(lower, gLower);
+  });
   if (match) return match.Weight ?? null;
 
   // Tier 2: number-extraction fallback — if both names share the same integer,

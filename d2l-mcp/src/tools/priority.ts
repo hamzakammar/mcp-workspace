@@ -10,7 +10,7 @@ interface RawAssignment {
   Assessment: { ScoreDenominator: number } | null;
 }
 
-interface RawGradeObject {
+export interface RawGradeObject {
   Id: number;
   Name: string;
   Weight: number | null;
@@ -42,9 +42,9 @@ interface Recommendation {
   _folderId?: number; // internal — stripped before output
 }
 
-// ---- Helpers ----
+// ---- Helpers (exported for testing) ----
 
-function formatDueIn(isoDate: string): string {
+export function formatDueIn(isoDate: string): string {
   const diffMs = new Date(isoDate).getTime() - Date.now();
   if (diffMs <= 0) return 'overdue';
   const h = Math.round(diffMs / (1000 * 60 * 60));
@@ -54,7 +54,7 @@ function formatDueIn(isoDate: string): string {
 }
 
 // weight here is already a percentage (0–100) from GradeObject.Weight, not raw points
-function urgencyScore(
+export function urgencyScore(
   dueMs: number,
   weight: number | null,
   notStarted: boolean
@@ -66,18 +66,30 @@ function urgencyScore(
   return (weightFactor * notStartedPenalty) / hoursUntilDue;
 }
 
-function matchGradeWeight(
+/**
+ * Returns true when needle is a whole-word substring of haystack.
+ * "assignment 1" inside "assignment 10" is rejected because '0' follows the match.
+ */
+function wordBoundaryIncludes(haystack: string, needle: string): boolean {
+  const idx = haystack.indexOf(needle);
+  if (idx === -1) return false;
+  const afterIdx = idx + needle.length;
+  const charAfter = haystack[afterIdx];
+  return afterIdx >= haystack.length || !/\w/.test(charAfter);
+}
+
+export function matchGradeWeight(
   name: string,
   gradeObjects: RawGradeObject[]
 ): number | null {
   const lower = name.toLowerCase();
-  // Tier 1: exact match or substring containment
-  let match = gradeObjects.find(
-    (g) =>
-      g.Name.toLowerCase() === lower ||
-      g.Name.toLowerCase().includes(lower) ||
-      lower.includes(g.Name.toLowerCase())
-  );
+  // Tier 1: exact match or whole-word substring containment
+  let match = gradeObjects.find((g) => {
+    const gLower = g.Name.toLowerCase();
+    return gLower === lower ||
+      wordBoundaryIncludes(gLower, lower) ||
+      wordBoundaryIncludes(lower, gLower);
+  });
   if (match) return match.Weight ?? null;
 
   // Tier 2: number-extraction fallback — if both names share the same integer,
