@@ -146,8 +146,8 @@ export const connectTools = {
       const clientId = process.env.NOTION_CLIENT_ID;
       const redirectUri = process.env.NOTION_REDIRECT_URI
         || (process.env.API_HOST
-          ? `https://${process.env.API_HOST}/api/notion/callback`
-          : 'https://horizon.hamzaammar.ca/api/notion/callback');
+          ? `https://${process.env.API_HOST}/auth/notion/callback`
+          : 'https://horizon.hamzaammar.ca/auth/notion/callback');
 
       if (!clientId) {
         return JSON.stringify({
