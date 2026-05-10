@@ -164,12 +164,23 @@ function createServer(): McpServer {
           }
         }
         return { content: [{ type: "text" as const, text: result }] };
-      } catch (error) {
+      } catch (error: any) {
         const elapsedTime = Date.now() - startTime;
         console.error(
           `[TOOL] Tool execution failed: ${toolName} (${elapsedTime}ms)`,
           error
         );
+        // Provide a helpful reauth message instead of a raw error string
+        if (error?.message === "REAUTH_REQUIRED" || error?.message?.includes("REAUTH_REQUIRED")) {
+          const host = process.env.API_HOST || "localhost:3000";
+          return {
+            content: [{
+              type: "text" as const,
+              text: `⚠️ Your D2L session has expired and requires Duo re-authentication.\n\nTo fix this:\n1. Visit https://${host}/onboard\n2. Click "Connect" next to D2L / Brightspace\n3. Complete the Duo MFA login in the browser window\n\nOnce re-authenticated, your tools will work again automatically.`,
+            }],
+            isError: true,
+          };
+        }
         throw error;
       }
     };

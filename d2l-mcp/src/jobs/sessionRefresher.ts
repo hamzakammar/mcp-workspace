@@ -395,8 +395,12 @@ export async function refreshD2LSession(userId: string): Promise<RefreshResult> 
   // on the user's phone. Skip straight to credential login instead.
   const storageStatePath = await loadStorageStateFromS3(userId, undefined, { rejectIfLegacy: true });
   if (!storageStatePath) {
-    console.error(`[REFRESH] No usable browser state for user ${userId} — trying credential login`);
-    const credResult = await attemptCredentialLogin(userId, d2lHost);
+    // Legacy state was rejected for headless navigation, but it may still contain a valid
+    // Duo "remember this device" cookie needed for credential login to bypass Duo.
+    // Load it without legacy/expiry restrictions for the credential login path only.
+    const legacyStatePath = await loadStorageStateFromS3(userId, undefined, { ignoreExpiry: true });
+    console.error(`[REFRESH] No usable browser state for user ${userId} — trying credential login${legacyStatePath ? ' (with legacy Duo cookie)' : ''}`);
+    const credResult = await attemptCredentialLogin(userId, d2lHost, legacyStatePath);
     if (credResult) {
       console.error(`[REFRESH] Credential login succeeded for user ${userId} (no prior S3 state)`);
       return { success: true };

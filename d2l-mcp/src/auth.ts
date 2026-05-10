@@ -314,6 +314,17 @@ async function attemptSilentRelogin(userId: string): Promise<string | null> {
     return null;
   }
 
+  // If storageStatePath is null (legacy rejected or expired above), try loading without
+  // restrictions: credential login needs the Duo "remember this device" cookie from the
+  // state to bypass the Duo challenge, even if the ADFS session itself is expired.
+  let credStatePath = storageStatePath;
+  if (!credStatePath) {
+    credStatePath = await loadStorageStateFromS3(userId, undefined, { ignoreExpiry: true }) ?? undefined;
+    if (credStatePath) {
+      console.error(`[AUTH] Loaded expired/legacy S3 state for Duo cookie (credential login) for user ${userId}`);
+    }
+  }
+
   let browser;
   try {
     browser = await chromium.launch({
@@ -324,7 +335,7 @@ async function attemptSilentRelogin(userId: string): Promise<string | null> {
     // Restore S3 storage state so the Duo "remember this device" cookie is present,
     // allowing credential fill to bypass the Duo challenge (same as VNC does).
     const context = await browser.newContext(
-      storageStatePath ? { storageState: storageStatePath } : {}
+      credStatePath ? { storageState: credStatePath } : {}
     );
     const page = await context.newPage();
 

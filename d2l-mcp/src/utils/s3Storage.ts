@@ -62,7 +62,7 @@ function isStateExpired(capturedAt: string): boolean {
 export async function loadStorageStateFromS3(
   userId: string,
   service?: string,
-  opts?: { rejectIfLegacy?: boolean }
+  opts?: { rejectIfLegacy?: boolean; ignoreExpiry?: boolean }
 ): Promise<string | undefined> {
   const key = storageStateKey(userId, service);
   try {
@@ -75,7 +75,7 @@ export async function loadStorageStateFromS3(
     if (isEncryptedEnvelope(data)) {
       // ── Encrypted envelope (current format) ──────────────────────────
       const capturedAt = readEnvelopeCapturedAt(data);
-      if (capturedAt && isStateExpired(capturedAt)) {
+      if (capturedAt && isStateExpired(capturedAt) && !opts?.ignoreExpiry) {
         console.error(
           `[S3] Storage state for user ${userId} expired (captured ${capturedAt}). ` +
           `Treating as not found — duo reauth required.`
@@ -105,7 +105,7 @@ export async function loadStorageStateFromS3(
 
       // Check TTL using the captured_at S3 object metadata before serving.
       const legacyCapturedAt = res.Metadata?.captured_at;
-      if (legacyCapturedAt && isStateExpired(legacyCapturedAt)) {
+      if (legacyCapturedAt && isStateExpired(legacyCapturedAt) && !opts?.ignoreExpiry) {
         console.error(
           `[S3] Legacy storage state for user ${userId} is expired (captured ${legacyCapturedAt}). ` +
           `Treating as not found — duo reauth required.`
