@@ -1,0 +1,75 @@
+{
+  "Objects": [
+    {
+      "CalendarEventId": 102778,
+      "OrgUnitId": 68929,
+      "CreatorUserId": 0,
+      "Title": "Weekly Report",
+      "Description": "",
+      "CalendarEventViewUrl": "https://learn.ul.ie/d2l/le/calendar/68929/event/113149/detailsview",
+      "IsAllDayEvent": false,
+      "GroupId": null,
+      "StartDateTime": "2025-11-21T17:00:00.000Z",
+      "EndDateTime": "2025-11-21T17:00:00.000Z",
+      "IsRecurring": false,
+      "RecurrenceInfo": null,
+      "StartDay": null,
+      "EndDay": null,
+      "LocationId": null,
+      "LocationName": "",
+      "OrgUnitName": "CS4444 - RESIDENCY 2",
+      "OrgUnitCode": "CS4444_SEM1_2025_6",
+      "IsAssociatedWithEntity": true,
+      "AssociatedEntity": {
+        "AssociatedEntityType": "D2L.LE.Dropbox.Dropbox",
+        "AssociatedEntityId": 37826,
+        "Link": ""
+      },
+      "HasVisibilityRestrictions": false,
+      "VisibilityRestrictions": {
+        "Type": 1,
+        "Range": null,
+        "HiddenRangeUnitType": null,
+        "StartDate": null,
+        "EndDate": null
+      },
+      "Presenters": []
+    },
+    {
+      "CalendarEventId": 109569,
+      "OrgUnitId": 68929,
+      "CreatorUserId": 0,
+      "Title": "Final Quiz",
+      "Description": "<p>Multiple choice quiz covering all topics</p>",
+      "CalendarEventViewUrl": "https://learn.ul.ie/d2l/le/calendar/68929/event/120438/detailsview",
+      "IsAllDayEvent": false,
+      "GroupId": null,
+      "StartDateTime": "2025-12-15T14:00:00.000Z",
+      "EndDateTime": "2025-12-15T15:00:00.000Z",
+      "IsRecurring": false,
+      "RecurrenceInfo": null,
+      "StartDay": null,
+      "EndDay": null,
+      "LocationId": null,
+      "LocationName": "",
+      "OrgUnitName": "CS4444 - RESIDENCY 2",
+      "OrgUnitCode": "CS4444_SEM1_2025_6",
+      "IsAssociatedWithEntity": true,
+      "AssociatedEntity": {
+        "AssociatedEntityType": "D2L.LE.Quizzing.Quiz",
+        "AssociatedEntityId": 12345,
+        "Link": "https://learn.ul.ie/d2l/lms/quizzing/user/quiz_summary.d2l?qi=12345"
+      },
+      "HasVisibilityRestrictions": false,
+      "VisibilityRestrictions": {
+        "Type": 1,
+        "Range": null,
+        "HiddenRangeUnitType": null,
+        "StartDate": null,
+        "EndDate": null
+      },
+      "Presenters": []
+    }
+  ],
+  "Next": null
+}

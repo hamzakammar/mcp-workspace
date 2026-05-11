@@ -1,0 +1,47 @@
+[
+  {
+    "Id": 118403,
+    "IsHidden": false,
+    "Attachments": [],
+    "CreatedBy": 9011,
+    "CreatedDate": "2025-11-19T16:51:48.287Z",
+    "LastModifiedBy": null,
+    "LastModifiedDate": "2025-11-19T16:51:48.287Z",
+    "Title": "Technology Report new submission date",
+    "Body": {
+      "Text": "All,\r\nThe submission date for the Technology Report has been extended to the 24th of November at 5pm.\r\n",
+      "Html": "<p>All,</p><p>The submission date for the <strong>Technology Report</strong> has been extended to the <strong>24th of November at 5pm</strong>.</p>"
+    },
+    "StartDate": "2025-11-19T16:49:00.000Z",
+    "EndDate": null,
+    "IsGlobal": false,
+    "IsPublished": true,
+    "ShowOnlyInCourseOfferings": false,
+    "IsAuthorInfoShown": true
+  },
+  {
+    "Id": 118404,
+    "IsHidden": false,
+    "Attachments": [
+      {
+        "FileName": "syllabus.pdf",
+        "Size": 102400
+      }
+    ],
+    "CreatedBy": 9011,
+    "CreatedDate": "2025-09-01T09:00:00.000Z",
+    "LastModifiedBy": null,
+    "LastModifiedDate": "2025-09-01T09:00:00.000Z",
+    "Title": "Welcome to the course!",
+    "Body": {
+      "Text": "Welcome everyone!\n\nPlease see the attached syllabus.",
+      "Html": "<p>Welcome everyone!</p><p>Please see the attached syllabus.</p>"
+    },
+    "StartDate": "2025-09-01T09:00:00.000Z",
+    "EndDate": null,
+    "IsGlobal": false,
+    "IsPublished": true,
+    "ShowOnlyInCourseOfferings": false,
+    "IsAuthorInfoShown": true
+  }
+]
