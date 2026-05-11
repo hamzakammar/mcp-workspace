@@ -1,0 +1,80 @@
+{
+  "PagingInfo": {
+    "Bookmark": "71833",
+    "HasMoreItems": false
+  },
+  "Items": [
+    {
+      "OrgUnit": {
+        "Id": 6606,
+        "Type": {
+          "Id": 1,
+          "Code": "Organization",
+          "Name": "Organization"
+        },
+        "Name": "University Of Limerick",
+        "Code": "UL",
+        "HomeUrl": "https://learn.ul.ie/d2l/home/6606",
+        "ImageUrl": "https://learn.ul.ie/d2l/api/lp/1.9/courses/6606/image"
+      },
+      "Access": {
+        "IsActive": true,
+        "StartDate": null,
+        "EndDate": null,
+        "CanAccess": true,
+        "ClasslistRoleName": "Learner",
+        "LISRoles": ["urn:lti:instrole:ims/lis/Student"],
+        "LastAccessed": "2025-11-27T22:30:23.460Z"
+      },
+      "PinDate": null
+    },
+    {
+      "OrgUnit": {
+        "Id": 68929,
+        "Type": {
+          "Id": 3,
+          "Code": "Course Offering",
+          "Name": "Course Offering"
+        },
+        "Name": "CS4444 - RESIDENCY 2: SOFTWARE/SYSTEM DEV. PART 2 2025/6 SEM1",
+        "Code": "CS4444_SEM1_2025_6",
+        "HomeUrl": "https://learn.ul.ie/d2l/home/68929",
+        "ImageUrl": "https://learn.ul.ie/d2l/api/lp/1.9/courses/68929/image"
+      },
+      "Access": {
+        "IsActive": true,
+        "StartDate": null,
+        "EndDate": null,
+        "CanAccess": true,
+        "ClasslistRoleName": "Learner",
+        "LISRoles": ["urn:lti:instrole:ims/lis/Student"],
+        "LastAccessed": "2025-11-27T00:32:31.487Z"
+      },
+      "PinDate": "2025-09-19T15:18:44.833Z"
+    },
+    {
+      "OrgUnit": {
+        "Id": 67993,
+        "Type": {
+          "Id": 4,
+          "Code": "Group",
+          "Name": "Group"
+        },
+        "Name": "Group 3",
+        "Code": "Group_49276_2948_3",
+        "HomeUrl": "https://learn.ul.ie/d2l/home/67993",
+        "ImageUrl": null
+      },
+      "Access": {
+        "IsActive": true,
+        "StartDate": null,
+        "EndDate": null,
+        "CanAccess": true,
+        "ClasslistRoleName": "Learner",
+        "LISRoles": ["urn:lti:instrole:ims/lis/Student"],
+        "LastAccessed": null
+      },
+      "PinDate": null
+    }
+  ]
+}

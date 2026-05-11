@@ -1,0 +1,68 @@
+[
+  {
+    "PointsNumerator": 10,
+    "PointsDenominator": 10,
+    "WeightedNumerator": null,
+    "WeightedDenominator": null,
+    "GradeObjectIdentifier": "56659",
+    "GradeObjectName": "Weekly Report",
+    "GradeObjectType": 1,
+    "GradeObjectTypeName": "Numeric",
+    "DisplayedGrade": "100 %",
+    "Comments": {
+      "Text": "",
+      "Html": ""
+    },
+    "PrivateComments": {
+      "Text": "",
+      "Html": ""
+    },
+    "LastModified": "2025-10-22T14:58:20.370Z",
+    "LastModifiedBy": null,
+    "ReleasedDate": null
+  },
+  {
+    "PointsNumerator": 8,
+    "PointsDenominator": 10,
+    "WeightedNumerator": null,
+    "WeightedDenominator": null,
+    "GradeObjectIdentifier": "56660",
+    "GradeObjectName": "Quiz 1",
+    "GradeObjectType": 1,
+    "GradeObjectTypeName": "Numeric",
+    "DisplayedGrade": "80 %",
+    "Comments": {
+      "Text": "Good work!",
+      "Html": "<p>Good work!</p>"
+    },
+    "PrivateComments": {
+      "Text": "",
+      "Html": ""
+    },
+    "LastModified": "2025-10-25T10:30:00.000Z",
+    "LastModifiedBy": null,
+    "ReleasedDate": null
+  },
+  {
+    "PointsNumerator": null,
+    "PointsDenominator": 10,
+    "WeightedNumerator": null,
+    "WeightedDenominator": null,
+    "GradeObjectIdentifier": "56661",
+    "GradeObjectName": "Assignment (Not Graded)",
+    "GradeObjectType": 1,
+    "GradeObjectTypeName": "Numeric",
+    "DisplayedGrade": null,
+    "Comments": {
+      "Text": "",
+      "Html": ""
+    },
+    "PrivateComments": {
+      "Text": "",
+      "Html": ""
+    },
+    "LastModified": null,
+    "LastModifiedBy": null,
+    "ReleasedDate": null
+  }
+]

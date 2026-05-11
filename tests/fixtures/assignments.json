@@ -1,0 +1,89 @@
+[
+  {
+    "Id": 37812,
+    "CategoryId": null,
+    "Name": "Weekly Report",
+    "CustomInstructions": {
+      "Text": "Submit your weekly report in .docx format.",
+      "Html": "<p>Submit your weekly report in .docx format.</p>"
+    },
+    "Attachments": [],
+    "TotalFiles": -1,
+    "UnreadFiles": -1,
+    "FlaggedFiles": -1,
+    "TotalUsers": -1,
+    "TotalUsersWithSubmissions": -1,
+    "TotalUsersWithFeedback": -1,
+    "Availability": {
+      "StartDate": "2025-09-07T23:01:00.000Z",
+      "EndDate": "2025-09-12T16:00:00.000Z",
+      "StartDateAvailabilityType": 0,
+      "EndDateAvailabilityType": 0
+    },
+    "IsHidden": false,
+    "Assessment": {
+      "ScoreDenominator": 10,
+      "Rubrics": []
+    },
+    "DropboxType": 2,
+    "GroupTypeId": null,
+    "DueDate": "2025-09-12T16:00:00.000Z",
+    "DisplayInCalendar": false,
+    "NotificationEmail": null,
+    "LinkAttachments": [],
+    "ActivityId": "https://ids.brightspace.com/activities/dropbox/test-1",
+    "IsAnonymous": false,
+    "SubmissionType": 0,
+    "CompletionType": 0,
+    "AllowableFileType": 5,
+    "CustomAllowableFileTypes": [".docx"],
+    "GradeItemId": 56659,
+    "AllowOnlyUsersWithSpecialAccess": null
+  },
+  {
+    "Id": 37839,
+    "CategoryId": null,
+    "Name": "Technology Analysis Report",
+    "CustomInstructions": {
+      "Text": "2500 word analysis of a technology used at your residency.",
+      "Html": "<p>2500 word analysis of a technology used at your residency.</p>"
+    },
+    "Attachments": [
+      {
+        "FileName": "rubric.pdf",
+        "Size": 51200
+      }
+    ],
+    "TotalFiles": -1,
+    "UnreadFiles": -1,
+    "FlaggedFiles": -1,
+    "TotalUsers": -1,
+    "TotalUsersWithSubmissions": -1,
+    "TotalUsersWithFeedback": -1,
+    "Availability": null,
+    "IsHidden": false,
+    "Assessment": {
+      "ScoreDenominator": 50,
+      "Rubrics": []
+    },
+    "DropboxType": 2,
+    "GroupTypeId": null,
+    "DueDate": "2025-11-24T17:00:00.000Z",
+    "DisplayInCalendar": false,
+    "NotificationEmail": null,
+    "LinkAttachments": [
+      {
+        "Name": "Citation Guide",
+        "Url": "https://libguides.ul.ie/citeitright"
+      }
+    ],
+    "ActivityId": "https://ids.brightspace.com/activities/dropbox/test-2",
+    "IsAnonymous": false,
+    "SubmissionType": 0,
+    "CompletionType": 0,
+    "AllowableFileType": 0,
+    "CustomAllowableFileTypes": null,
+    "GradeItemId": 56683,
+    "AllowOnlyUsersWithSpecialAccess": null
+  }
+]

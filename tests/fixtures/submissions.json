@@ -1,0 +1,42 @@
+[
+  {
+    "Entity": {
+      "DisplayName": "Test User",
+      "EntityId": 45760,
+      "EntityType": "User",
+      "Active": true
+    },
+    "Status": 1,
+    "Feedback": {
+      "Score": 45,
+      "Feedback": {
+        "Text": "Excellent work on the analysis!",
+        "Html": "<p>Excellent work on the analysis!</p>"
+      }
+    },
+    "Submissions": [
+      {
+        "Id": 766506,
+        "SubmittedBy": {
+          "Identifier": "45760",
+          "DisplayName": "Test User"
+        },
+        "SubmissionDate": "2025-11-24T11:59:57.233Z",
+        "Comment": {
+          "Text": "Here is my submission"
+        },
+        "Files": [
+          {
+            "IsRead": true,
+            "IsFlagged": false,
+            "IsDeleted": false,
+            "FileId": 3605044,
+            "FileName": "TechnologyAnalysis.pdf",
+            "Size": 2007067
+          }
+        ]
+      }
+    ],
+    "CompletionDate": "2025-11-24T11:59:57.233Z"
+  }
+]
