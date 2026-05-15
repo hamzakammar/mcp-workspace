@@ -323,13 +323,24 @@ export async function getPiazzaCookieHeader(userId?: string): Promise<string> {
                 const rawSetCookie = loginResp.headers.get('set-cookie') || '';
                 setCookies = rawSetCookie.split(/,(?=\s*\w+=)/).map(s => s.trim()).filter(Boolean);
               }
-              const cookieParts: string[] = [];
+              // Deduplicate cookies: keep only non-empty values (Piazza sends piazza_session= empty to clear old)
+              const cookieMap = new Map<string, string>();
               for (const sc of setCookies) {
                 const nameValue = sc.split(';')[0];
-                if (nameValue) cookieParts.push(nameValue);
+                if (!nameValue) continue;
+                const eqIdx = nameValue.indexOf('=');
+                if (eqIdx < 0) continue;
+                const name = nameValue.slice(0, eqIdx);
+                const value = nameValue.slice(eqIdx + 1);
+                // Only overwrite if new value is non-empty
+                if (value || !cookieMap.has(name)) cookieMap.set(name, value);
               }
+              // Remove empty-value cookies
+              const cookieParts = [...cookieMap.entries()]
+                .filter(([, v]) => v.length > 0)
+                .map(([k, v]) => `${k}=${v}`);
 
-              console.error(`[PIAZZA_AUTH] Raw Set-Cookie parts: ${cookieParts.join(' | ')}`);
+              console.error(`[PIAZZA_AUTH] Deduped cookies: ${cookieParts.map(c => c.split('=')[0]).join(', ')}`);
               if (cookieParts.length > 0 && cookieParts.some(c => c.includes("session_id"))) {
                 const newCookieHeader = cookieParts.join("; ");
                 console.error(`[PIAZZA_AUTH] Credential login succeeded, got ${cookieParts.length} cookies`);
