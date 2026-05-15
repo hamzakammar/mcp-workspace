@@ -105,6 +105,76 @@ async function getUrgentReminders(
   }
 }
 
+// ---- Global deadline notifications (all courses, 7-day window) ----
+interface GlobalDeadline {
+  title: string;
+  course: string;
+  dueIn: string;
+  dueDate: string;
+}
+
+const globalDeadlineCache: Record<string, { items: GlobalDeadline[]; cachedAt: number }> = {};
+const GLOBAL_DEADLINE_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+
+async function getGlobalDeadlines(userId: string): Promise<GlobalDeadline[]> {
+  const cached = globalDeadlineCache[userId];
+  if (cached && Date.now() - cached.cachedAt < GLOBAL_DEADLINE_CACHE_TTL) {
+    return cached.items;
+  }
+
+  try {
+    const d2lClient = new D2LClient(userId);
+    const enrollmentsRaw = (await d2lClient.getMyEnrollments()) as { Items: Array<{
+      OrgUnit: { Id: number; Name: string; Code: string; Type: { Code: string } };
+      Access: { IsActive: boolean; CanAccess: boolean };
+    }> };
+
+    const now = new Date();
+    const weekFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const items: GlobalDeadline[] = [];
+
+    // Only check active course offerings
+    const courses = (enrollmentsRaw.Items || []).filter(e =>
+      e.OrgUnit?.Type?.Code === 'Course Offering' && e.Access?.IsActive && e.Access?.CanAccess
+    );
+
+    // Fetch calendar events for all courses in parallel (7-day window)
+    await Promise.all(courses.map(async (course) => {
+      try {
+        const events = (await d2lClient.getMyCalendarEvents(
+          course.OrgUnit.Id,
+          now.toISOString(),
+          weekFromNow.toISOString()
+        )) as { Objects: Array<{ Title: string; EndDateTime: string }> };
+
+        for (const e of (events.Objects || [])) {
+          items.push({
+            title: e.Title,
+            course: course.OrgUnit.Name.replace(/ Online - .*$/, ''),
+            dueIn: formatDueIn(e.EndDateTime),
+            dueDate: new Date(e.EndDateTime).toLocaleString('en-US', {
+              timeZone: 'America/Toronto',
+              month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+            }),
+          });
+        }
+      } catch { /* skip courses that fail */ }
+    }));
+
+    // Sort by urgency
+    items.sort((a, b) => {
+      const aMs = a.dueIn === 'overdue' ? -1 : parseInt(a.dueIn);
+      const bMs = b.dueIn === 'overdue' ? -1 : parseInt(b.dueIn);
+      return aMs - bMs;
+    });
+
+    globalDeadlineCache[userId] = { items, cachedAt: Date.now() };
+    return items;
+  } catch {
+    return [];
+  }
+}
+
 function createServer(): McpServer {
   console.error("[INIT] createServer() called - starting MCP server initialization");
 
@@ -167,6 +237,27 @@ function createServer(): McpServer {
         const syncUserId = getUserId();
         if (syncUserId && syncUserId !== "legacy" && toolName !== "sync_to_notion") {
           backgroundNotionSync(syncUserId).catch(() => {});
+        }
+
+        // Inject global deadline notifications (7-day window, cached 30min)
+        const deadlineUserId = userId || syncUserId;
+        if (deadlineUserId && deadlineUserId !== "legacy") {
+          try {
+            const deadlines = await getGlobalDeadlines(deadlineUserId);
+            if (deadlines.length > 0) {
+              try {
+                const parsed = JSON.parse(result);
+                const withDeadlines = Array.isArray(parsed)
+                  ? { results: parsed, _upcomingDeadlines: deadlines }
+                  : { ...parsed, _upcomingDeadlines: deadlines };
+                return { content: [{ type: "text" as const, text: JSON.stringify(withDeadlines, null, 2) }] };
+              } catch {
+                // Non-JSON result — append as text
+                const deadlineText = `\n\n---\n📅 Upcoming deadlines (next 7 days):\n${deadlines.map(d => `  • ${d.title} (${d.course}) — ${d.dueDate}`).join('\n')}`;
+                return { content: [{ type: "text" as const, text: result + deadlineText }] };
+              }
+            }
+          } catch { /* deadline check failed, continue without */ }
         }
 
         return { content: [{ type: "text" as const, text: result }] };
