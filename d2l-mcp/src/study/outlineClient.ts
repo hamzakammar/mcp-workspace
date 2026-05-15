@@ -327,27 +327,64 @@ function parseTitle($: cheerio.CheerioAPI): string | null {
 
 // ─── Exported functions ───────────────────────────────────────────────────────
 
+interface SearchResult {
+  term: string;
+  courses: string;
+  title: string;
+  url: string;
+  instructors?: string[];
+  sections?: string;
+}
+
+/**
+ * Search the outline API for a course. Returns matching outlines with their view URLs.
+ */
+async function searchOutlineAPI(cookieHeader: string, query: string): Promise<SearchResult[]> {
+  const url = `${OUTLINE_BASE}/viewer/api/search/?q=${encodeURIComponent(query)}`;
+  const resp = await fetch(url, {
+    headers: {
+      "Cookie": cookieHeader,
+      "Accept": "application/json",
+    },
+  });
+  if (!resp.ok) throw new Error(`Outline API search failed: ${resp.status}`);
+  return await resp.json() as SearchResult[];
+}
+
 /**
  * Fetch and parse a specific course outline.
  * courseCode: e.g. "CS135" or "MATH135"
- * term: e.g. "1251" (required — outline URLs include the term)
+ * term: e.g. "1251" (required — used to filter API results)
  */
 export async function fetchCourseOutline(
   cookieHeader: string,
   courseCode: string,
   term: string
 ): Promise<ParsedOutline> {
-  const url = buildOutlineUrl(courseCode, term);
-  console.error(`[OUTLINE_CLIENT] Fetching outline: ${url}`);
+  // Format course code for search: "CS135" → "CS 135"
+  const searchQuery = courseCode.replace(/([A-Za-z]+)(\d+)/, '$1 $2').toUpperCase();
+  console.error(`[OUTLINE_CLIENT] Searching outline API: "${searchQuery}" term=${term}`);
 
-  const html = await fetchWithCookie(url, cookieHeader);
+  const results = await searchOutlineAPI(cookieHeader, searchQuery);
+
+  // Find the matching term
+  const match = results.find(r => r.term === term) || results[0];
+  if (!match) {
+    throw new Error(`No outline found for ${courseCode} term ${term}`);
+  }
+
+  // Fetch the full HTML from the view URL
+  const viewUrl = match.url.startsWith("http") ? match.url : `${OUTLINE_BASE}${match.url}`;
+  console.error(`[OUTLINE_CLIENT] Fetching outline view: ${viewUrl}`);
+
+  const html = await fetchWithCookie(viewUrl, cookieHeader);
   const $ = cheerio.load(html);
 
   return {
-    title: parseTitle($),
+    title: parseTitle($) || match.title,
     courseCode: courseCode.toUpperCase(),
     term,
-    outlineUrl: url,
+    outlineUrl: viewUrl,
     assessments: parseAssessments($),
     schedule: parseSchedule($),
     instructors: parseInstructors($),
@@ -357,31 +394,18 @@ export async function fetchCourseOutline(
 }
 
 /**
- * Fetch the list of available outlines for the user's organization.
- * Returns an array of { courseCode, term, url } objects.
+ * Fetch the list of available outlines for the user (enrolled courses).
+ * Uses the API search with empty query to get "my courses".
  */
 export async function fetchMyOutlineList(cookieHeader: string): Promise<Array<{ courseCode: string; term: string; url: string }>> {
-  const url = `${OUTLINE_BASE}/viewer/org/uwaterloo/`;
-  console.error(`[OUTLINE_CLIENT] Fetching outline list from ${url}`);
+  console.error(`[OUTLINE_CLIENT] Fetching my outlines via API`);
 
-  const html = await fetchWithCookie(url, cookieHeader);
-  const $ = cheerio.load(html);
-  const results: Array<{ courseCode: string; term: string; url: string }> = [];
-
-  // Outline list pages typically have links like /viewer/course/cs/135/1251/
-  $("a[href*='/viewer/course/']").each((_, el) => {
-    const href = $(el).attr("href") || "";
-    const m = href.match(/\/viewer\/course\/([^/]+)\/([^/]+)\/([^/]+)\/?/);
-    if (m) {
-      results.push({
-        courseCode: `${m[1].toUpperCase()}${m[2]}`,
-        term: m[3],
-        url: href.startsWith("http") ? href : `${OUTLINE_BASE}${href}`,
-      });
-    }
-  });
-
-  return results;
+  const results = await searchOutlineAPI(cookieHeader, "");
+  return results.map(r => ({
+    courseCode: r.courses.replace(/\s+/g, '').toUpperCase(),
+    term: r.term,
+    url: r.url.startsWith("http") ? r.url : `${OUTLINE_BASE}${r.url}`,
+  }));
 }
 
 /**

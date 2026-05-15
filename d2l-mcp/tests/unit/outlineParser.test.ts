@@ -19,17 +19,32 @@ import {
 
 // ─── Mock fetch helper ────────────────────────────────────────────────────────
 
+// The new flow: 1) API search (returns JSON), 2) fetch view page (returns HTML)
+// For most tests, we want the API search to succeed and test the HTML parsing.
+const MOCK_SEARCH_RESULT = [{ term: '1265', courses: 'CS 138', title: 'Intro', url: '/viewer/view/abc123' }];
+
 function mockFetch(status: number, html: string, location?: string) {
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-    status,
-    ok: status >= 200 && status < 300,
-    headers: {
-      get: (name: string) => {
-        if (name.toLowerCase() === 'location') return location ?? null;
-        return null;
+  vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+    // API search call
+    if (url.includes('/viewer/api/search/')) {
+      return {
+        status: 200,
+        ok: true,
+        json: async () => MOCK_SEARCH_RESULT,
+      };
+    }
+    // View page call
+    return {
+      status,
+      ok: status >= 200 && status < 300,
+      headers: {
+        get: (name: string) => {
+          if (name.toLowerCase() === 'location') return location ?? null;
+          return null;
+        },
       },
-    },
-    text: async () => html,
+      text: async () => html,
+    };
   }));
 }
 
@@ -146,11 +161,16 @@ describe('fetchCourseOutline — auth error detection', () => {
     ).rejects.toThrow(OutlineAuthError);
   });
 
-  it('throws a plain Error (not OutlineAuthError) on non-200 non-redirect status', async () => {
-    mockFetch(404, 'Not Found');
+  it('throws a plain Error (not OutlineAuthError) when API returns no results', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/viewer/api/search/')) {
+        return { status: 200, ok: true, json: async () => [] };
+      }
+      return { status: 404, ok: false, text: async () => 'Not Found', headers: { get: () => null } };
+    }));
     await expect(
       fetchCourseOutline('sessionid=valid', 'CS999', '1265')
-    ).rejects.toThrow(/404/);
+    ).rejects.toThrow(/No outline found/);
   });
 
   it('does NOT throw on a valid 200 HTML page (no redirect element)', async () => {
