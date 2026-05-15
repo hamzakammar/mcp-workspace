@@ -122,7 +122,7 @@ export const connectTools = {
       try {
         const encryptedPassword = await encryptPassword(args.password);
         await logCredentialAccess(userId, 'piazza_password', 'write', 'connect_piazza MCP tool');
-        await upsertCredential(userId, 'piazza', { email: args.email, password: encryptedPassword });
+        await upsertCredential(userId, 'piazza', { email: args.email, password: encryptedPassword, token: 'credential_auth' });
         return JSON.stringify({
           success: true,
           message: `Piazza connected with ${args.email}. Your credentials are encrypted and stored. Use piazza_get_classes to verify the connection.`,

@@ -1740,6 +1740,7 @@ router.post("/piazza/connect", async (req: Request, res: Response) => {
         service: "piazza",
         email,
         password: encryptedPiazzaPassword,
+        token: "credential_auth",
         updated_at: new Date().toISOString(),
       }, {
         onConflict: "user_id,service"
