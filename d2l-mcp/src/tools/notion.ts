@@ -9,6 +9,8 @@ import { getUserId } from '../utils/userContext.js';
 import { client } from '../client.js';
 import { getNotionToken } from '../study/notionAuth.js';
 import { syncCourses, type CourseData, type AssignmentInfo, type GradeInfo, type AnnouncementInfo } from '../study/notionClient.js';
+import { fetchCourseOutline, getCurrentTerm, type Assessment } from '../study/outlineClient.js';
+import { getOrRefreshOutlineCookies } from '../study/outlineAuth.js';
 
 // ─── D2L raw types ────────────────────────────────────────────────────────────
 
@@ -108,14 +110,112 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
   return courseData;
 }
 
+/**
+ * Enrich course data with outline assessments (weights, due dates from syllabus).
+ * Merges outline assessments into existing assignments or adds new ones.
+ */
+async function enrichWithOutline(courses: CourseData[], userId: string): Promise<void> {
+  let cookieHeader: string;
+  try {
+    cookieHeader = await getOrRefreshOutlineCookies(userId);
+  } catch {
+    return; // outline not connected, skip silently
+  }
+
+  const term = getCurrentTerm();
+
+  for (const course of courses) {
+    try {
+      // Extract course code from D2L code (e.g. "PSYCH207_081_cel_1265" → "PSYCH207")
+      const codeMatch = course.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6})(\d{3})/);
+      if (!codeMatch) continue;
+      const courseCode = `${codeMatch[1]}${codeMatch[2]}`;
+
+      const outline = await fetchCourseOutline(cookieHeader, courseCode, term);
+
+      if (outline.assessments.length > 0) {
+        // Merge outline assessments: add any not already in assignments list
+        const existingNames = new Set(course.assignments.map(a => a.name.toLowerCase()));
+
+        for (const assessment of outline.assessments) {
+          if (!existingNames.has(assessment.name.toLowerCase())) {
+            course.assignments.push({
+              name: assessment.name,
+              dueDate: assessment.date ?? null,
+              maxPoints: null,
+              status: 'Not Started',
+              grade: assessment.weight ? `Weight: ${assessment.weight}` : undefined,
+            });
+          } else {
+            // Enrich existing assignment with weight info
+            const existing = course.assignments.find(
+              a => a.name.toLowerCase() === assessment.name.toLowerCase()
+            );
+            if (existing && assessment.weight && !existing.grade) {
+              existing.grade = `Weight: ${assessment.weight}`;
+            }
+          }
+        }
+      }
+
+      // Add instructor info to announcements if not already there
+      if (outline.instructors.length > 0 && course.announcements.length === 0) {
+        const instructorList = outline.instructors
+          .map(i => `${i.name}${i.email ? ` (${i.email})` : ''}`)
+          .join(', ');
+        course.announcements.push({
+          title: 'Instructors',
+          date: new Date().toISOString(),
+          body: instructorList,
+        });
+      }
+    } catch {
+      // Outline not available for this course, skip
+    }
+  }
+}
+
 // Stored database ID per user (in-memory cache for auto-sync)
 const userDatabaseIds: Map<string, string> = new Map();
+// Lock to prevent concurrent syncs for the same user
+const syncInProgress: Set<string> = new Set();
+
+/**
+ * Non-academic course patterns to exclude from Notion sync.
+ * These are community/administrative courses, not real classes.
+ */
+const EXCLUDED_PATTERNS = [
+  /^uwaterloo.ses$/i,
+  /co-?op community/i,
+  /residence/i,
+  /^cfe[_\s]/i,
+  /orientation/i,
+  /wellness/i,
+  /student.?life/i,
+  /academic.?integrity/i,
+];
+
+function isAcademicCourse(enrollment: RawEnrollment): boolean {
+  const name = enrollment.OrgUnit.Name;
+  const code = enrollment.OrgUnit.Code || '';
+  // Must be a Course Offering with active access
+  if (enrollment.OrgUnit?.Type?.Code !== 'Course Offering') return false;
+  if (!enrollment.Access?.IsActive || !enrollment.Access?.CanAccess) return false;
+  // Exclude non-academic courses
+  if (EXCLUDED_PATTERNS.some(p => p.test(name) || p.test(code))) return false;
+  // Must have a recognizable course code pattern (letters + digits)
+  const hasCode = /[A-Z]{2,6}\s*\d{3}/i.test(code) || /[A-Z]{2,6}\s*\d{3}/i.test(name);
+  return hasCode;
+}
 
 /**
  * Background sync — called after tool calls to keep Notion updated.
- * Non-blocking, swallows errors.
+ * Non-blocking, swallows errors. Only one sync per user at a time.
  */
 export async function backgroundNotionSync(userId: string): Promise<void> {
+  if (syncInProgress.has(userId)) return; // already running
+  syncInProgress.add(userId);
+
   try {
     const notionToken = await getNotionToken(userId);
     if (!notionToken) return;
@@ -123,32 +223,24 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
     const databaseId = userDatabaseIds.get(userId);
     if (!databaseId) return;
 
-    // Fetch enrollments
+    // Fetch enrollments — only real academic courses
     const enrollmentsRaw = (await client.getMyEnrollments()) as { Items: RawEnrollment[] };
-    const now = new Date();
-    const sixMonthsAgo = new Date(now.getTime() - 6 * 30 * 24 * 60 * 60 * 1000);
-    const activeCourses = (enrollmentsRaw.Items || []).filter((e) => {
-      if (e.OrgUnit?.Type?.Code !== 'Course Offering') return false;
-      if (!e.Access?.IsActive || !e.Access?.CanAccess) return false;
-      const endDate = e.Access.EndDate ? new Date(e.Access.EndDate) : null;
-      if (endDate && endDate < sixMonthsAgo) return false;
-      return true;
-    });
+    const activeCourses = (enrollmentsRaw.Items || []).filter(isAcademicCourse);
 
-    const courses: CourseData[] = [];
-    for (const enrollment of activeCourses) {
-      const course = await fetchCourseData(
-        enrollment.OrgUnit.Id,
-        enrollment.OrgUnit.Name,
-        enrollment.OrgUnit.Code || '',
-      );
-      courses.push(course);
-    }
+    // Fetch course data in parallel (faster)
+    const courses = await Promise.all(
+      activeCourses.map(e => fetchCourseData(e.OrgUnit.Id, e.OrgUnit.Name, e.OrgUnit.Code || ''))
+    );
+
+    // Enrich with outline data
+    await enrichWithOutline(courses, userId);
 
     await syncCourses(notionToken, databaseId, courses);
     console.error(`[NOTION] Background sync complete: ${courses.length} courses`);
   } catch (e) {
     console.error(`[NOTION] Background sync error: ${e instanceof Error ? e.message : e}`);
+  } finally {
+    syncInProgress.delete(userId);
   }
 }
 
@@ -187,19 +279,11 @@ export const notionTools = {
       // Store database ID for auto-sync
       if (userId) userDatabaseIds.set(userId, args.databaseId);
 
-      // 2. Fetch active enrollments
+      // 2. Fetch active academic enrollments (skip admin/community courses)
       let activeCourses: RawEnrollment[] = [];
       try {
         const enrollmentsRaw = (await client.getMyEnrollments()) as { Items: RawEnrollment[] };
-        const now = new Date();
-        const sixMonthsAgo = new Date(now.getTime() - 6 * 30 * 24 * 60 * 60 * 1000);
-        activeCourses = (enrollmentsRaw.Items || []).filter((e) => {
-          if (e.OrgUnit?.Type?.Code !== 'Course Offering') return false;
-          if (!e.Access?.IsActive || !e.Access?.CanAccess) return false;
-          const endDate = e.Access.EndDate ? new Date(e.Access.EndDate) : null;
-          if (endDate && endDate < sixMonthsAgo) return false;
-          return true;
-        });
+        activeCourses = (enrollmentsRaw.Items || []).filter(isAcademicCourse);
       } catch (e) {
         return JSON.stringify({
           success: false,
@@ -207,15 +291,14 @@ export const notionTools = {
         }, null, 2);
       }
 
-      // 3. Fetch full course data for each
-      const courses: CourseData[] = [];
-      for (const enrollment of activeCourses) {
-        const course = await fetchCourseData(
-          enrollment.OrgUnit.Id,
-          enrollment.OrgUnit.Name,
-          enrollment.OrgUnit.Code || '',
-        );
-        courses.push(course);
+      // 3. Fetch full course data in parallel
+      const courses = await Promise.all(
+        activeCourses.map(e => fetchCourseData(e.OrgUnit.Id, e.OrgUnit.Name, e.OrgUnit.Code || ''))
+      );
+
+      // 3b. Enrich with outline data (assessments, weights, instructors)
+      if (userId) {
+        await enrichWithOutline(courses, userId);
       }
 
       // 4. Sync to Notion
