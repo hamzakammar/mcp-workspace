@@ -208,7 +208,7 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
   for (const course of courses) {
     try {
       // Extract course code from D2L code (e.g. "PSYCH207_081_cel_1265" → "PSYCH207")
-      const codeMatch = course.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6})(\d{3})/);
+      const codeMatch = course.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6})(\d{2,3})/);
       if (!codeMatch) continue;
       const courseCode = `${codeMatch[1]}${codeMatch[2]}`;
 
@@ -303,7 +303,7 @@ function isAcademicCourse(enrollment: RawEnrollment): boolean {
   // Exclude non-academic courses
   if (EXCLUDED_PATTERNS.some(p => p.test(name) || p.test(code))) return false;
   // Must have a recognizable course code pattern (letters + digits)
-  const hasCode = /[A-Z]{2,6}\s*\d{3}/i.test(code) || /[A-Z]{2,6}\s*\d{3}/i.test(name);
+  const hasCode = /[A-Z]{2,6}\s*\d{2,3}/i.test(code) || /[A-Z]{2,6}\s*\d{2,3}/i.test(name);
   return hasCode;
 }
 
@@ -397,7 +397,7 @@ async function cleanupStalePages(
       // Only check courseCode-only keys (not "code|title" compound keys)
       if (key.includes('|')) continue;
       // Extract short code from the Notion page's Course Code (e.g. "PSYCH207_081_cel_1265" → "PSYCH207")
-      const shortCode = key.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{3})/)?.[1] || key;
+      const shortCode = key.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{2,3})/)?.[1] || key;
       if (!activeCodes.has(shortCode) && !activeCodes.has(key)) {
         await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
           method: 'PATCH',
@@ -455,7 +455,7 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
 
     // Cleanup stale pages
     const activeCodes = new Set(courses.map(c => {
-      const m = c.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{3})/);
+      const m = c.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{2,3})/);
       return m ? m[1] : c.code;
     }));
     await cleanupStalePages(notionToken, databaseId, activeCodes);
@@ -538,7 +538,7 @@ export const notionTools = {
 
         // 6. Cleanup stale pages
         const activeCodes = new Set(courses.map(c => {
-          const m = c.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{3})/);
+          const m = c.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{2,3})/);
           return m ? m[1] : c.code;
         }));
         const archived = await cleanupStalePages(notionToken, args.databaseId, activeCodes);
