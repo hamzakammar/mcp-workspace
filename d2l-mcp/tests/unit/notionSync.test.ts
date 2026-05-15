@@ -3,8 +3,6 @@
  *
  * Tests the tool contract: error messages, D2L data mapping,
  * and sync result formatting. All external calls are mocked.
- *
- * Written FIRST (TDD) — implementation in src/tools/notion.ts.
  */
 
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
@@ -30,37 +28,36 @@ vi.mock('../../src/utils/userContext.js', () => ({
   getUserId: vi.fn().mockReturnValue('user-test-1'),
 }));
 
-// Mock notionClient so we can control sync behavior
 vi.mock('../../src/study/notionClient.js', () => ({
   validateNotionToken: vi.fn(),
+  syncCourses: vi.fn(),
   syncAssignments: vi.fn(),
 }));
 
-// Mock the credential/token lookup
 vi.mock('../../src/study/notionAuth.js', () => ({
   getNotionToken: vi.fn(),
 }));
 
-// Mock D2L client
 vi.mock('../../src/client.js', () => ({
   client: {
     getMyEnrollments: vi.fn(),
     getDropboxFolders: vi.fn(),
-    getGradeObjects: vi.fn(),
+    getMyGradeValues: vi.fn(),
+    getNews: vi.fn(),
   },
 }));
 
 import { notionTools } from '../../src/tools/notion.js';
-import { syncAssignments, validateNotionToken } from '../../src/study/notionClient.js';
+import { syncCourses } from '../../src/study/notionClient.js';
 import { getNotionToken } from '../../src/study/notionAuth.js';
 import { client } from '../../src/client.js';
 
-const syncMock = vi.mocked(syncAssignments);
+const syncMock = vi.mocked(syncCourses);
 const tokenMock = vi.mocked(getNotionToken);
-const validateMock = vi.mocked(validateNotionToken);
 const enrollmentsMock = vi.mocked(client.getMyEnrollments);
 const dropboxMock = vi.mocked(client.getDropboxFolders);
-const gradesMock = vi.mocked(client.getGradeObjects);
+const gradesMock = vi.mocked(client.getMyGradeValues);
+const newsMock = vi.mocked(client.getNews);
 
 const TOOL = notionTools.sync_to_notion;
 
@@ -84,118 +81,90 @@ describe('sync_to_notion — not connected', () => {
     expect(result.hint).toBeDefined();
   });
 
-  it('returns error when D2L has no active enrollments', async () => {
+  it('returns success with 0 courses when no active enrollments', async () => {
     tokenMock.mockResolvedValue('secret_test');
-    validateMock.mockResolvedValue(true);
     enrollmentsMock.mockResolvedValue({ Items: [] } as any);
-    gradesMock.mockResolvedValue([]);
     syncMock.mockResolvedValue({ created: 0, updated: 0, failed: 0 });
     const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
-    // No courses → sync returns 0 items, but should succeed
     expect(result.success).toBe(true);
     expect(result.coursesChecked).toBe(0);
   });
 });
 
-// ─── Field mapping ─────────────────────────────────────────────────────────────
+// ─── Course data fetching ─────────────────────────────────────────────────────
 
-describe('sync_to_notion — field mapping', () => {
+describe('sync_to_notion — course data', () => {
   beforeEach(() => {
     tokenMock.mockResolvedValue('secret_test');
-    validateMock.mockResolvedValue(true);
-
     enrollmentsMock.mockResolvedValue({
       Items: [{
         OrgUnit: { Id: 123, Name: 'Intro to CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
         Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
       }],
     } as any);
-
+    dropboxMock.mockResolvedValue([]);
     gradesMock.mockResolvedValue([]);
+    newsMock.mockResolvedValue([]);
   });
 
-  it('maps assignment title correctly', async () => {
+  it('passes course data to syncCourses', async () => {
     dropboxMock.mockResolvedValue([{
       Id: 1, Name: 'Assignment 1',
       DueDate: '2026-04-15T23:59:00Z',
       Assessment: { ScoreDenominator: 20 },
     }] as any);
 
-    let capturedAssignments: any[] = [];
-    syncMock.mockImplementation(async (_t, _db, assignments) => {
-      capturedAssignments = assignments;
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
       return { created: 1, updated: 0, failed: 0 };
     });
 
     await TOOL.handler({ databaseId: 'db-1' });
-    expect(capturedAssignments[0].title).toBe('Assignment 1');
+    expect(capturedCourses).toHaveLength(1);
+    expect(capturedCourses[0].name).toBe('Intro to CS');
+    expect(capturedCourses[0].code).toBe('CS135');
+    expect(capturedCourses[0].assignments).toHaveLength(1);
+    expect(capturedCourses[0].assignments[0].name).toBe('Assignment 1');
   });
 
-  it('maps courseCode correctly', async () => {
-    dropboxMock.mockResolvedValue([{
-      Id: 1, Name: 'Assignment 1',
-      DueDate: '2026-04-15T23:59:00Z',
-      Assessment: null,
+  it('fetches grades for each course', async () => {
+    gradesMock.mockResolvedValue([{
+      GradeObjectName: 'Midterm',
+      PointsNumerator: 85,
+      PointsDenominator: 100,
+      WeightedNumerator: null,
+      WeightedDenominator: null,
     }] as any);
 
-    let capturedAssignments: any[] = [];
-    syncMock.mockImplementation(async (_t, _db, assignments) => {
-      capturedAssignments = assignments;
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
       return { created: 1, updated: 0, failed: 0 };
     });
 
     await TOOL.handler({ databaseId: 'db-1' });
-    expect(capturedAssignments[0].courseCode).toBe('CS135');
-    expect(capturedAssignments[0].courseName).toBe('Intro to CS');
+    expect(capturedCourses[0].grades).toHaveLength(1);
+    expect(capturedCourses[0].grades[0].name).toBe('Midterm');
+    expect(capturedCourses[0].grades[0].pointsNumerator).toBe(85);
   });
 
-  it('maps dueDate as ISO string', async () => {
-    dropboxMock.mockResolvedValue([{
-      Id: 1, Name: 'Lab 2',
-      DueDate: '2026-05-01T23:59:00Z',
-      Assessment: null,
+  it('fetches announcements for each course', async () => {
+    newsMock.mockResolvedValue([{
+      Title: 'Welcome!',
+      StartDate: '2026-05-01T00:00:00Z',
+      Body: { Html: '<p>Hello class</p>' },
     }] as any);
 
-    let capturedAssignments: any[] = [];
-    syncMock.mockImplementation(async (_t, _db, assignments) => {
-      capturedAssignments = assignments;
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
       return { created: 1, updated: 0, failed: 0 };
     });
 
     await TOOL.handler({ databaseId: 'db-1' });
-    expect(capturedAssignments[0].dueDate).toBe('2026-05-01T23:59:00Z');
-  });
-
-  it('maps type as "assignment" for dropbox folders', async () => {
-    dropboxMock.mockResolvedValue([{
-      Id: 1, Name: 'A1', DueDate: '2026-05-01T00:00:00Z', Assessment: null,
-    }] as any);
-
-    let capturedAssignments: any[] = [];
-    syncMock.mockImplementation(async (_t, _db, assignments) => {
-      capturedAssignments = assignments;
-      return { created: 1, updated: 0, failed: 0 };
-    });
-
-    await TOOL.handler({ databaseId: 'db-1' });
-    expect(capturedAssignments[0].type).toBe('assignment');
-  });
-
-  it('skips assignments with no due date', async () => {
-    dropboxMock.mockResolvedValue([
-      { Id: 1, Name: 'No Due Date', DueDate: null, Assessment: null },
-      { Id: 2, Name: 'Has Due Date', DueDate: '2026-05-01T00:00:00Z', Assessment: null },
-    ] as any);
-
-    let capturedAssignments: any[] = [];
-    syncMock.mockImplementation(async (_t, _db, assignments) => {
-      capturedAssignments = assignments;
-      return { created: assignments.length, updated: 0, failed: 0 };
-    });
-
-    await TOOL.handler({ databaseId: 'db-1' });
-    expect(capturedAssignments).toHaveLength(1);
-    expect(capturedAssignments[0].name).not.toBe('No Due Date');
+    expect(capturedCourses[0].announcements).toHaveLength(1);
+    expect(capturedCourses[0].announcements[0].title).toBe('Welcome!');
   });
 });
 
@@ -204,17 +173,15 @@ describe('sync_to_notion — field mapping', () => {
 describe('sync_to_notion — summary format', () => {
   beforeEach(() => {
     tokenMock.mockResolvedValue('secret_test');
-    validateMock.mockResolvedValue(true);
     enrollmentsMock.mockResolvedValue({
       Items: [{
         OrgUnit: { Id: 1, Name: 'Intro to CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
         Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
       }],
     } as any);
+    dropboxMock.mockResolvedValue([]);
     gradesMock.mockResolvedValue([]);
-    dropboxMock.mockResolvedValue([
-      { Id: 1, Name: 'A1', DueDate: '2026-05-01T00:00:00Z', Assessment: null },
-    ] as any);
+    newsMock.mockResolvedValue([]);
   });
 
   it('returns success: true on successful sync', async () => {
@@ -244,29 +211,27 @@ describe('sync_to_notion — summary format', () => {
     expect(result.summary.length).toBeGreaterThan(0);
   });
 
-  it('summary mentions created count when items were synced', async () => {
-    syncMock.mockResolvedValue({ created: 5, updated: 2, failed: 0 });
+  it('indicates auto-sync is enabled after first sync', async () => {
+    syncMock.mockResolvedValue({ created: 1, updated: 0, failed: 0 });
     const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
-    expect(result.summary).toMatch(/5/);
+    expect(result.autoSyncEnabled).toBe(true);
   });
 });
 
 // ─── Error resilience ────────────────────────────────────────────────────────
 
 describe('sync_to_notion — error resilience', () => {
-  it('returns error if syncAssignments throws (e.g. invalid database ID)', async () => {
+  it('returns error if syncCourses throws (e.g. invalid database ID)', async () => {
     tokenMock.mockResolvedValue('secret_test');
-    validateMock.mockResolvedValue(true);
     enrollmentsMock.mockResolvedValue({
       Items: [{
         OrgUnit: { Id: 1, Name: 'CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
         Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
       }],
     } as any);
+    dropboxMock.mockResolvedValue([]);
     gradesMock.mockResolvedValue([]);
-    dropboxMock.mockResolvedValue([
-      { Id: 1, Name: 'A1', DueDate: '2026-05-01T00:00:00Z', Assessment: null },
-    ] as any);
+    newsMock.mockResolvedValue([]);
     syncMock.mockRejectedValue(new Error('Notion query failed (404): object_not_found'));
 
     const result = JSON.parse(await TOOL.handler({ databaseId: 'bad-db-id' }));

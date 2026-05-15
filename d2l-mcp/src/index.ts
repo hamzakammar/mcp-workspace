@@ -26,7 +26,7 @@ import { discussionTools } from "./tools/discussions.js";
 import { statusTools } from "./tools/status.js";
 import { crowdmarkTools } from "./tools/crowdmark.js";
 import { connectTools } from "./tools/connect.js";
-import { notionTools } from "./tools/notion.js";
+import { notionTools, backgroundNotionSync } from "./tools/notion.js";
 import { D2LClient } from "./client.js";
 import { startSessionRefreshScheduler } from "./jobs/sessionRefresher.js";
 import { startStorageStateTTLJob } from "./jobs/storageStateTTL.js";
@@ -163,6 +163,12 @@ function createServer(): McpServer {
             // Urgency check failed — return original result unchanged
           }
         }
+        // Fire-and-forget background Notion sync after successful tool calls
+        const syncUserId = getUserId();
+        if (syncUserId && syncUserId !== "legacy" && toolName !== "sync_to_notion") {
+          backgroundNotionSync(syncUserId).catch(() => {});
+        }
+
         return { content: [{ type: "text" as const, text: result }] };
       } catch (error: any) {
         const elapsedTime = Date.now() - startTime;

@@ -1,21 +1,18 @@
 /**
  * Notion API client — direct fetch, no SDK dependency.
  *
- * Handles assignment sync to a user's Notion database:
- *   - Token validation
- *   - Querying existing pages (for dedup)
- *   - Creating / updating assignment pages
- *   - Rate-limited bulk sync (Notion allows ~3 req/s avg)
+ * Syncs D2L course data to a user's Notion database:
+ *   - One page per course
+ *   - Properties: course name, code, status, next due date
+ *   - Page body: assignments, grades, upcoming events
  *
  * Database schema expected:
  *   Name          (title)
- *   Course        (select)
  *   Course Code   (rich_text)
- *   Due Date      (date)
- *   Status        (select: Not Started | In Progress | Submitted | Graded)
- *   Grade %       (number)
- *   Weight %      (number)
- *   Type          (select: Assignment | Quiz)
+ *   Status        (select: Active | Ended)
+ *   Next Due      (date)
+ *   Grade         (rich_text)
+ *   Assignments   (number)
  */
 
 const NOTION_BASE = 'https://api.notion.com/v1';
@@ -23,15 +20,36 @@ const NOTION_VERSION = '2022-06-28';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export interface NotionAssignment {
-  title: string;
-  courseName: string;
-  courseCode: string;
+export interface CourseData {
+  orgUnitId: number;
+  name: string;
+  code: string;
+  isActive: boolean;
+  assignments: AssignmentInfo[];
+  grades: GradeInfo[];
+  announcements: AnnouncementInfo[];
+}
+
+export interface AssignmentInfo {
+  name: string;
   dueDate: string | null;
-  type: 'assignment' | 'quiz';
-  status?: 'Not Started' | 'In Progress' | 'Submitted' | 'Graded';
-  gradePercent?: number | null;
-  weightPercent?: number | null;
+  maxPoints: number | null;
+  status: 'Not Started' | 'Submitted' | 'Graded';
+  grade?: string | null;
+}
+
+export interface GradeInfo {
+  name: string;
+  pointsNumerator: number | null;
+  pointsDenominator: number | null;
+  weightedNumerator: number | null;
+  weightedDenominator: number | null;
+}
+
+export interface AnnouncementInfo {
+  title: string;
+  date: string;
+  body: string;
 }
 
 export interface SyncResult {
@@ -41,8 +59,19 @@ export interface SyncResult {
 }
 
 export interface SyncOptions {
-  /** Milliseconds to wait between write calls (default: 350 for Notion rate limits) */
   delayMs?: number;
+}
+
+// Keep old types for backward compat with tests
+export interface NotionAssignment {
+  title: string;
+  courseName: string;
+  courseCode: string;
+  dueDate: string | null;
+  type: 'assignment' | 'quiz';
+  status?: 'Not Started' | 'In Progress' | 'Submitted' | 'Graded';
+  gradePercent?: number | null;
+  weightPercent?: number | null;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -55,44 +84,170 @@ function notionHeaders(token: string): Record<string, string> {
   };
 }
 
-function buildProperties(assignment: NotionAssignment): Record<string, unknown> {
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildCourseProperties(course: CourseData): Record<string, unknown> {
+  // Find next upcoming due date
+  const now = new Date();
+  const upcomingDues = course.assignments
+    .filter(a => a.dueDate && new Date(a.dueDate) > now)
+    .sort((a, b) => new Date(a.dueDate!).getTime() - new Date(b.dueDate!).getTime());
+  const nextDue = upcomingDues.length > 0 ? upcomingDues[0].dueDate : null;
+
+  // Compute overall grade summary
+  const gradedItems = course.grades.filter(g => g.pointsNumerator !== null && g.pointsDenominator);
+  let gradeSummary = '';
+  if (gradedItems.length > 0) {
+    const totalEarned = gradedItems.reduce((s, g) => s + (g.weightedNumerator ?? g.pointsNumerator ?? 0), 0);
+    const totalPossible = gradedItems.reduce((s, g) => s + (g.weightedDenominator ?? g.pointsDenominator ?? 0), 0);
+    if (totalPossible > 0) {
+      gradeSummary = `${Math.round((totalEarned / totalPossible) * 100)}%`;
+    }
+  }
+
   return {
     'Name': {
-      title: [{ text: { content: assignment.title } }],
-    },
-    'Course': {
-      select: { name: assignment.courseName },
+      title: [{ text: { content: course.name } }],
     },
     'Course Code': {
-      rich_text: [{ text: { content: assignment.courseCode } }],
-    },
-    'Due Date': {
-      date: assignment.dueDate ? { start: assignment.dueDate } : null,
+      rich_text: [{ text: { content: course.code } }],
     },
     'Status': {
-      select: { name: assignment.status ?? 'Not Started' },
+      select: { name: course.isActive ? 'Active' : 'Ended' },
     },
-    'Grade %': {
-      number: assignment.gradePercent ?? null,
+    'Next Due': {
+      date: nextDue ? { start: nextDue } : null,
     },
-    'Weight %': {
-      number: assignment.weightPercent ?? null,
+    'Grade': {
+      rich_text: [{ text: { content: gradeSummary } }],
     },
-    'Type': {
-      select: { name: assignment.type === 'quiz' ? 'Quiz' : 'Assignment' },
+    'Assignments': {
+      number: course.assignments.length,
     },
   };
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function buildCourseBody(course: CourseData): unknown[] {
+  const blocks: unknown[] = [];
+
+  // ── Assignments section ──
+  if (course.assignments.length > 0) {
+    blocks.push({
+      object: 'block',
+      type: 'heading_2',
+      heading_2: { rich_text: [{ text: { content: '📋 Assignments' } }] },
+    });
+
+    for (const a of course.assignments) {
+      const duePart = a.dueDate ? ` — Due: ${new Date(a.dueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}` : '';
+      const gradePart = a.grade ? ` [${a.grade}]` : '';
+      const statusEmoji = a.status === 'Graded' ? '✅' : a.status === 'Submitted' ? '📤' : '⬜';
+
+      blocks.push({
+        object: 'block',
+        type: 'bulleted_list_item',
+        bulleted_list_item: {
+          rich_text: [{ text: { content: `${statusEmoji} ${a.name}${duePart}${gradePart}` } }],
+        },
+      });
+    }
+  }
+
+  // ── Grades section ──
+  if (course.grades.length > 0) {
+    blocks.push({
+      object: 'block',
+      type: 'heading_2',
+      heading_2: { rich_text: [{ text: { content: '📊 Grades' } }] },
+    });
+
+    for (const g of course.grades) {
+      const score = g.pointsNumerator !== null && g.pointsDenominator
+        ? `${g.pointsNumerator}/${g.pointsDenominator}`
+        : 'Not graded';
+      blocks.push({
+        object: 'block',
+        type: 'bulleted_list_item',
+        bulleted_list_item: {
+          rich_text: [{ text: { content: `${g.name}: ${score}` } }],
+        },
+      });
+    }
+  }
+
+  // ── Announcements section (last 5) ──
+  if (course.announcements.length > 0) {
+    blocks.push({
+      object: 'block',
+      type: 'heading_2',
+      heading_2: { rich_text: [{ text: { content: '📢 Recent Announcements' } }] },
+    });
+
+    for (const ann of course.announcements.slice(0, 5)) {
+      const date = new Date(ann.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+      // Notion text blocks limited to 2000 chars
+      const snippet = ann.body.replace(/<[^>]+>/g, '').slice(0, 200);
+      blocks.push({
+        object: 'block',
+        type: 'bulleted_list_item',
+        bulleted_list_item: {
+          rich_text: [{ text: { content: `[${date}] ${ann.title}` } }],
+        },
+      });
+      if (snippet) {
+        blocks.push({
+          object: 'block',
+          type: 'paragraph',
+          paragraph: {
+            rich_text: [{ text: { content: `    ${snippet}${ann.body.length > 200 ? '...' : ''}` } }],
+          },
+        });
+      }
+    }
+  }
+
+  // If no content at all, add a placeholder
+  if (blocks.length === 0) {
+    blocks.push({
+      object: 'block',
+      type: 'paragraph',
+      paragraph: {
+        rich_text: [{ text: { content: 'No assignments, grades, or announcements found for this course yet.' } }],
+      },
+    });
+  }
+
+  return blocks;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Probe /v1/users/me to check if the token is valid and has API access.
+ * Ensure the database has the expected properties. Creates missing ones via PATCH.
  */
+export async function ensureDatabaseSchema(token: string, databaseId: string): Promise<void> {
+  const requiredProperties: Record<string, unknown> = {
+    'Course Code': { rich_text: {} },
+    'Status': { select: { options: [{ name: 'Active', color: 'green' }, { name: 'Ended', color: 'gray' }] } },
+    'Next Due': { date: {} },
+    'Grade': { rich_text: {} },
+    'Assignments': { number: {} },
+  };
+
+  const resp = await fetch(`${NOTION_BASE}/databases/${databaseId}`, {
+    method: 'PATCH',
+    headers: notionHeaders(token),
+    body: JSON.stringify({ properties: requiredProperties }),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({})) as { message?: string };
+    throw new Error(`Failed to set up database schema (${resp.status}): ${err.message ?? 'unknown'}`);
+  }
+}
+
 export async function validateNotionToken(token: string): Promise<boolean> {
   try {
     const resp = await fetch(`${NOTION_BASE}/users/me`, {
@@ -106,9 +261,8 @@ export async function validateNotionToken(token: string): Promise<boolean> {
 
 /**
  * Query all pages in a Notion database and return a dedup map.
- * Key: `courseCode|title`  →  Value: Notion page ID
- *
- * Handles pagination automatically.
+ * Key: `courseCode|title` (for assignment pages) or `courseCode` (for course pages)
+ * Value: Notion page ID
  */
 export async function queryAllPages(token: string, databaseId: string): Promise<Map<string, string>> {
   const map = new Map<string, string>();
@@ -147,8 +301,13 @@ export async function queryAllPages(token: string, databaseId: string): Promise<
       const courseCode = (page.properties?.['Course Code']?.rich_text ?? [])
         .map((t) => t.plain_text).join('').trim();
 
-      if (!title) continue; // skip pages with empty title
+      if (!title) continue;
+      // Store both formats: courseCode|title (for legacy assignment dedup)
+      // and courseCode alone (for course-page dedup)
       map.set(`${courseCode}|${title}`, page.id);
+      if (courseCode) {
+        map.set(courseCode, page.id);
+      }
     }
 
     cursor = data.has_more ? data.next_cursor : undefined;
@@ -158,8 +317,126 @@ export async function queryAllPages(token: string, databaseId: string): Promise<
 }
 
 /**
- * Create a new assignment page in the Notion database.
+ * Create a course page in the Notion database with full content.
  */
+export async function createCoursePage(
+  token: string,
+  databaseId: string,
+  course: CourseData,
+): Promise<void> {
+  const body = {
+    parent: { database_id: databaseId },
+    properties: buildCourseProperties(course),
+    children: buildCourseBody(course).slice(0, 100), // Notion max 100 blocks per create
+  };
+
+  const resp = await fetch(`${NOTION_BASE}/pages`, {
+    method: 'POST',
+    headers: notionHeaders(token),
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({})) as { message?: string };
+    throw new Error(`Notion create page failed (${resp.status}): ${err.message ?? 'unknown error'}`);
+  }
+}
+
+/**
+ * Update an existing course page — updates properties and replaces content.
+ */
+export async function updateCoursePage(
+  token: string,
+  pageId: string,
+  course: CourseData,
+): Promise<void> {
+  // Update properties
+  const resp = await fetch(`${NOTION_BASE}/pages/${pageId}`, {
+    method: 'PATCH',
+    headers: notionHeaders(token),
+    body: JSON.stringify({
+      properties: buildCourseProperties(course),
+    }),
+  });
+
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({})) as { message?: string };
+    throw new Error(`Notion update page failed (${resp.status}): ${err.message ?? 'unknown error'}`);
+  }
+
+  // Delete existing blocks and replace with new content
+  // First, get existing blocks
+  const blocksResp = await fetch(`${NOTION_BASE}/blocks/${pageId}/children?page_size=100`, {
+    headers: notionHeaders(token),
+  });
+  if (blocksResp.ok) {
+    const blocksData = await blocksResp.json() as { results: Array<{ id: string }> };
+    // Delete old blocks
+    for (const block of blocksData.results) {
+      await fetch(`${NOTION_BASE}/blocks/${block.id}`, {
+        method: 'DELETE',
+        headers: notionHeaders(token),
+      });
+    }
+  }
+
+  // Append new content
+  const newBlocks = buildCourseBody(course).slice(0, 100);
+  if (newBlocks.length > 0) {
+    await fetch(`${NOTION_BASE}/blocks/${pageId}/children`, {
+      method: 'PATCH',
+      headers: notionHeaders(token),
+      body: JSON.stringify({ children: newBlocks }),
+    });
+  }
+}
+
+/**
+ * Sync course data to Notion — one page per course.
+ */
+export async function syncCourses(
+  token: string,
+  databaseId: string,
+  courses: CourseData[],
+  options: SyncOptions = {},
+): Promise<SyncResult> {
+  const delayMs = options.delayMs ?? 350;
+  const result: SyncResult = { created: 0, updated: 0, failed: 0 };
+
+  if (courses.length === 0) return result;
+
+  // Ensure database has required properties before syncing
+  await ensureDatabaseSchema(token, databaseId);
+
+  const existingPages = await queryAllPages(token, databaseId);
+
+  for (let i = 0; i < courses.length; i++) {
+    const course = courses[i];
+    const existingPageId = existingPages.get(course.code);
+
+    try {
+      if (existingPageId) {
+        await updateCoursePage(token, existingPageId, course);
+        result.updated++;
+      } else {
+        await createCoursePage(token, databaseId, course);
+        result.created++;
+      }
+    } catch (e) {
+      console.error(`[NOTION] Failed to sync course ${course.code}: ${e instanceof Error ? e.message : e}`);
+      result.failed++;
+    }
+
+    if (delayMs > 0 && i < courses.length - 1) {
+      await delay(delayMs);
+    }
+  }
+
+  return result;
+}
+
+// ─── Legacy compat (for existing tests) ──────────────────────────────────────
+
 export async function createAssignmentPage(
   token: string,
   databaseId: string,
@@ -170,19 +447,22 @@ export async function createAssignmentPage(
     headers: notionHeaders(token),
     body: JSON.stringify({
       parent: { database_id: databaseId },
-      properties: buildProperties(assignment),
+      properties: {
+        'Name': { title: [{ text: { content: assignment.title } }] },
+        'Course': { select: { name: assignment.courseName } },
+        'Course Code': { rich_text: [{ text: { content: assignment.courseCode } }] },
+        'Due Date': { date: assignment.dueDate ? { start: assignment.dueDate } : null },
+        'Status': { select: { name: assignment.status ?? 'Not Started' } },
+        'Type': { select: { name: assignment.type === 'quiz' ? 'Quiz' : 'Assignment' } },
+      },
     }),
   });
-
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({})) as { message?: string };
     throw new Error(`Notion create page failed (${resp.status}): ${err.message ?? 'unknown error'}`);
   }
 }
 
-/**
- * Update an existing Notion page's properties.
- */
 export async function updateAssignmentPage(
   token: string,
   pageId: string,
@@ -192,24 +472,22 @@ export async function updateAssignmentPage(
     method: 'PATCH',
     headers: notionHeaders(token),
     body: JSON.stringify({
-      properties: buildProperties(assignment),
+      properties: {
+        'Name': { title: [{ text: { content: assignment.title } }] },
+        'Course': { select: { name: assignment.courseName } },
+        'Course Code': { rich_text: [{ text: { content: assignment.courseCode } }] },
+        'Due Date': { date: assignment.dueDate ? { start: assignment.dueDate } : null },
+        'Status': { select: { name: assignment.status ?? 'Not Started' } },
+        'Type': { select: { name: assignment.type === 'quiz' ? 'Quiz' : 'Assignment' } },
+      },
     }),
   });
-
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({})) as { message?: string };
     throw new Error(`Notion update page failed (${resp.status}): ${err.message ?? 'unknown error'}`);
   }
 }
 
-/**
- * Sync a list of assignments to a Notion database.
- *
- * - Queries existing pages first (dedup by courseCode|title).
- * - Creates pages for new assignments; patches existing ones.
- * - Continues past individual failures (increments failed count).
- * - Waits delayMs between each write to stay under Notion rate limits.
- */
 export async function syncAssignments(
   token: string,
   databaseId: string,
@@ -218,16 +496,13 @@ export async function syncAssignments(
 ): Promise<SyncResult> {
   const delayMs = options.delayMs ?? 350;
   const result: SyncResult = { created: 0, updated: 0, failed: 0 };
-
   if (assignments.length === 0) return result;
 
   const existingPages = await queryAllPages(token, databaseId);
-
   for (let i = 0; i < assignments.length; i++) {
     const assignment = assignments[i];
     const dedupKey = `${assignment.courseCode}|${assignment.title}`;
     const existingPageId = existingPages.get(dedupKey);
-
     try {
       if (existingPageId) {
         await updateAssignmentPage(token, existingPageId, assignment);
@@ -239,12 +514,9 @@ export async function syncAssignments(
     } catch {
       result.failed++;
     }
-
-    // Rate limiting: wait between writes (but not after the last one)
     if (delayMs > 0 && i < assignments.length - 1) {
       await delay(delayMs);
     }
   }
-
   return result;
 }

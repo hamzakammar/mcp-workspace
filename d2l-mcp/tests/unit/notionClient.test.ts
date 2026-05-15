@@ -134,7 +134,9 @@ describe('queryAllPages', () => {
     const map = await queryAllPages(TOKEN, DB_ID);
     expect(map.get('CS135|Assignment 1')).toBe('page-1');
     expect(map.get('MATH135|Quiz 1')).toBe('page-2');
-    expect(map.size).toBe(2);
+    // Also stores courseCode-only keys for course-page dedup
+    expect(map.get('CS135')).toBe('page-1');
+    expect(map.get('MATH135')).toBe('page-2');
   });
 
   it('follows pagination — fetches all pages when has_more is true', async () => {
@@ -160,9 +162,10 @@ describe('queryAllPages', () => {
       },
     ]);
     const map = await queryAllPages(TOKEN, DB_ID);
-    expect(map.size).toBe(2);
+    // Both courseCode|title and courseCode keys (CS100 points to last page seen)
     expect(map.get('CS100|A1')).toBe('p1');
     expect(map.get('CS100|A2')).toBe('p2');
+    expect(map.get('CS100')).toBeDefined();
   });
 
   it('handles pages with missing Name (skips gracefully)', async () => {
@@ -188,7 +191,8 @@ describe('queryAllPages', () => {
     const map = await queryAllPages(TOKEN, DB_ID);
     // page-broken has no title text, should be skipped
     expect(map.get('CS135|Assignment 2')).toBe('page-ok');
-    expect(map.size).toBe(1);
+    // Also has courseCode key
+    expect(map.get('CS135')).toBe('page-ok');
   });
 
   it('throws on non-200 response (e.g. 404 — wrong database ID)', async () => {
@@ -269,20 +273,12 @@ describe('createAssignmentPage', () => {
     expect(body.properties['Status'].select.name).toBe('Not Started');
   });
 
-  it('sends Weight % as number property', async () => {
+  it('sends Course Code as rich_text in legacy create', async () => {
     const spy = vi.fn().mockResolvedValue({ status: 200, ok: true, json: async () => ({ id: 'np' }) });
     vi.stubGlobal('fetch', spy);
     await createAssignmentPage(TOKEN, DB_ID, assignment);
     const body = JSON.parse((spy.mock.calls[0] as [string, RequestInit])[1].body as string);
-    expect(body.properties['Weight %'].number).toBe(10);
-  });
-
-  it('sends null Grade % as null number', async () => {
-    const spy = vi.fn().mockResolvedValue({ status: 200, ok: true, json: async () => ({ id: 'np' }) });
-    vi.stubGlobal('fetch', spy);
-    await createAssignmentPage(TOKEN, DB_ID, assignment);
-    const body = JSON.parse((spy.mock.calls[0] as [string, RequestInit])[1].body as string);
-    expect(body.properties['Grade %'].number).toBeNull();
+    expect(body.properties['Course Code'].rich_text[0].text.content).toBe('CS135');
   });
 
   it('sends Type as select property', async () => {
@@ -336,14 +332,6 @@ describe('updateAssignmentPage', () => {
     await updateAssignmentPage(TOKEN, 'page-1', assignment);
     const body = JSON.parse((spy.mock.calls[0] as [string, RequestInit])[1].body as string);
     expect(body.properties['Status'].select.name).toBe('Submitted');
-  });
-
-  it('sends updated Grade %', async () => {
-    const spy = vi.fn().mockResolvedValue({ status: 200, ok: true, json: async () => ({}) });
-    vi.stubGlobal('fetch', spy);
-    await updateAssignmentPage(TOKEN, 'page-1', assignment);
-    const body = JSON.parse((spy.mock.calls[0] as [string, RequestInit])[1].body as string);
-    expect(body.properties['Grade %'].number).toBe(85.5);
   });
 
   it('throws on API error', async () => {
