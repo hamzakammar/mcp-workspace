@@ -71,26 +71,23 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
     }
   } catch { /* course may not expose dropbox */ }
 
-  // Fetch quizzes
+  // Fetch quizzes (D2L raw format: { Objects: [...] } or [...], with PascalCase keys)
   try {
-    const quizzes = (await client.getQuizzes(orgUnitId)) as Array<{
-      Name: string;
-      DueDate: string | null;
-      IsActive: boolean;
-    }>;
-    if (Array.isArray(quizzes)) {
-      const existingNames = new Set(courseData.assignments.map(a => a.name.toLowerCase()));
-      for (const quiz of quizzes) {
-        if (!quiz.IsActive) continue;
-        // Don't duplicate if already in dropbox
-        if (existingNames.has(quiz.Name.toLowerCase())) continue;
-        courseData.assignments.push({
-          name: quiz.Name,
-          dueDate: quiz.DueDate,
-          maxPoints: null,
-          status: 'Not Started',
-        });
-      }
+    const quizzesRaw = (await client.getQuizzes(orgUnitId)) as
+      | { Objects: Array<{ Name: string; DueDate: string | null; IsActive: boolean }> }
+      | Array<{ Name: string; DueDate: string | null; IsActive: boolean }>;
+    const quizzes = Array.isArray(quizzesRaw) ? quizzesRaw : (quizzesRaw.Objects || []);
+    const existingNames = new Set(courseData.assignments.map(a => a.name.toLowerCase()));
+    for (const quiz of quizzes) {
+      if (quiz.IsActive === false) continue;
+      if (!quiz.Name) continue;
+      if (existingNames.has(quiz.Name.toLowerCase())) continue;
+      courseData.assignments.push({
+        name: quiz.Name,
+        dueDate: quiz.DueDate ?? null,
+        maxPoints: null,
+        status: 'Not Started',
+      });
     }
   } catch { /* quizzes may not be accessible */ }
 
