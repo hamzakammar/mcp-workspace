@@ -215,13 +215,38 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
       const outline = await fetchCourseOutline(cookieHeader, courseCode, term);
 
       if (outline.assessments.length > 0) {
-        const existingNames = new Set(course.assignments.map(a => a.name.toLowerCase()));
+        // Fuzzy match: find existing assignment by prefix match or key-phrase overlap
+        function findExisting(assessmentName: string): AssignmentInfo | undefined {
+          const lower = assessmentName.toLowerCase();
+          // Strip common prefixes for comparison: "Bonus Quiz:", "Bonus Assignment:", etc.
+          const normalize = (s: string) => s.toLowerCase()
+            .replace(/^(bonus\s+)?(quiz|assignment|activity):\s*/i, '')
+            .replace(/\s*\([^)]*\)\s*$/, '') // remove trailing parenthetical
+            .trim();
+          const normalizedSearch = normalize(assessmentName);
+
+          return course.assignments.find(a => {
+            const aLower = a.name.toLowerCase();
+            const aNorm = normalize(a.name);
+            return aLower === lower
+              || aLower.startsWith(lower)
+              || lower.startsWith(aLower)
+              || aNorm === normalizedSearch
+              || aNorm.startsWith(normalizedSearch)
+              || normalizedSearch.startsWith(aNorm);
+          });
+        }
 
         for (const assessment of outline.assessments) {
           const parsedDate = parseOutlineDate(assessment.date);
           const weightText = assessment.weight ? `Weight: ${assessment.weight}` : undefined;
 
-          if (!existingNames.has(assessment.name.toLowerCase())) {
+          const existing = findExisting(assessment.name);
+          if (existing) {
+            // Enrich existing with weight and/or date from outline
+            if (weightText && !existing.grade) existing.grade = weightText;
+            if (parsedDate && !existing.dueDate) existing.dueDate = parsedDate;
+          } else {
             // New item from outline — add it
             course.assignments.push({
               name: cleanOutlineText(assessment.name),
@@ -230,15 +255,6 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
               status: 'Not Started',
               grade: weightText,
             });
-          } else {
-            // Existing item — enrich with weight and/or date from outline
-            const existing = course.assignments.find(
-              a => a.name.toLowerCase() === assessment.name.toLowerCase()
-            );
-            if (existing) {
-              if (weightText && !existing.grade) existing.grade = weightText;
-              if (parsedDate && !existing.dueDate) existing.dueDate = parsedDate;
-            }
           }
         }
       }

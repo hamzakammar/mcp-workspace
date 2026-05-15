@@ -197,14 +197,31 @@ function buildCourseBody(course: CourseData): unknown[] {
   }
 
   // ── Schedule section ──
-  if (course.schedule && course.schedule.length > 0) {
+  // Filter out schedule items that are just duplicates of assignments (some outlines
+  // have one table parsed as both assessments and schedule)
+  const assignmentNames = new Set(course.assignments.map(a => a.name.toLowerCase()));
+  const realSchedule = (course.schedule || []).filter(s => {
+    const topic = s.topic.toLowerCase();
+    const week = s.week.toLowerCase();
+    // Skip if week or topic matches an assignment name
+    if (assignmentNames.has(topic) || assignmentNames.has(week)) return false;
+    // Skip if topic/week looks like an assessment item
+    const combined = `${week} ${topic}`;
+    if (/^(assignment|quiz|bonus|midterm|final|exam|end of course)/i.test(week)) return false;
+    if (/^(assignment|quiz|bonus|midterm|final|exam|end of course)/i.test(topic)) return false;
+    // Skip if topic is just a date (not a real topic)
+    if (/^(monday|tuesday|wednesday|thursday|friday|saturday|sunday|opens)/i.test(topic)) return false;
+    return true;
+  });
+
+  if (realSchedule.length > 0) {
     blocks.push({
       object: 'block',
       type: 'heading_2',
       heading_2: { rich_text: [{ text: { content: '📅 Weekly Schedule' } }] },
     });
 
-    for (const s of course.schedule.slice(0, 15)) {
+    for (const s of realSchedule.slice(0, 15)) {
       const readingsPart = s.readings ? ` — ${s.readings}` : '';
       blocks.push({
         object: 'block',
