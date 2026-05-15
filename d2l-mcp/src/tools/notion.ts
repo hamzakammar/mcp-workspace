@@ -35,6 +35,7 @@ interface RawGradeValue {
 }
 
 interface RawNewsItem {
+  Id: number;
   Title: string;
   StartDate: string;
   Body: { Html: string } | null;
@@ -116,6 +117,7 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
 
   // Fetch announcements
   try {
+    const d2lHost = process.env.D2L_HOST || 'learn.uwaterloo.ca';
     const raw = (await client.getNews(orgUnitId)) as RawNewsItem[];
     const news: RawNewsItem[] = Array.isArray(raw) ? raw : [];
     for (const item of news.slice(0, 5)) {
@@ -123,6 +125,7 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
         title: item.Title,
         date: item.StartDate,
         body: item.Body?.Html ?? '',
+        url: `https://${d2lHost}/d2l/le/news/${orgUnitId}/${item.Id}/view`,
       });
     }
   } catch { /* news may not be accessible */ }

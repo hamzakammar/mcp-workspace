@@ -50,6 +50,7 @@ export interface AnnouncementInfo {
   title: string;
   date: string;
   body: string;
+  url?: string;
 }
 
 export interface SyncResult {
@@ -86,6 +87,17 @@ function notionHeaders(token: string): Record<string, string> {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Format a date in Eastern Time for display */
+function formatDateET(isoDate: string, includeTime = true): string {
+  const opts: Intl.DateTimeFormatOptions = {
+    timeZone: 'America/Toronto',
+    month: 'short',
+    day: 'numeric',
+    ...(includeTime ? { hour: 'numeric', minute: '2-digit' } : {}),
+  };
+  return new Date(isoDate).toLocaleString('en-US', opts);
 }
 
 function buildCourseProperties(course: CourseData): Record<string, unknown> {
@@ -141,7 +153,7 @@ function buildCourseBody(course: CourseData): unknown[] {
     });
 
     for (const a of course.assignments) {
-      const duePart = a.dueDate ? ` — Due: ${new Date(a.dueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}` : '';
+      const duePart = a.dueDate ? ` — Due: ${formatDateET(a.dueDate)}` : '';
       const gradePart = a.grade ? ` [${a.grade}]` : '';
       const statusEmoji = a.status === 'Graded' ? '✅' : a.status === 'Submitted' ? '📤' : '⬜';
 
@@ -186,22 +198,26 @@ function buildCourseBody(course: CourseData): unknown[] {
     });
 
     for (const ann of course.announcements.slice(0, 5)) {
-      const date = new Date(ann.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      // Notion text blocks limited to 2000 chars
-      const snippet = ann.body.replace(/<[^>]+>/g, '').slice(0, 200);
+      const date = formatDateET(ann.date, false);
+      // Build rich text: title as link if URL available, plain text otherwise
+      const titleRichText: unknown[] = ann.url
+        ? [{ text: { content: `[${date}] `, link: null } }, { text: { content: ann.title, link: { url: ann.url } } }]
+        : [{ text: { content: `[${date}] ${ann.title}` } }];
+
       blocks.push({
         object: 'block',
         type: 'bulleted_list_item',
-        bulleted_list_item: {
-          rich_text: [{ text: { content: `[${date}] ${ann.title}` } }],
-        },
+        bulleted_list_item: { rich_text: titleRichText },
       });
+
+      // Show body snippet (strip HTML, cap at 500 chars)
+      const snippet = ann.body.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().slice(0, 500);
       if (snippet) {
         blocks.push({
           object: 'block',
           type: 'paragraph',
           paragraph: {
-            rich_text: [{ text: { content: `    ${snippet}${ann.body.length > 200 ? '...' : ''}` } }],
+            rich_text: [{ text: { content: `    ${snippet}${ann.body.length > 500 ? '...' : ''}` } }],
           },
         });
       }
