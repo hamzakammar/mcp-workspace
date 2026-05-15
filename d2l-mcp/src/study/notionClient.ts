@@ -28,6 +28,13 @@ export interface CourseData {
   assignments: AssignmentInfo[];
   grades: GradeInfo[];
   announcements: AnnouncementInfo[];
+  schedule?: ScheduleItem[];
+}
+
+export interface ScheduleItem {
+  week: string;
+  topic: string;
+  readings?: string;
 }
 
 export interface AssignmentInfo {
@@ -184,6 +191,26 @@ function buildCourseBody(course: CourseData): unknown[] {
         type: 'bulleted_list_item',
         bulleted_list_item: {
           rich_text: [{ text: { content: `${g.name}: ${score}` } }],
+        },
+      });
+    }
+  }
+
+  // ── Schedule section ──
+  if (course.schedule && course.schedule.length > 0) {
+    blocks.push({
+      object: 'block',
+      type: 'heading_2',
+      heading_2: { rich_text: [{ text: { content: '📅 Weekly Schedule' } }] },
+    });
+
+    for (const s of course.schedule.slice(0, 15)) {
+      const readingsPart = s.readings ? ` — ${s.readings}` : '';
+      blocks.push({
+        object: 'block',
+        type: 'bulleted_list_item',
+        bulleted_list_item: {
+          rich_text: [{ text: { content: `Week ${s.week}: ${s.topic}${readingsPart}` } }],
         },
       });
     }

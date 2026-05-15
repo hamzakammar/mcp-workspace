@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { getUserId } from '../utils/userContext.js';
 import { client } from '../client.js';
 import { getNotionToken } from '../study/notionAuth.js';
-import { syncCourses, type CourseData, type AssignmentInfo, type GradeInfo, type AnnouncementInfo } from '../study/notionClient.js';
+import { syncCourses, queryAllPages, type CourseData, type AssignmentInfo, type GradeInfo, type AnnouncementInfo } from '../study/notionClient.js';
 import { fetchCourseOutline, getCurrentTerm, type Assessment } from '../study/outlineClient.js';
 import { getOrRefreshOutlineCookies } from '../study/outlineAuth.js';
 
@@ -72,22 +72,34 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
     }
   } catch { /* course may not expose dropbox */ }
 
-  // Fetch quizzes (D2L raw format: { Objects: [...] } or [...], with PascalCase keys)
+  // Fetch quizzes with submission status
   try {
     const quizzesRaw = (await client.getQuizzes(orgUnitId)) as
-      | { Objects: Array<{ Name: string; DueDate: string | null; IsActive: boolean }> }
-      | Array<{ Name: string; DueDate: string | null; IsActive: boolean }>;
+      | { Objects: Array<{ Name: string; DueDate: string | null; IsActive: boolean; AttemptsAllowed: number | null }> }
+      | Array<{ Name: string; DueDate: string | null; IsActive: boolean; AttemptsAllowed: number | null }>;
     const quizzes = Array.isArray(quizzesRaw) ? quizzesRaw : (quizzesRaw.Objects || []);
     const existingNames = new Set(courseData.assignments.map(a => a.name.toLowerCase()));
+
+    // Also fetch quiz attempts to check submission status
     for (const quiz of quizzes) {
       if (quiz.IsActive === false) continue;
       if (!quiz.Name) continue;
       if (existingNames.has(quiz.Name.toLowerCase())) continue;
+
+      let status: 'Not Started' | 'Submitted' | 'Graded' = 'Not Started';
+      try {
+        const attemptsRaw = (await client.getQuizAttempts(orgUnitId, parseInt((quiz as any).QuizId || (quiz as any).Id || '0'))) as
+          | { Objects: Array<{ Attempt: { AttemptNumber: number } }> }
+          | Array<{ Attempt: { AttemptNumber: number } }>;
+        const attempts = Array.isArray(attemptsRaw) ? attemptsRaw : (attemptsRaw.Objects || []);
+        if (attempts.length > 0) status = 'Submitted';
+      } catch { /* skip attempt check */ }
+
       courseData.assignments.push({
         name: quiz.Name,
         dueDate: quiz.DueDate ?? null,
         maxPoints: null,
-        status: 'Not Started',
+        status,
       });
     }
   } catch { /* quizzes may not be accessible */ }
@@ -231,6 +243,15 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
         }
       }
 
+      // Add schedule from outline
+      if (outline.schedule.length > 0) {
+        course.schedule = outline.schedule.map(s => ({
+          week: s.week || '',
+          topic: s.topic,
+          readings: s.readings,
+        }));
+      }
+
       // Add instructor info to announcements if not already there
       if (outline.instructors.length > 0 && course.announcements.length === 0) {
         const instructorList = outline.instructors
@@ -250,8 +271,13 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
 
 // Stored database ID per user (in-memory cache for auto-sync)
 const userDatabaseIds: Map<string, string> = new Map();
+// "This Week" database ID per user (auto-created)
+const weeklyDbIds: Map<string, string> = new Map();
 // Lock to prevent concurrent syncs for the same user
 const syncInProgress: Set<string> = new Set();
+// Throttle: track last sync time per user (max once per hour)
+const lastSyncTime: Map<string, number> = new Map();
+const SYNC_THROTTLE_MS = 60 * 60 * 1000; // 1 hour
 
 /**
  * Non-academic course patterns to exclude from Notion sync.
@@ -282,11 +308,122 @@ function isAcademicCourse(enrollment: RawEnrollment): boolean {
 }
 
 /**
+ * Sync upcoming tasks as rows in the SAME database with a "Due This Week" tag.
+ * Uses a "Type" property set to "📌 Due Soon" to distinguish from course pages.
+ * Removes old "Due Soon" entries and re-creates current ones.
+ */
+async function syncUpcomingTasks(
+  notionToken: string,
+  databaseId: string,
+  courses: CourseData[],
+): Promise<number> {
+  const headers = { 'Authorization': `Bearer ${notionToken}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' };
+
+  // First, ensure the database has a "Type" property
+  await fetch(`https://api.notion.com/v1/databases/${databaseId}`, {
+    method: 'PATCH', headers,
+    body: JSON.stringify({ properties: { 'Type': { select: {} } } }),
+  });
+
+  // Remove existing "Due Soon" tagged pages
+  try {
+    const existingResp = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
+      method: 'POST', headers,
+      body: JSON.stringify({
+        filter: { property: 'Type', select: { equals: '📌 Due Soon' } },
+        page_size: 100,
+      }),
+    });
+    if (existingResp.ok) {
+      const data = await existingResp.json() as { results: Array<{ id: string }> };
+      for (const page of data.results) {
+        await fetch(`https://api.notion.com/v1/pages/${page.id}`, {
+          method: 'PATCH', headers,
+          body: JSON.stringify({ archived: true }),
+        });
+      }
+    }
+  } catch { /* continue */ }
+
+  // Collect upcoming tasks (next 10 days)
+  const now = new Date();
+  const tenDays = new Date(now.getTime() + 10 * 24 * 60 * 60 * 1000);
+  let created = 0;
+
+  for (const course of courses) {
+    const courseName = course.name.replace(/ Online - .*$/, '');
+    for (const a of course.assignments) {
+      if (!a.dueDate) continue;
+      const due = new Date(a.dueDate);
+      if (due < now || due > tenDays) continue;
+
+      try {
+        await fetch('https://api.notion.com/v1/pages', {
+          method: 'POST', headers,
+          body: JSON.stringify({
+            parent: { database_id: databaseId },
+            properties: {
+              'Name': { title: [{ text: { content: `${a.name} (${courseName})` } }] },
+              'Course Code': { rich_text: [{ text: { content: course.code } }] },
+              'Status': { select: { name: a.status === 'Submitted' ? 'Active' : 'Active' } },
+              'Next Due': { date: { start: a.dueDate } },
+              'Grade': { rich_text: [{ text: { content: a.grade || '' } }] },
+              'Type': { select: { name: '📌 Due Soon' } },
+            },
+          }),
+        });
+        created++;
+      } catch { /* skip */ }
+    }
+  }
+
+  console.error(`[NOTION] Upcoming tasks synced: ${created} items due in next 10 days`);
+  return created;
+}
+
+/**
+ * Remove Notion pages for courses no longer enrolled.
+ * Compares by extracting the short course code (e.g. PSYCH207) from both sides.
+ */
+async function cleanupStalePages(
+  notionToken: string,
+  databaseId: string,
+  activeCodes: Set<string>,
+): Promise<number> {
+  let archived = 0;
+  try {
+    const existingPages = await queryAllPages(notionToken, databaseId);
+    for (const [key, pageId] of existingPages) {
+      // Only check courseCode-only keys (not "code|title" compound keys)
+      if (key.includes('|')) continue;
+      // Extract short code from the Notion page's Course Code (e.g. "PSYCH207_081_cel_1265" → "PSYCH207")
+      const shortCode = key.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{3})/)?.[1] || key;
+      if (!activeCodes.has(shortCode) && !activeCodes.has(key)) {
+        await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+          method: 'PATCH',
+          headers: { 'Authorization': `Bearer ${notionToken}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ archived: true }),
+        });
+        archived++;
+        console.error(`[NOTION] Archived stale page: ${key}`);
+      }
+    }
+  } catch { /* skip */ }
+  return archived;
+}
+
+/**
  * Background sync — called after tool calls to keep Notion updated.
  * Non-blocking, swallows errors. Only one sync per user at a time.
+ * Throttled to max once per hour.
  */
 export async function backgroundNotionSync(userId: string): Promise<void> {
-  if (syncInProgress.has(userId)) return; // already running
+  if (syncInProgress.has(userId)) return;
+
+  // Throttle: skip if synced less than 1 hour ago
+  const lastSync = lastSyncTime.get(userId) || 0;
+  if (Date.now() - lastSync < SYNC_THROTTLE_MS) return;
+
   syncInProgress.add(userId);
 
   try {
@@ -308,7 +445,22 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
     // Enrich with outline data
     await enrichWithOutline(courses, userId);
 
+    // Sync course pages
     await syncCourses(notionToken, databaseId, courses);
+
+    // Sync "Due Soon" tasks
+    try {
+      await syncUpcomingTasks(notionToken, databaseId, courses);
+    } catch { /* skip */ }
+
+    // Cleanup stale pages
+    const activeCodes = new Set(courses.map(c => {
+      const m = c.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{3})/);
+      return m ? m[1] : c.code;
+    }));
+    await cleanupStalePages(notionToken, databaseId, activeCodes);
+
+    lastSyncTime.set(userId, Date.now());
     console.error(`[NOTION] Background sync complete: ${courses.length} courses`);
   } catch (e) {
     console.error(`[NOTION] Background sync error: ${e instanceof Error ? e.message : e}`);
@@ -378,11 +530,27 @@ export const notionTools = {
       try {
         const result = await syncCourses(notionToken, args.databaseId, courses);
 
+        // 5. Sync "Due Soon" tasks as rows in the same database
+        let upcomingCount = 0;
+        try {
+          upcomingCount = await syncUpcomingTasks(notionToken, args.databaseId, courses);
+        } catch { /* skip */ }
+
+        // 6. Cleanup stale pages
+        const activeCodes = new Set(courses.map(c => {
+          const m = c.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{3})/);
+          return m ? m[1] : c.code;
+        }));
+        const archived = await cleanupStalePages(notionToken, args.databaseId, activeCodes);
+
+        lastSyncTime.set(userId!, Date.now());
+
         const total = result.created + result.updated;
         const parts: string[] = [];
         if (result.created > 0) parts.push(`${result.created} created`);
         if (result.updated > 0) parts.push(`${result.updated} updated`);
         if (result.failed > 0) parts.push(`${result.failed} failed`);
+        if (archived > 0) parts.push(`${archived} archived`);
 
         const summary = total === 0 && result.failed === 0
           ? `No courses to sync.`
@@ -391,10 +559,12 @@ export const notionTools = {
         return JSON.stringify({
           success: true,
           ...result,
+          archived,
+          upcomingTasks: upcomingCount,
           coursesChecked: activeCourses.length,
           summary,
           autoSyncEnabled: true,
-          message: 'Notion will now auto-sync in the background on subsequent tool calls.',
+          message: `Notion synced. ${upcomingCount} "Due Soon" tasks added (filter by Type: 📌 Due Soon for weekly view). Background sync runs max once/hour.`,
         }, null, 2);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
