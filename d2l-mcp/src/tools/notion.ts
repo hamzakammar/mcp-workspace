@@ -57,7 +57,7 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
     announcements: [],
   };
 
-  // Fetch assignments
+  // Fetch assignments (dropbox)
   try {
     const raw = (await client.getDropboxFolders(orgUnitId)) as RawAssignment[];
     const folders: RawAssignment[] = Array.isArray(raw) ? raw : [];
@@ -70,6 +70,29 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
       });
     }
   } catch { /* course may not expose dropbox */ }
+
+  // Fetch quizzes
+  try {
+    const quizzes = (await client.getQuizzes(orgUnitId)) as Array<{
+      Name: string;
+      DueDate: string | null;
+      IsActive: boolean;
+    }>;
+    if (Array.isArray(quizzes)) {
+      const existingNames = new Set(courseData.assignments.map(a => a.name.toLowerCase()));
+      for (const quiz of quizzes) {
+        if (!quiz.IsActive) continue;
+        // Don't duplicate if already in dropbox
+        if (existingNames.has(quiz.Name.toLowerCase())) continue;
+        courseData.assignments.push({
+          name: quiz.Name,
+          dueDate: quiz.DueDate,
+          maxPoints: null,
+          status: 'Not Started',
+        });
+      }
+    }
+  } catch { /* quizzes may not be accessible */ }
 
   // Fetch grades
   try {
