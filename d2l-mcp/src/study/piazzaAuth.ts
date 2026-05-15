@@ -266,6 +266,100 @@ export async function getPiazzaCookieHeader(userId?: string): Promise<string> {
     }
   }
   
+  // Try credential-based login (email + password stored in DB)
+  if (userId) {
+    try {
+      const sbUrl = process.env.SUPABASE_URL;
+      const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
+      if (sbUrl && sbKey) {
+        const credUrl = `${sbUrl}/rest/v1/user_credentials?user_id=eq.${userId}&service=eq.piazza&select=email,password&limit=1`;
+        const credResp = await fetch(credUrl, {
+          headers: { "apikey": sbKey, "Authorization": `Bearer ${sbKey}` },
+        });
+        if (credResp.ok) {
+          const rows = await credResp.json() as Array<{ email: string; password: string }>;
+          if (rows.length > 0 && rows[0].email && rows[0].password) {
+            const { decryptPassword } = await import("../utils/kms.js");
+            const plainPassword = await decryptPassword(rows[0].password);
+            console.error(`[PIAZZA_AUTH] Attempting credential login for ${rows[0].email}`);
+
+            // Step 1: Get initial session cookie + CSRF token from login page
+            const initResp = await fetch("https://piazza.com/account/login", {
+              headers: { "Accept": "text/html" },
+            });
+            const initCookies = initResp.headers.getSetCookie?.() || [];
+            let initSessionCookie = '';
+            for (const sc of initCookies) {
+              const nv = sc.split(';')[0];
+              if (nv.includes('session_id')) initSessionCookie = nv;
+            }
+            if (!initSessionCookie) {
+              const rawSC = initResp.headers.get('set-cookie') || '';
+              const m = rawSC.match(/session_id=[^;]+/);
+              if (m) initSessionCookie = m[0];
+            }
+            const csrfToken = initSessionCookie.split('=')[1] || '';
+
+            // Step 2: Login with CSRF token + session cookie
+            const loginResp = await fetch("https://piazza.com/logic/api?method=user.login", {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "cookie": initSessionCookie,
+                "csrf-token": csrfToken,
+              },
+              body: JSON.stringify({ method: "user.login", params: { email: rows[0].email, pass: plainPassword } }),
+            });
+
+            if (loginResp.ok) {
+              // Check response body for session info
+              const loginBody = await loginResp.text();
+              console.error(`[PIAZZA_AUTH] Login response body (first 300): ${loginBody.slice(0, 300)}`);
+
+              // Extract session cookies from Set-Cookie headers
+              let setCookies = loginResp.headers.getSetCookie?.() || [];
+              // Fallback: some environments don't support getSetCookie
+              if (setCookies.length === 0) {
+                const rawSetCookie = loginResp.headers.get('set-cookie') || '';
+                setCookies = rawSetCookie.split(/,(?=\s*\w+=)/).map(s => s.trim()).filter(Boolean);
+              }
+              const cookieParts: string[] = [];
+              for (const sc of setCookies) {
+                const nameValue = sc.split(';')[0];
+                if (nameValue) cookieParts.push(nameValue);
+              }
+
+              console.error(`[PIAZZA_AUTH] Raw Set-Cookie parts: ${cookieParts.join(' | ')}`);
+              if (cookieParts.length > 0 && cookieParts.some(c => c.includes("session_id"))) {
+                const newCookieHeader = cookieParts.join("; ");
+                console.error(`[PIAZZA_AUTH] Credential login succeeded, got ${cookieParts.length} cookies`);
+
+                // Store the fresh cookies in DB for next time
+                await fetch(`${sbUrl}/rest/v1/user_credentials?user_id=eq.${userId}&service=eq.piazza`, {
+                  method: "PATCH",
+                  headers: {
+                    "apikey": sbKey, "Authorization": `Bearer ${sbKey}`,
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify({ token: newCookieHeader, updated_at: new Date().toISOString() }),
+                });
+
+                return newCookieHeader;
+              } else {
+                const body = await loginResp.text();
+                console.error(`[PIAZZA_AUTH] Credential login response had no session cookie. Body: ${body.slice(0, 200)}`);
+              }
+            } else {
+              console.error(`[PIAZZA_AUTH] Credential login failed with status ${loginResp.status}`);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`[PIAZZA_AUTH] Credential login error:`, e);
+    }
+  }
+
   // Fallback to browser-based auth (ONLY in non-production)
   if (isProduction) {
     throw new Error("Piazza authentication required but no valid cookies found. Please re-authenticate via mobile app WebView login.");
