@@ -43,6 +43,7 @@ export interface AssignmentInfo {
   maxPoints: number | null;
   status: 'Not Started' | 'Submitted' | 'Graded';
   grade?: string | null;
+  url?: string;
 }
 
 export interface GradeInfo {
@@ -164,12 +165,15 @@ function buildCourseBody(course: CourseData): unknown[] {
       const gradePart = a.grade ? ` [${a.grade}]` : '';
       const statusEmoji = a.status === 'Graded' ? '✅' : a.status === 'Submitted' ? '📤' : '⬜';
 
+      // Make assignment name a clickable link if URL is available
+      const nameRichText: unknown[] = a.url
+        ? [{ text: { content: `${statusEmoji} `, link: null } }, { text: { content: a.name, link: { url: a.url } } }, { text: { content: `${duePart}${gradePart}` } }]
+        : [{ text: { content: `${statusEmoji} ${a.name}${duePart}${gradePart}` } }];
+
       blocks.push({
         object: 'block',
         type: 'bulleted_list_item',
-        bulleted_list_item: {
-          rich_text: [{ text: { content: `${statusEmoji} ${a.name}${duePart}${gradePart}` } }],
-        },
+        bulleted_list_item: { rich_text: nameRichText },
       });
     }
   }

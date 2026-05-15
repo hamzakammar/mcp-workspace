@@ -59,6 +59,7 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
   };
 
   // Fetch assignments (dropbox)
+  const d2lHost = process.env.D2L_HOST || 'learn.uwaterloo.ca';
   try {
     const raw = (await client.getDropboxFolders(orgUnitId)) as RawAssignment[];
     const folders: RawAssignment[] = Array.isArray(raw) ? raw : [];
@@ -68,6 +69,7 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
         dueDate: folder.DueDate,
         maxPoints: folder.Assessment?.ScoreDenominator ?? null,
         status: 'Not Started',
+        url: `https://${d2lHost}/d2l/lms/dropbox/user/folder_submit_files.d2l?db=${folder.Id}&grpid=0&isprv=0&bp=0&ou=${orgUnitId}`,
       });
     }
   } catch { /* course may not expose dropbox */ }
@@ -95,11 +97,13 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
         if (attempts.length > 0) status = 'Submitted';
       } catch { /* skip attempt check */ }
 
+      const quizId = (quiz as any).QuizId || (quiz as any).Id || '0';
       courseData.assignments.push({
         name: quiz.Name,
         dueDate: quiz.DueDate ?? null,
         maxPoints: null,
         status,
+        url: `https://${d2lHost}/d2l/lms/quizzing/user/quiz_summary.d2l?qi=${quizId}&ou=${orgUnitId}`,
       });
     }
   } catch { /* quizzes may not be accessible */ }
