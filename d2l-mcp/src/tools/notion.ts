@@ -134,6 +134,52 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
 }
 
 /**
+ * Try to parse a human-readable date string from an outline into an ISO date.
+ * Handles formats like:
+ *   "Friday, May 15, 2026 at 11:55 PM"
+ *   "Opens: Wednesday, June 3, 2026 at 6:55 AM Closes: Friday, June 5, 2026 at 6:55 AM"
+ * For "Opens/Closes" format, returns the Closes date (deadline).
+ */
+function parseOutlineDate(dateStr: string | undefined): string | null {
+  if (!dateStr || dateStr === 'n/a') return null;
+
+  // If it has "Closes:", extract that date (it's the deadline)
+  const closesMatch = dateStr.match(/Closes?:\s*(.+)/i);
+  const target = closesMatch ? closesMatch[1].trim() : dateStr;
+
+  // Try to parse with Date — handle "Day, Month DD, YYYY at HH:MM AM/PM"
+  const cleaned = target
+    .replace(/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s*/i, '')
+    .replace(/\s+at\s+/i, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Outline dates are in Eastern Time — append timezone before parsing
+  const withTz = cleaned.replace(/\s*(AM|PM)\s*$/i, ' $1 EDT');
+  const parsed = new Date(withTz);
+  if (!isNaN(parsed.getTime()) && parsed.getFullYear() > 2020) {
+    return parsed.toISOString();
+  }
+  // Fallback: try without timezone hint
+  const fallback = new Date(cleaned);
+  if (!isNaN(fallback.getTime()) && fallback.getFullYear() > 2020) {
+    // Assume Eastern: add 4h (EDT offset) to treat as UTC
+    return new Date(fallback.getTime() + 4 * 60 * 60 * 1000).toISOString();
+  }
+  return null;
+}
+
+/**
+ * Clean up outline text — fix missing spaces, special chars, etc.
+ */
+function cleanOutlineText(text: string): string {
+  return text
+    .replace(/([AP]M)([A-Z])/g, '$1 $2')  // "6:55 AMCloses" → "6:55 AM Closes"
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
  * Enrich course data with outline assessments (weights, due dates from syllabus).
  * Merges outline assessments into existing assignments or adds new ones.
  */
@@ -157,25 +203,29 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
       const outline = await fetchCourseOutline(cookieHeader, courseCode, term);
 
       if (outline.assessments.length > 0) {
-        // Merge outline assessments: add any not already in assignments list
         const existingNames = new Set(course.assignments.map(a => a.name.toLowerCase()));
 
         for (const assessment of outline.assessments) {
+          const parsedDate = parseOutlineDate(assessment.date);
+          const weightText = assessment.weight ? `Weight: ${assessment.weight}` : undefined;
+
           if (!existingNames.has(assessment.name.toLowerCase())) {
+            // New item from outline — add it
             course.assignments.push({
-              name: assessment.name,
-              dueDate: assessment.date ?? null,
+              name: cleanOutlineText(assessment.name),
+              dueDate: parsedDate,
               maxPoints: null,
               status: 'Not Started',
-              grade: assessment.weight ? `Weight: ${assessment.weight}` : undefined,
+              grade: weightText,
             });
           } else {
-            // Enrich existing assignment with weight info
+            // Existing item — enrich with weight and/or date from outline
             const existing = course.assignments.find(
               a => a.name.toLowerCase() === assessment.name.toLowerCase()
             );
-            if (existing && assessment.weight && !existing.grade) {
-              existing.grade = `Weight: ${assessment.weight}`;
+            if (existing) {
+              if (weightText && !existing.grade) existing.grade = weightText;
+              if (parsedDate && !existing.dueDate) existing.dueDate = parsedDate;
             }
           }
         }
