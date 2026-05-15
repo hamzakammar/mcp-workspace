@@ -12,8 +12,10 @@
 export type CredentialType =
   | "d2l_password"
   | "piazza_password"
+  | "outline_password"
   | "d2l_token"
   | "piazza_token"
+  | "outline_token"
   | "s3_state"
   | "api_key"
   | "all";   // used for delete_my_data which wipes everything at once

@@ -85,7 +85,7 @@ export const PlanningTools = {
                         title: taskTitle,
                         course_id: courseId,
                         due_at: dueAt,
-                        source: 'manual',
+                        source,
                         source_ref: `${source}:${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
                         status: 'open',
                         description: description ?? null,

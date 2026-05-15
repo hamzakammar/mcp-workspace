@@ -761,6 +761,7 @@ router.post("/d2l/connect-cookie", async (req: Request, res: Response) => {
       .upsert({
         user_id: userId,
         service: "d2l",
+        host: host,
         token: cookies,
         updated_at: new Date().toISOString(),
       }, {
@@ -1487,7 +1488,10 @@ router.get("/d2l/courses/:courseId/file", async (req: Request, res: Response) =>
     }
 
     const contentType = fetchResp.headers.get("content-type") || "application/octet-stream";
-    const filename = fileUrl.split("/").pop()?.split("?")[0] || "file.pdf";
+    const rawName = fileUrl.split("/").pop()?.split("?")[0] || "file.pdf";
+    // Strip any character that could break out of the quoted filename or
+    // smuggle additional header directives (CR/LF, quotes, backslashes).
+    const filename = rawName.replace(/[\r\n"\\]/g, "_").slice(0, 200) || "file.pdf";
 
     res.setHeader("Content-Type", contentType);
     res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
@@ -1668,6 +1672,9 @@ router.post("/d2l/save-credentials", async (req: Request, res: Response) => {
     if (!sbUrl || !sbKey) throw new Error("Missing Supabase config");
     const d2lHost = host || process.env.D2L_HOST || "learn.uwaterloo.ca";
 
+    const encryptedPassword = await encryptPassword(password);
+    await logCredentialAccess(userId, "d2l_password", "write", "POST /d2l/save-credentials");
+
     // First try PATCH — only updates if row already exists (preserves token)
     const patchResp = await fetch(
       `${sbUrl}/rest/v1/user_credentials?user_id=eq.${userId}&service=eq.d2l`,
@@ -1678,7 +1685,7 @@ router.post("/d2l/save-credentials", async (req: Request, res: Response) => {
           "Content-Type": "application/json",
           "Prefer": "return=representation",
         },
-        body: JSON.stringify({ username, password, host: d2lHost }),
+        body: JSON.stringify({ username, password: encryptedPassword, host: d2lHost }),
       }
     );
     if (!patchResp.ok) throw new Error(await patchResp.text());
@@ -1695,7 +1702,7 @@ router.post("/d2l/save-credentials", async (req: Request, res: Response) => {
         },
         body: JSON.stringify({
           user_id: userId, service: "d2l",
-          host: d2lHost, username, password,
+          host: d2lHost, username, password: encryptedPassword,
           token: "{}",
           updated_at: new Date().toISOString(),
         }),
@@ -2342,6 +2349,8 @@ router.post("/outline/connect", async (req: Request, res: Response) => {
   }
 
   try {
+    const encryptedPassword = await encryptPassword(password);
+    await logCredentialAccess(userId, "outline_password", "write", "POST /outline/connect");
     const { error } = await supabase
       .from("user_credentials")
       .upsert({
@@ -2349,7 +2358,7 @@ router.post("/outline/connect", async (req: Request, res: Response) => {
         service: "outline",
         host: "outline.uwaterloo.ca",
         username,
-        password,
+        password: encryptedPassword,
         updated_at: new Date().toISOString(),
       }, { onConflict: "user_id,service" });
 

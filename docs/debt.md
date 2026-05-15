@@ -43,6 +43,16 @@ Severity guide:
 - **Fix:** Add a periodic background revalidation (e.g. check every 2h if token was last validated > 1h ago) — similar to what `sessionRefresher.js` does for the token age check.
 - **Unblocked by:** Nothing; low priority since the 403-retry path already handles it silently.
 
+### [DEBT-003] Workspace-root vitest scaffolding is broken — module resolution fails
+- **Severity:** low
+- **Area:** `tests/unit/marshal.test.ts`, `tests/unit/tools.test.ts`, `vitest.config.ts`
+- **Logged:** 2026-05-14
+- **Author:** agent
+- **Description:** The workspace-root vitest config and the scaffolding tests under `tests/unit/` import from `../d2l-mcp/src/.../*.js`. Vitest cannot resolve those paths to TS sources (no resolver alias) and the workspace root has no `node_modules` (vitest only installed inside `d2l-mcp/`). The d2l-mcp-local test suite under `d2l-mcp/tests/unit/` passes cleanly (177 tests). Workspace-root tests never ran successfully.
+- **Impact:** `npm test` from the repo root fails immediately. CI that runs root-level vitest will produce false failures.
+- **Fix:** Either (a) delete the workspace-root `tests/` scaffolding and let `d2l-mcp/tests/` be canonical, or (b) install vitest at root, add a `resolve.alias` mapping in `vitest.config.ts`, and fix the test imports to point at compiled `dist/` or aliased TS sources.
+- **Unblocked by:** Nothing.
+
 ### [DEBT-002] `get_assignment_rubric` returns all course rubrics, not only rubrics attached to the specific assignment
 - **Severity:** medium
 - **Area:** `d2l-mcp/src/tools/rubric.ts`

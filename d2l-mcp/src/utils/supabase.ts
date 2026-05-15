@@ -74,10 +74,15 @@ if (supabaseUrl.startsWith('postgresql://')) {
               return builder;
             },
             is: (col: string, val: any) => {
-              if (params.length === 0) query += ` WHERE ${col} IS $${paramIndex}`;
-              else query += ` AND ${col} IS $${paramIndex}`;
-              params.push(val);
-              paramIndex++;
+              // PostgreSQL's IS operator requires a literal NULL/TRUE/FALSE,
+              // not a parameter. Inline the literal so `is("col", null)`
+              // produces `IS NULL` instead of an invalid `IS $1`.
+              const literal = val === null ? 'NULL' : val === true ? 'TRUE' : val === false ? 'FALSE' : null;
+              if (literal === null) {
+                throw new Error(`is() only supports null/true/false, got ${typeof val}`);
+              }
+              if (params.length === 0) query += ` WHERE ${col} IS ${literal}`;
+              else query += ` AND ${col} IS ${literal}`;
               return builder;
             },
             limit: (n: number) => {

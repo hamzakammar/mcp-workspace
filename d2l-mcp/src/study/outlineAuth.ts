@@ -21,6 +21,7 @@ import path from "path";
 import os from "os";
 import fs from "fs/promises";
 import { supabase } from "../utils/supabase.js";
+import { decryptPassword } from "../utils/kms.js";
 import { sendPushToUser } from "../api/push.js";
 
 const CHROMIUM_PATH = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium";
@@ -83,7 +84,13 @@ async function getOutlineCredentials(userId: string): Promise<{ username: string
     .single();
 
   if (error || !data?.username || !data?.password) return null;
-  return { username: data.username, password: data.password };
+  try {
+    const password = await decryptPassword(data.password);
+    return { username: data.username, password };
+  } catch (e: any) {
+    console.error(`[OUTLINE_AUTH] Failed to decrypt password for user ${userId}: ${e?.message}`);
+    return null;
+  }
 }
 
 // ─── Cookie validation ────────────────────────────────────────────────────────

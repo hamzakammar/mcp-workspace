@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -168,10 +169,13 @@ func verifyAccessToken(tokenStr string) (string, error) {
 
 // exchangeRefreshToken exchanges a refresh token for a fresh session.
 func exchangeRefreshToken(refreshToken string) (*supabaseSession, error) {
-	body := fmt.Sprintf(`{"refresh_token":"%s"}`, refreshToken)
+	body, err := json.Marshal(map[string]string{"refresh_token": refreshToken})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal refresh body: %w", err)
+	}
 	req, err := http.NewRequest("POST",
 		getSupabaseURL()+"/auth/v1/token?grant_type=refresh_token",
-		strings.NewReader(body))
+		bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create refresh request: %w", err)
 	}
