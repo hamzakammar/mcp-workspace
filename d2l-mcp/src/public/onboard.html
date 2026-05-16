@@ -615,7 +615,7 @@
         <div id="d2lStatusRow" style="display:flex;align-items:center;gap:10px;padding:10px 13px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)">
           <span style="font-size:13px;flex-shrink:0;color:var(--muted)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 10v6M2 10l10-5 10 5-10 5z"/><path d="M6 12v5c0 1.1 2.7 2 6 2s6-.9 6-2v-5"/></svg></span>
           <div style="flex:1;min-width:0">
-            <div style="font-size:13px;font-weight:500">D2L / Brightspace</div>
+            <div style="font-size:13px;font-weight:500">D2L / Brightspace <span style="font-size:11px;color:var(--muted);font-weight:400">required</span></div>
             <div id="d2lStatusText" style="font-size:11.5px;color:var(--muted)">Checking...</div>
           </div>
           <span id="d2lStatusDot" style="width:8px;height:8px;border-radius:50%;background:#d4d4d4;flex-shrink:0"></span>
@@ -626,7 +626,7 @@
         <div id="piazzaStatusRow" style="display:flex;align-items:center;gap:10px;padding:10px 13px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)">
           <span style="font-size:13px;flex-shrink:0;color:var(--muted)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span>
           <div style="flex:1;min-width:0">
-            <div style="font-size:13px;font-weight:500">Piazza</div>
+            <div style="font-size:13px;font-weight:500">Piazza <span style="font-size:11px;color:var(--muted);font-weight:400">optional</span></div>
             <div id="piazzaStatusText" style="font-size:11.5px;color:var(--muted)">Checking...</div>
           </div>
           <span id="piazzaStatusDot" style="width:8px;height:8px;border-radius:50%;background:#d4d4d4;flex-shrink:0"></span>
@@ -648,7 +648,7 @@
         <div id="outlineStatusRow" style="display:flex;align-items:center;gap:10px;padding:10px 13px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)">
           <span style="font-size:13px;flex-shrink:0;color:var(--muted)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></span>
           <div style="flex:1;min-width:0">
-            <div style="font-size:13px;font-weight:500">Course Outlines <span style="font-size:11px;color:var(--muted);font-weight:400">optional · UW</span></div>
+            <div style="font-size:13px;font-weight:500">Course Outlines <span style="font-size:11px;color:var(--muted);font-weight:400">optional · UW only</span></div>
             <div id="outlineStatusText" style="font-size:11.5px;color:var(--muted)">Checking...</div>
           </div>
           <span id="outlineStatusDot" style="width:8px;height:8px;border-radius:50%;background:#d4d4d4;flex-shrink:0"></span>
@@ -1395,14 +1395,14 @@
         const btn = document.getElementById('d2lReconnectBtn');
         if (data.connected) {
           dot.style.background = 'var(--success)';
-          const host = data.host || 'learn.uwaterloo.ca';
-          const age = data.tokenAge ? `${Math.round(data.tokenAge / 3600000)}h ago` : '';
-          text.textContent = `Connected to ${host}` + (age ? ` · refreshed ${age}` : '');
+          text.textContent = 'Connected';
+          text.style.color = 'var(--success)';
           btn.textContent = 'Re-login';
           btn.style.display = '';
         } else {
-          dot.style.background = 'var(--danger)';
-          text.textContent = data.duoRequired ? 'Session expired — re-login required' : 'Not connected';
+          dot.style.background = data.duoRequired ? 'var(--warn)' : 'var(--danger)';
+          text.textContent = data.duoRequired ? 'Expired — click Re-login' : 'Not connected — click Connect to get started';
+          text.style.color = data.duoRequired ? 'var(--warn)' : 'var(--danger)';
           btn.textContent = data.duoRequired ? 'Re-login' : 'Connect';
           btn.style.display = '';
         }
@@ -1420,10 +1420,12 @@
         if (data.connected) {
           dot.style.background = 'var(--success)';
           text.textContent = 'Connected';
+          text.style.color = 'var(--success)';
           btn.textContent = 'Reconnect';
         } else {
           dot.style.background = '#d4d4d4';
           text.textContent = 'Not connected';
+          text.style.color = 'var(--muted)';
           btn.textContent = 'Connect';
         }
         btn.style.display = '';
@@ -1440,11 +1442,13 @@
         const btn = document.getElementById('crowdmarkConnectBtn');
         if (data.connected) {
           dot.style.background = 'var(--success)';
-          text.textContent = 'Connected — grades and feedback available';
+          text.textContent = 'Connected';
+          text.style.color = 'var(--success)';
           btn.textContent = 'Reconnect';
         } else {
           dot.style.background = '#d4d4d4';
-          text.textContent = 'Not connected — connect to see graded assignments';
+          text.textContent = 'Not connected';
+          text.style.color = 'var(--muted)';
           btn.textContent = 'Connect';
         }
         btn.style.display = '';
@@ -1461,11 +1465,13 @@
         const btn = document.getElementById('outlineConnectBtn');
         if (data.connected) {
           dot.style.background = 'var(--success)';
-          text.textContent = 'Connected — course outlines available';
+          text.textContent = 'Connected';
+          text.style.color = 'var(--success)';
           btn.textContent = 'Reconnect';
         } else {
           dot.style.background = '#d4d4d4';
-          text.textContent = 'Not connected — UW students can connect for syllabus/outline data';
+          text.textContent = 'Not connected';
+          text.style.color = 'var(--muted)';
           btn.textContent = 'Connect';
         }
         btn.style.display = '';
@@ -1482,11 +1488,13 @@
         const btn = document.getElementById('notionConnectBtn');
         if (data.connected) {
           dot.style.background = 'var(--success)';
-          text.textContent = 'Connected — use sync_to_notion in Claude to sync assignments';
+          text.textContent = 'Connected';
+          text.style.color = 'var(--success)';
           btn.textContent = 'Reconnect';
         } else {
           dot.style.background = '#d4d4d4';
-          text.textContent = 'Not connected — sync D2L assignments to Notion';
+          text.textContent = 'Not connected';
+          text.style.color = 'var(--muted)';
           btn.textContent = 'Connect';
         }
         btn.style.display = '';
