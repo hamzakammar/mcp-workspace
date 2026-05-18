@@ -289,6 +289,23 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
   }
 }
 
+/**
+ * Mark past-due assignments as Overdue (if not already submitted/graded).
+ * Should run AFTER all data sources (D2L + outline) have been merged.
+ */
+function markOverdueAssignments(courses: CourseData[]): void {
+  const now = new Date();
+  for (const course of courses) {
+    for (const a of course.assignments) {
+      if (a.dueDate && a.status === 'Not Started') {
+        if (new Date(a.dueDate) < now) {
+          a.status = 'Overdue';
+        }
+      }
+    }
+  }
+}
+
 // Stored database ID per user (in-memory cache for auto-sync)
 const userDatabaseIds: Map<string, string> = new Map();
 // "This Week" database ID per user (auto-created)
@@ -464,6 +481,7 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
 
     // Enrich with outline data
     await enrichWithOutline(courses, userId);
+    markOverdueAssignments(courses);
 
     // Sync course pages
     await syncCourses(notionToken, databaseId, courses);
@@ -545,6 +563,7 @@ export const notionTools = {
       if (userId) {
         await enrichWithOutline(courses, userId);
       }
+      markOverdueAssignments(courses);
 
       // 4. Sync to Notion
       try {

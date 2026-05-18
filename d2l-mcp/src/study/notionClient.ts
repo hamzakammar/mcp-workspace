@@ -41,7 +41,7 @@ export interface AssignmentInfo {
   name: string;
   dueDate: string | null;
   maxPoints: number | null;
-  status: 'Not Started' | 'Submitted' | 'Graded';
+  status: 'Not Started' | 'Submitted' | 'Graded' | 'Overdue';
   grade?: string | null;
   url?: string;
 }
@@ -163,7 +163,7 @@ function buildCourseBody(course: CourseData): unknown[] {
     for (const a of course.assignments) {
       const duePart = a.dueDate ? ` — Due: ${formatDateET(a.dueDate)}` : '';
       const gradePart = a.grade ? ` [${a.grade}]` : '';
-      const statusEmoji = a.status === 'Graded' ? '✅' : a.status === 'Submitted' ? '📤' : '⬜';
+      const statusEmoji = a.status === 'Graded' ? '✅' : a.status === 'Submitted' ? '📤' : a.status === 'Overdue' ? '⚠️' : '⬜';
 
       // Make assignment name a clickable link if URL is available
       const nameRichText: unknown[] = a.url
@@ -407,13 +407,57 @@ export async function createCoursePage(
 }
 
 /**
+ * Read user-set statuses from existing page blocks.
+ * If user manually changed an emoji to 📤 (Submitted) or ✅, we respect that.
+ * Returns a map of assignment name → user-set status.
+ */
+async function readUserStatuses(token: string, pageId: string): Promise<Map<string, 'Submitted' | 'Graded'>> {
+  const statuses = new Map<string, 'Submitted' | 'Graded'>();
+  try {
+    const resp = await fetch(`${NOTION_BASE}/blocks/${pageId}/children?page_size=100`, {
+      headers: notionHeaders(token),
+    });
+    if (resp.ok) {
+      const data = await resp.json() as { results: Array<{ type: string; bulleted_list_item?: { rich_text: Array<{ plain_text: string }> } }> };
+      for (const block of data.results) {
+        if (block.type !== 'bulleted_list_item') continue;
+        const text = (block.bulleted_list_item?.rich_text || []).map(t => t.plain_text).join('');
+        // Check if user set status emoji
+        if (text.startsWith('📤 ') || text.startsWith('✅ ')) {
+          const isSubmitted = text.startsWith('📤');
+          // Extract assignment name (after emoji, before " — Due:")
+          const nameMatch = text.match(/^[📤✅⬜⚠️]\s+(.+?)(?:\s+—\s+Due:|$|\s+\[)/);
+          if (nameMatch) {
+            statuses.set(nameMatch[1].trim().toLowerCase(), isSubmitted ? 'Submitted' : 'Graded');
+          }
+        }
+      }
+    }
+  } catch { /* skip */ }
+  return statuses;
+}
+
+/**
  * Update an existing course page — updates properties and replaces content.
+ * Reads user-set statuses from existing blocks and preserves them.
  */
 export async function updateCoursePage(
   token: string,
   pageId: string,
   course: CourseData,
 ): Promise<void> {
+  // Read user-set statuses BEFORE deleting blocks
+  const userStatuses = await readUserStatuses(token, pageId);
+
+  // Apply user-set statuses to course data (don't overwrite user's manual changes)
+  for (const a of course.assignments) {
+    const userStatus = userStatuses.get(a.name.toLowerCase());
+    if (userStatus) {
+      // User manually marked it — respect their choice
+      a.status = userStatus;
+    }
+  }
+
   // Update properties
   const resp = await fetch(`${NOTION_BASE}/pages/${pageId}`, {
     method: 'PATCH',
@@ -429,13 +473,11 @@ export async function updateCoursePage(
   }
 
   // Delete existing blocks and replace with new content
-  // First, get existing blocks
   const blocksResp = await fetch(`${NOTION_BASE}/blocks/${pageId}/children?page_size=100`, {
     headers: notionHeaders(token),
   });
   if (blocksResp.ok) {
     const blocksData = await blocksResp.json() as { results: Array<{ id: string }> };
-    // Delete old blocks
     for (const block of blocksData.results) {
       await fetch(`${NOTION_BASE}/blocks/${block.id}`, {
         method: 'DELETE',
