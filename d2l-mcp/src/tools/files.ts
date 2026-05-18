@@ -421,6 +421,60 @@ export async function readFile(filePath: string): Promise<{
   content: string | null;
   exists: boolean;
 }> {
+  // Check if this is a note ID (UUID) or S3 key — fetch from S3
+  const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(filePath);
+  const isS3Key = filePath.startsWith('users/') || filePath.startsWith('s3://');
+
+  if (isUUID || isS3Key) {
+    const { S3Client, GetObjectCommand } = await import('@aws-sdk/client-s3');
+    const s3Bucket = process.env.S3_BUCKET || 'study-mcp-notes';
+    const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
+
+    let s3Key = isS3Key ? filePath.replace('s3://', '').replace(`${s3Bucket}/`, '') : '';
+
+    // If UUID, look up the S3 key from the notes table
+    if (isUUID) {
+      const userId = getUserId();
+      const sbUrl = process.env.SUPABASE_URL;
+      const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+      if (sbUrl && sbKey) {
+        const resp = await fetch(`${sbUrl}/rest/v1/notes?id=eq.${filePath}&select=s3_key,title&limit=1`, {
+          headers: { 'apikey': sbKey, 'Authorization': `Bearer ${sbKey}` },
+        });
+        if (resp.ok) {
+          const rows = await resp.json() as Array<{ s3_key: string; title: string }>;
+          if (rows.length > 0 && rows[0].s3_key) {
+            s3Key = rows[0].s3_key;
+          } else {
+            throw new Error(`Note not found: ${filePath}`);
+          }
+        }
+      }
+    }
+
+    if (!s3Key) throw new Error(`Could not resolve S3 key for: ${filePath}`);
+
+    console.error(`[READ_FILE] Fetching from S3: ${s3Key}`);
+    const s3Resp = await s3.send(new GetObjectCommand({ Bucket: s3Bucket, Key: s3Key }));
+    const rawBytes = await s3Resp.Body?.transformToByteArray();
+    if (!rawBytes || rawBytes.length === 0) throw new Error(`Empty file in S3: ${s3Key}`);
+
+    const data = Buffer.from(rawBytes);
+    const filename = path.basename(s3Key);
+    const ext = path.extname(filename);
+    const contentType = s3Resp.ContentType || 'application/octet-stream';
+    const textContent = await extractContent(data, ext);
+
+    return {
+      path: `s3://${s3Bucket}/${s3Key}`,
+      filename,
+      size: data.length,
+      contentType,
+      content: textContent,
+      exists: true,
+    };
+  }
+
   const finalPath = resolveFilePath(filePath);
 
   // Read file

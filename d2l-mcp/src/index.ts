@@ -471,12 +471,12 @@ function createServer(): McpServer {
 
   server.tool(
     "read_file",
-    "Read a file from disk and extract its text content. Supports PDF, DOCX, TXT, MD, and other text-based formats. If you provide just a filename, it will search in the Downloads folder. You can also provide a full path. Use this to read files that were previously downloaded from D2L or any other files on your system.",
+    "Read a file and extract its text content. Supports PDF, DOCX, TXT, MD, and other formats. Accepts: a note ID (UUID from uploaded notes), an S3 key (users/.../file.pdf), a filename (searched in Downloads), or a full path. Use this to read uploaded PDFs/notes or downloaded D2L files.",
     {
       filePath: z
         .string()
         .describe(
-          "The file path or filename to read. Can be a full path (e.g., /Users/username/Downloads/file.pdf) or just a filename (e.g., file.pdf) which will be searched in Downloads folder."
+          "The file to read. Can be: a note ID (UUID), an S3 path (users/.../*.pdf), a filename (searched in Downloads), or a full filesystem path."
         ),
     },
     wrapToolHandler("read_file", async (args) => {
