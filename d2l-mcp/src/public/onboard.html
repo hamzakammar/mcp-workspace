@@ -608,6 +608,7 @@
       <!-- ── Connections ──────────────────────────────────────────── -->
       <div class="card-head" style="margin-bottom:10px">
         <h2 style="font-size:14px">Connections</h2>
+        <p style="font-size:11.5px;color:var(--muted);margin-top:2px">D2L is required. All other integrations are optional enhancements.</p>
       </div>
 
       <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:6px">
@@ -1196,8 +1197,7 @@
           d2.className = 'step-dot done'; d2.textContent = '✓';
           d3.className = 'step-dot done'; d3.textContent = '✓';
           setTimeout(() => {
-            document.getElementById('stepD2L').classList.add('hidden');
-            document.getElementById('stepPiazza').classList.remove('hidden');
+            showSuccess();
           }, 700);
         } else if (data.status === 'failed' || data.status === 'no_session') {
           clearInterval(pollInterval);
