@@ -1399,6 +1399,10 @@
           text.style.color = 'var(--success)';
           btn.textContent = 'Re-login';
           btn.style.display = '';
+          // Collapse any open VNC login UI
+          const box = document.getElementById('d2lReloginBox');
+          if (box) box.classList.add('hidden');
+          if (d2lReloginPoll) { clearInterval(d2lReloginPoll); d2lReloginPoll = null; }
         } else {
           dot.style.background = data.duoRequired ? 'var(--warn)' : 'var(--danger)';
           text.textContent = data.duoRequired ? 'Expired — click Re-login' : 'Not connected — click Connect to get started';
@@ -1445,6 +1449,12 @@
           text.textContent = 'Connected';
           text.style.color = 'var(--success)';
           btn.textContent = 'Reconnect';
+          // Collapse open connect UI
+          const box = document.getElementById('crowdmarkConnectBox');
+          if (box) box.classList.add('hidden');
+          const vncStep = document.getElementById('crowdmarkVncStep');
+          if (vncStep) vncStep.classList.add('hidden');
+          if (crowdmarkPollInterval) { clearInterval(crowdmarkPollInterval); crowdmarkPollInterval = null; }
         } else {
           dot.style.background = '#d4d4d4';
           text.textContent = 'Not connected';
@@ -1468,6 +1478,12 @@
           text.textContent = 'Connected';
           text.style.color = 'var(--success)';
           btn.textContent = 'Reconnect';
+          // Collapse any open connect UI
+          const box = document.getElementById('outlineConnectBox');
+          if (box) box.classList.add('hidden');
+          const vncStep = document.getElementById('outlineVncStep');
+          if (vncStep) vncStep.classList.add('hidden');
+          if (outlinePollInterval) { clearInterval(outlinePollInterval); outlinePollInterval = null; }
         } else {
           dot.style.background = '#d4d4d4';
           text.textContent = 'Not connected';
