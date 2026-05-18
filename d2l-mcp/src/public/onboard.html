@@ -1244,6 +1244,16 @@
       document.querySelector('.wrap').classList.add('wide');
       document.getElementById('mcpUrl').textContent = `${API}/mcp`;
 
+      // Ensure all connect boxes start collapsed on page load
+      ['outlineConnectBox','crowdmarkConnectBox','d2lReloginBox','notionConnectBox'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.add('hidden');
+      });
+      ['outlineVncStep','crowdmarkVncStep'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.add('hidden');
+      });
+
       loadNotes();
       loadConnectionStatus();
       ensureApiKey();
