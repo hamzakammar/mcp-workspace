@@ -25,3 +25,4 @@ Connect your D2L/Brightspace account and get a personal MCP server — giving an
 bash d2l-mcp/scripts/deploy-to-ecs.sh
 ```
 
+ 
