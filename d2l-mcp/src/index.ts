@@ -45,8 +45,24 @@ import { isDuoRequired } from "./auth.js";
 import apiRoutes from "./api/routes.js";
 import d2lAuthRoutes from "./api/d2lAuthRoutes.js";
 import publicAuthRoutes from "./api/publicAuthRoutes.js";
+import oauthRoutes from "./api/oauth/index.js";
 import { BrowserSessionManager } from "./browser/BrowserSessionManager.js";
 import { fileURLToPath } from "url";
+
+/**
+ * Redact credential-bearing headers before logging. Prevents access tokens,
+ * API keys, cookies, and D2L session data from ever reaching CloudWatch.
+ * Matches a fixed sensitive set plus a heuristic for anything that looks like
+ * an auth/token/secret/cookie/key header.
+ */
+const SENSITIVE_HEADER_RE = /(authorization|cookie|set-cookie|x-api-key|api-key|apikey|token|secret|password|session|proxy-authorization|x-supabase|x-new-refresh-token)/i;
+function redactHeaders(headers: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(headers || {})) {
+    out[k] = SENSITIVE_HEADER_RE.test(k) ? "[REDACTED]" : v;
+  }
+  return out;
+}
 
 // ---- Urgency surfacing cache (Task 6) ----
 // Caches upcoming-deadline check results per user+course for 15 minutes.
@@ -988,6 +1004,12 @@ async function main() {
       });
     });
 
+    // OAuth 2.1 authorization server (discovery, DCR, authorize, token, revoke).
+    // Public — these endpoints are how MCP clients discover and complete the
+    // OAuth flow. Mounted at root so the standard .well-known and endpoint paths
+    // resolve. This is a SECONDARY auth method; the API-key path is unchanged.
+    app.use("/", oauthRoutes);
+
     // Public auth routes (signup/signin for onboarding — no JWT required)
     app.use("/auth", publicAuthRoutes);
 
@@ -1062,7 +1084,7 @@ async function main() {
       console.error(`[MCP] Method: ${requestMethod}`);
       console.error(`[MCP] Request ID: ${requestId}`);
       console.error(`[MCP] Active sessions: ${Object.keys(transports).join(', ') || 'none'}`);
-      console.error(`[MCP] Headers:`, JSON.stringify(req.headers, null, 2));
+      console.error(`[MCP] Headers:`, JSON.stringify(redactHeaders(req.headers), null, 2));
       if (requestMethod === "tools/call") {
         console.error(
           `[MCP] Tool: ${requestParams.name || "unknown"}, Args:`,
