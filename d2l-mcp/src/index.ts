@@ -294,8 +294,29 @@ function createServer(): McpServer {
     });
   };
 
+  const READ_ONLY_ANNOTATIONS = { readOnlyHint: true } as const;
+  const MUTATING_ANNOTATIONS = { readOnlyHint: false } as const;
+
+  const registerReadTool = (
+    name: string,
+    description: string,
+    schema: z.ZodRawShape,
+    handler: (args: any) => Promise<any>
+  ) => {
+    server.tool(name, description, schema, READ_ONLY_ANNOTATIONS, handler);
+  };
+
+  const registerMutatingTool = (
+    name: string,
+    description: string,
+    schema: z.ZodRawShape,
+    handler: (args: any) => Promise<any>
+  ) => {
+    server.tool(name, description, schema, MUTATING_ANNOTATIONS, handler);
+  };
+
   // Register assignment tools
-  server.tool(
+  registerReadTool(
     "get_assignments",
     assignmentTools.get_assignments.description,
     { orgUnitId: assignmentTools.get_assignments.schema.orgUnitId },
@@ -306,7 +327,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerReadTool(
     "get_assignment",
     assignmentTools.get_assignment.description,
     {
@@ -320,7 +341,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerReadTool(
     "get_assignment_submissions",
     assignmentTools.get_assignment_submissions.description,
     {
@@ -336,7 +357,7 @@ function createServer(): McpServer {
   );
 
   // Register content tools
-  server.tool(
+  registerReadTool(
     "get_course_content",
     contentTools.get_course_content.description,
     { orgUnitId: contentTools.get_course_content.schema.orgUnitId },
@@ -347,7 +368,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerReadTool(
     "get_course_topic",
     contentTools.get_course_topic.description,
     {
@@ -361,7 +382,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerReadTool(
     "get_course_modules",
     contentTools.get_course_modules.description,
     { orgUnitId: contentTools.get_course_modules.schema.orgUnitId },
@@ -372,7 +393,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerReadTool(
     "get_course_module",
     contentTools.get_course_module.description,
     {
@@ -387,7 +408,7 @@ function createServer(): McpServer {
   );
 
   // Register grade tools
-  server.tool(
+  registerReadTool(
     "get_my_grades",
     gradeTools.get_my_grades.description,
     { orgUnitId: gradeTools.get_my_grades.schema.orgUnitId },
@@ -399,7 +420,7 @@ function createServer(): McpServer {
   );
 
   // Register calendar tools
-  server.tool(
+  registerReadTool(
     "get_upcoming_due_dates",
     calendarTools.get_upcoming_due_dates.description,
     {
@@ -415,7 +436,7 @@ function createServer(): McpServer {
   );
 
   // Register news tools
-  server.tool(
+  registerReadTool(
     "get_announcements",
     newsTools.get_announcements.description,
     {
@@ -430,7 +451,7 @@ function createServer(): McpServer {
   );
 
   // Register enrollment tools
-  server.tool(
+  registerReadTool(
     "get_my_courses",
     enrollmentTools.get_my_courses.description,
     {},
@@ -440,7 +461,7 @@ function createServer(): McpServer {
   );
 
   // Register file tools
-  server.tool(
+  registerMutatingTool(
     "download_file",
     "Download a file from D2L Brightspace. Provide a D2L content URL (e.g., https://learn.ul.ie/content/enforced/68929-CS4444.../file.docx or /content/enforced/...). The file will be saved to your Downloads folder by default, or to a custom path if specified. Returns the local file path, filename, size, and content type. Use this to download lecture slides, assignment files, course materials, or any file linked in course content.",
     {
@@ -469,7 +490,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerReadTool(
     "read_file",
     "Read a file and extract its text content. Supports PDF, DOCX, TXT, MD, and other formats. Accepts: a note ID (UUID from uploaded notes), an S3 key (users/.../file.pdf), a filename (searched in Downloads), or a full path. Use this to read uploaded PDFs/notes or downloaded D2L files.",
     {
@@ -494,7 +515,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerMutatingTool(
     "delete_file",
     "Delete a file from disk. Uses the same path resolution as read_file: you can pass a full path or just a filename (it will search your Downloads folder). Use this to clean up downloaded files after you are done reading them.",
     {
@@ -513,7 +534,7 @@ function createServer(): McpServer {
   // Register Piazza tools
   piazzaTools.forEach((tool) => {
     const schema = tool.inputSchema as z.ZodObject<any>;
-    server.tool(
+    registerReadTool(
       tool.name,
       tool.description,
       schema.shape,
@@ -522,42 +543,42 @@ function createServer(): McpServer {
   });
 
   // Register Planning tools (multi-user: userId injected from MCP_USER_ID)
-  server.tool(
+  registerReadTool(
     "tasks_list",
     PlanningTools.tasks_list.description,
     PlanningTools.tasks_list.schema,
     wrapStudyToolHandler("tasks_list", PlanningTools.tasks_list.handler)
   );
 
-  server.tool(
+  registerMutatingTool(
     "tasks_complete",
     PlanningTools.tasks_complete.description,
     PlanningTools.tasks_complete.schema,
     wrapStudyToolHandler("tasks_complete", PlanningTools.tasks_complete.handler)
   );
 
-  server.tool(
+  registerMutatingTool(
     "notes_sync",
     NotesTools.notes_sync.description,
     NotesTools.notes_sync.schema,
     wrapStudyToolHandler("notes_sync", NotesTools.notes_sync.handler)
   );
 
-  server.tool(
+  registerReadTool(
     "notes_search",
     NotesTools.notes_search.description,
     NotesTools.notes_search.schema,
     wrapStudyToolHandler("notes_search", NotesTools.notes_search.handler)
   );
 
-  server.tool(
+  registerReadTool(
     "notes_suggest_for_item",
     NotesTools.notes_suggest_for_item.description,
     NotesTools.notes_suggest_for_item.schema,
     wrapStudyToolHandler("notes_suggest_for_item", NotesTools.notes_suggest_for_item.handler)
   );
 
-  server.tool(
+  registerMutatingTool(
     "notes_embed_missing",
     NotesTools.notes_embed_missing.description,
     NotesTools.notes_embed_missing.schema,
@@ -565,7 +586,7 @@ function createServer(): McpServer {
   );
 
   // RAG semantic search over note_chunks (vector embeddings in note_chunks table)
-  server.tool(
+  registerReadTool(
     "semantic_search_notes",
     "Semantic (vector) search over your note chunks using AI embeddings. Returns the most relevant note passages for a given query, ranked by cosine similarity. Optionally filter by course ID.",
     {
@@ -597,21 +618,21 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerMutatingTool(
     "sync_all",
     SyncTools.sync_all.description,
     SyncTools.sync_all.schema,
     wrapStudyToolHandler("sync_all", SyncTools.sync_all.handler)
   );
 
-  server.tool(
+  registerReadTool(
     "plan_week",
     PlanningTools.plan_week.description,
     PlanningTools.plan_week.schema,
     wrapStudyToolHandler("plan_week", PlanningTools.plan_week.handler)
   );
 
-  server.tool(
+  registerMutatingTool(
     "tasks_add",
     PlanningTools.tasks_add.description,
     PlanningTools.tasks_add.schema,
@@ -619,28 +640,28 @@ function createServer(): McpServer {
   );
 
   // Register Piazza study tools (multi-user: userId injected from MCP_USER_ID)
-  server.tool(
+  registerMutatingTool(
     "piazza_sync",
     PiazzaTools.piazza_sync.description,
     PiazzaTools.piazza_sync.schema,
     wrapStudyToolHandler("piazza_sync", PiazzaTools.piazza_sync.handler)
   );
 
-  server.tool(
+  registerMutatingTool(
     "piazza_embed_missing",
     PiazzaTools.piazza_embed_missing.description,
     PiazzaTools.piazza_embed_missing.schema,
     wrapStudyToolHandler("piazza_embed_missing", PiazzaTools.piazza_embed_missing.handler)
   );
 
-  server.tool(
+  registerReadTool(
     "piazza_semantic_search",
     PiazzaTools.piazza_semantic_search.description,
     PiazzaTools.piazza_semantic_search.schema,
     wrapStudyToolHandler("piazza_semantic_search", PiazzaTools.piazza_semantic_search.handler)
   );
 
-  server.tool(
+  registerReadTool(
     "piazza_suggest_for_item",
     PiazzaTools.piazza_suggest_for_item.description,
     PiazzaTools.piazza_suggest_for_item.schema,
@@ -648,21 +669,21 @@ function createServer(): McpServer {
   );
 
   // Register outline tools (outline.uwaterloo.ca)
-  server.tool(
+  registerMutatingTool(
     "get_course_outline",
     OutlineTools.get_course_outline.description,
     OutlineTools.get_course_outline.schema,
     wrapStudyToolHandler("get_course_outline", OutlineTools.get_course_outline.handler)
   );
 
-  server.tool(
+  registerMutatingTool(
     "get_my_course_outlines",
     OutlineTools.get_my_course_outlines.description,
     OutlineTools.get_my_course_outlines.schema,
     wrapStudyToolHandler("get_my_course_outlines", OutlineTools.get_my_course_outlines.handler)
   );
 
-  server.tool(
+  registerReadTool(
     "get_cached_outline",
     OutlineTools.get_cached_outline.description,
     OutlineTools.get_cached_outline.schema,
@@ -670,7 +691,7 @@ function createServer(): McpServer {
   );
 
   // Register quiz tools (Task 2)
-  server.tool(
+  registerReadTool(
     "get_quizzes",
     quizTools.get_quizzes.description,
     { orgUnitId: quizTools.get_quizzes.schema.orgUnitId },
@@ -680,7 +701,7 @@ function createServer(): McpServer {
   );
 
   // Register rubric tool (Task 4)
-  server.tool(
+  registerReadTool(
     "get_assignment_rubric",
     rubricTools.get_assignment_rubric.description,
     {
@@ -695,7 +716,7 @@ function createServer(): McpServer {
   );
 
   // Register priority tool (Task 5)
-  server.tool(
+  registerReadTool(
     "what_should_i_work_on",
     priorityTools.what_should_i_work_on.description,
     {
@@ -709,7 +730,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerReadTool(
     "what_should_i_work_on_global",
     priorityGlobalTools.what_should_i_work_on_global.description,
     {
@@ -723,7 +744,7 @@ function createServer(): McpServer {
   );
 
   // Register discussion boards tool (Task 11)
-  server.tool(
+  registerReadTool(
     "get_discussion_boards",
     discussionTools.get_discussion_boards.description,
     { orgUnitId: discussionTools.get_discussion_boards.schema.orgUnitId },
@@ -733,7 +754,7 @@ function createServer(): McpServer {
   );
 
   // Register Crowdmark tools (Task 9)
-  server.tool(
+  registerReadTool(
     "get_crowdmark_assignments",
     crowdmarkTools.get_crowdmark_assignments.description,
     {},
@@ -742,7 +763,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerReadTool(
     "get_crowdmark_feedback",
     crowdmarkTools.get_crowdmark_feedback.description,
     { assignmentId: crowdmarkTools.get_crowdmark_feedback.schema.assignmentId },
@@ -752,7 +773,7 @@ function createServer(): McpServer {
   );
 
   // Register connect tools (optional integration setup via MCP)
-  server.tool(
+  registerMutatingTool(
     "connect_crowdmark",
     connectTools.connect_crowdmark.description,
     connectTools.connect_crowdmark.schema,
@@ -761,7 +782,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerMutatingTool(
     "connect_outline",
     connectTools.connect_outline.description,
     connectTools.connect_outline.schema,
@@ -770,7 +791,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerMutatingTool(
     "connect_piazza",
     connectTools.connect_piazza.description,
     connectTools.connect_piazza.schema,
@@ -779,7 +800,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerReadTool(
     "get_connection_guide",
     connectTools.get_connection_guide.description,
     connectTools.get_connection_guide.schema,
@@ -788,7 +809,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerMutatingTool(
     "connect_notion",
     connectTools.connect_notion.description,
     connectTools.connect_notion.schema,
@@ -797,7 +818,7 @@ function createServer(): McpServer {
     })
   );
 
-  server.tool(
+  registerMutatingTool(
     "sync_to_notion",
     notionTools.sync_to_notion.description,
     notionTools.sync_to_notion.schema,
@@ -807,7 +828,7 @@ function createServer(): McpServer {
   );
 
   // Register horizon status tool (Task 12)
-  server.tool(
+  registerReadTool(
     "get_horizon_status",
     statusTools.get_horizon_status.description,
     {},
@@ -817,7 +838,7 @@ function createServer(): McpServer {
   );
 
   // delete_my_data — wipe all user data traces from the system
-  server.tool(
+  registerMutatingTool(
     "delete_my_data",
     "Permanently delete all your stored data from Horizon. " +
       "This removes your D2L and Piazza credentials, session cookies, S3 browser state, and API key. " +
