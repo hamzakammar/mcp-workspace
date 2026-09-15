@@ -5,8 +5,9 @@
  */
 
 import { z } from 'zod';
-import { getUserId } from '../utils/userContext.js';
+import { getUserId, runWithUserId } from '../utils/userContext.js';
 import { client } from '../client.js';
+import { classifyDateEvent, DateType, Confidence } from '../utils/dateEvent.js';
 import { getNotionToken } from '../study/notionAuth.js';
 import { syncCourses, queryAllPages, type CourseData, type AssignmentInfo, type GradeInfo, type AnnouncementInfo } from '../study/notionClient.js';
 import { fetchCourseOutline, getCurrentTerm, type Assessment } from '../study/outlineClient.js';
@@ -43,10 +44,19 @@ interface RawNewsItem {
 
 interface RawCalendarEvent {
   Title: string;
+  Description?: string | null;
   EndDateTime?: string | null;
   StartDateTime?: string | null;
   CalendarEventViewUrl?: string;
   OrgUnitName?: string;
+  // The strongest classification signal: D2L links assessment calendar events to
+  // their originating tool (e.g. "…Dropbox", "…Quiz"). Purely-scheduled events
+  // (lectures/tutorials/office hours) have no assessment entity.
+  AssociatedEntity?: {
+    AssociatedEntityType?: string;
+    AssociatedEntityId?: number;
+    Link?: string;
+  } | null;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -55,10 +65,66 @@ const CONNECT_HINT =
   'Connect Notion via the Horizon dashboard (/onboard) — click "Connect" next to Notion, ' +
   'then authorise the integration and paste the database ID shown on the page.';
 
+/**
+ * Extract a stable course code (SUBJECT + NUMBER + optional single course-letter
+ * suffix) from a messy D2L code or org-unit name.
+ *
+ * D2L codes glue a section/term token onto the code with a delimiter, e.g.
+ * "1261_CS135_LEC001", "ECE222_W26", "PSYCH207_081_cel_1265", "CS 135 001". We must
+ * NOT let the leading letter of that token (LEC/LAB/W…) be mistaken for a course
+ * suffix, while still keeping genuine suffix variants distinct (PHYS121 != PHYS121L,
+ * CS241 != CS241E). So we split on delimiters into tokens first, rejoin a bare
+ * subject with its following number ("CS" + "135"), and take the first token shaped
+ * like a course code — its optional trailing letter is only ever the code's own,
+ * because the section/term token is a separate token.
+ */
 function normalizeCourseCodeExact(input: string): string | null {
-  const normalized = input.replace(/[\s_-]+/g, '').toUpperCase();
-  const match = normalized.match(/([A-Z]{2,6}\d{2,3}[A-Z]?)/);
-  return match ? match[1] : null;
+  if (!input) return null;
+  const rawTokens = input.toUpperCase().split(/[\s_-]+/).filter(Boolean);
+  const tokens: string[] = [];
+  for (let i = 0; i < rawTokens.length; i++) {
+    const t = rawTokens[i];
+    const next = rawTokens[i + 1];
+    // Rejoin a space/delimiter-separated subject and number ("CS" + "135" → "CS135").
+    if (/^[A-Z]{2,6}$/.test(t) && next && /^\d{2,3}[A-Z]?$/.test(next)) {
+      tokens.push(t + next);
+      i++;
+    } else {
+      tokens.push(t);
+    }
+  }
+  for (const t of tokens) {
+    const match = t.match(/^([A-Z]{2,6}\d{2,3}[A-Z]?)/);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/**
+ * Decide whether a D2L calendar event is a real assessment/deadline (INCLUDE) vs a
+ * scheduled meeting or generic course event (EXCLUDE). Reuses the repository's
+ * existing classification logic (classifyDateEvent) and prefers strong metadata
+ * (AssociatedEntityType) over fragile title keywords.
+ */
+function isAssessmentCalendarEvent(event: RawCalendarEvent): boolean {
+  const entityType = event.AssociatedEntity?.AssociatedEntityType || '';
+  // Strong metadata: a Dropbox (assignment) or Quiz association is authoritative.
+  if (/Dropbox|Assignment/i.test(entityType)) return true;
+  if (/Quiz/i.test(entityType)) return true;
+  // Otherwise fall back to title/description classification.
+  const { dateType, confidence } = classifyDateEvent(
+    event.Title || '',
+    event.Description || '',
+    entityType || null,
+  );
+  // Scheduled meetings (lecture/tutorial/lab/office hours/…) are never assessments.
+  if (dateType === DateType.LECTURE) return false;
+  // Deadlines and exams/quizzes are assessments when classified with real signal.
+  if (dateType === DateType.DUE || dateType === DateType.EXAM) {
+    return confidence !== Confidence.LOW;
+  }
+  // Anything else (UNKNOWN, opens/closes-only, feedback) is not ingested as work.
+  return false;
 }
 
 function parseCalendarEventDate(event: {
@@ -172,6 +238,9 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
       if (!event.Title) continue;
       const eventCode = normalizeCourseCodeExact(event.OrgUnitName || '');
       if (targetCode && eventCode && eventCode !== targetCode) continue;
+      // Only ingest assessment/deadline-like events — never lectures, tutorials,
+      // office hours, or bare lab/scheduled meetings.
+      if (!isAssessmentCalendarEvent(event)) continue;
       mergeAssignments(courseData.assignments, {
         name: event.Title.trim(),
         dueDate: parseCalendarEventDate(event),
@@ -504,6 +573,22 @@ async function syncUpcomingTasks(
  * Remove Notion pages for courses no longer enrolled.
  * Compares by extracting the short course code (e.g. PSYCH207) from both sides.
  */
+/**
+ * Build the set of "active" course identifiers used to decide which Notion pages
+ * are stale. Includes BOTH the normalized code and the raw uppercased code for each
+ * course so a stored page key matches whether it was written as the raw D2L code or
+ * a normalized one — preventing a live course's page from being wrongly archived.
+ */
+function buildActiveCodes(courses: CourseData[]): Set<string> {
+  const codes = new Set<string>();
+  for (const c of courses) {
+    const norm = normalizeCourseCodeExact(c.code) ?? normalizeCourseCodeExact(c.name);
+    if (norm) codes.add(norm);
+    if (c.code) codes.add(c.code.toUpperCase());
+  }
+  return codes;
+}
+
 async function cleanupStalePages(
   notionToken: string,
   databaseId: string,
@@ -516,7 +601,7 @@ async function cleanupStalePages(
       // Only check courseCode-only keys (not "code|title" compound keys)
       if (key.includes('|')) continue;
       const normalizedCode = normalizeCourseCodeExact(key) ?? key;
-      if (!activeCodes.has(normalizedCode) && !activeCodes.has(key)) {
+      if (!activeCodes.has(normalizedCode) && !activeCodes.has(key) && !activeCodes.has(key.toUpperCase())) {
         await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
           method: 'PATCH',
           headers: { 'Authorization': `Bearer ${notionToken}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' },
@@ -536,7 +621,11 @@ async function cleanupStalePages(
  * Throttled to max once per hour.
  */
 export async function backgroundNotionSync(userId: string): Promise<void> {
-  if (process.env.BACKGROUND_NOTION_SYNC_ENABLED === 'false') return;
+  // Fail CLOSED: background sync (which writes to a user's Notion) runs ONLY when
+  // explicitly enabled. An unset/empty/any-other value means DISABLED so a default
+  // or misconfigured deployment never performs background writes. Manual
+  // sync_to_notion is intentionally NOT gated by this and remains available.
+  if (process.env.BACKGROUND_NOTION_SYNC_ENABLED !== 'true') return;
   if (syncInProgress.has(userId)) return;
 
   // Throttle: skip if synced less than 1 hour ago
@@ -552,33 +641,37 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
     const databaseId = userDatabaseIds.get(userId);
     if (!databaseId) return;
 
-    // Fetch enrollments — only real academic courses
-    const enrollmentsRaw = (await client.getMyEnrollments()) as { Items: RawEnrollment[] };
-    const activeCourses = (enrollmentsRaw.Items || []).filter(isAcademicCourse);
+    // Bind the D2L identity to this userId for the whole sync so cross-user
+    // isolation cannot break if this is ever called outside a request's async
+    // context (the D2L `client` proxy resolves the user from AsyncLocalStorage).
+    await runWithUserId(userId, async () => {
+      // Fetch enrollments — only real academic courses
+      const enrollmentsRaw = (await client.getMyEnrollments()) as { Items: RawEnrollment[] };
+      const activeCourses = (enrollmentsRaw.Items || []).filter(isAcademicCourse);
 
-    // Fetch course data in parallel (faster)
-    const courses = await Promise.all(
-      activeCourses.map(e => fetchCourseData(e.OrgUnit.Id, e.OrgUnit.Name, e.OrgUnit.Code || ''))
-    );
+      // Fetch course data in parallel (faster)
+      const courses = await Promise.all(
+        activeCourses.map(e => fetchCourseData(e.OrgUnit.Id, e.OrgUnit.Name, e.OrgUnit.Code || ''))
+      );
 
-    // Enrich with outline data
-    await enrichWithOutline(courses, userId);
-    markOverdueAssignments(courses);
+      // Enrich with outline data
+      await enrichWithOutline(courses, userId);
+      markOverdueAssignments(courses);
 
-    // Sync course pages
-    await syncCourses(notionToken, databaseId, courses);
+      // Sync course pages
+      await syncCourses(notionToken, databaseId, courses);
 
-    // Sync "Due Soon" tasks
-    try {
-      await syncUpcomingTasks(notionToken, databaseId, courses);
-    } catch { /* skip */ }
+      // Sync "Due Soon" tasks
+      try {
+        await syncUpcomingTasks(notionToken, databaseId, courses);
+      } catch { /* skip */ }
 
-    // Cleanup stale pages
-    const activeCodes = new Set(courses.map(c => normalizeCourseCodeExact(c.code) ?? c.code));
-    await cleanupStalePages(notionToken, databaseId, activeCodes);
+      // Cleanup stale pages
+      await cleanupStalePages(notionToken, databaseId, buildActiveCodes(courses));
 
-    lastSyncTime.set(userId, Date.now());
-    console.error(`[NOTION] Background sync complete: ${courses.length} courses`);
+      lastSyncTime.set(userId, Date.now());
+      console.error(`[NOTION] Background sync complete: ${courses.length} courses`);
+    });
   } catch (e) {
     console.error(`[NOTION] Background sync error: ${e instanceof Error ? e.message : e}`);
   } finally {
@@ -655,8 +748,7 @@ export const notionTools = {
         } catch { /* skip */ }
 
         // 6. Cleanup stale pages
-        const activeCodes = new Set(courses.map(c => normalizeCourseCodeExact(c.code) ?? c.code));
-        const archived = await cleanupStalePages(notionToken, args.databaseId, activeCodes);
+        const archived = await cleanupStalePages(notionToken, args.databaseId, buildActiveCodes(courses));
 
         lastSyncTime.set(userId!, Date.now());
 

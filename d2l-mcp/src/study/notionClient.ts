@@ -292,27 +292,83 @@ function buildCourseBody(course: CourseData): unknown[] {
 
 const MANAGED_LIVE_SYNC_MARKER = '🔄 Horizon Live Sync (auto-managed)';
 
+// Exact section headings emitted by buildCourseBody. On pages created before the
+// managed-callout format, these were written as direct page children with no
+// marker; we recognise them to migrate a legacy page exactly once (see
+// updateCoursePage). Only Horizon's buildCourseBody ever produces these strings.
+const LEGACY_GENERATED_HEADINGS = new Set<string>([
+  '📋 Assignments',
+  '📊 Grades',
+  '📅 Weekly Schedule',
+  '📢 Recent Announcements',
+]);
+
+interface NotionBlock {
+  id: string;
+  type: string;
+  callout?: { rich_text: Array<{ plain_text?: string; text?: { content?: string } }> };
+  heading_2?: { rich_text: Array<{ plain_text?: string; text?: { content?: string } }> };
+  bulleted_list_item?: { rich_text: Array<{ plain_text: string }> };
+}
+
 function extractPlainTextFromRichText(richText: Array<{ plain_text?: string; text?: { content?: string } }>): string {
   return richText.map((t) => t.plain_text ?? t.text?.content ?? '').join('');
 }
 
-function parseAssignmentLine(text: string): AssignmentInfo | null {
-  const trimmed = text.trim();
-  const lineMatch = trimmed.match(/^[📤✅⬜⚠️]\s+(.+?)(?:\s+—\s+Due:|$|\s+\[)/);
-  if (!lineMatch) return null;
-  const status: AssignmentInfo['status'] = trimmed.startsWith('✅')
-    ? 'Graded'
-    : trimmed.startsWith('📤')
-      ? 'Submitted'
-      : trimmed.startsWith('⚠️')
-        ? 'Overdue'
-        : 'Not Started';
-  return {
-    name: lineMatch[1].trim(),
-    dueDate: null,
-    maxPoints: null,
-    status,
-  };
+/**
+ * Fetch ALL children of a block, following Notion pagination (page_size max 100).
+ * Without this, the managed callout — always appended LAST — is invisible on pages
+ * with >100 top-level blocks, so it would be re-appended every sync (unbounded
+ * duplication) and user statuses beyond block 100 would be missed.
+ */
+async function fetchAllChildren(token: string, blockId: string): Promise<NotionBlock[]> {
+  const all: NotionBlock[] = [];
+  let cursor: string | undefined;
+  do {
+    const url = `${NOTION_BASE}/blocks/${blockId}/children?page_size=100` +
+      (cursor ? `&start_cursor=${encodeURIComponent(cursor)}` : '');
+    const resp = await fetch(url, { headers: notionHeaders(token) });
+    if (!resp.ok) break;
+    const data = await resp.json() as { results?: NotionBlock[]; has_more?: boolean; next_cursor?: string | null };
+    all.push(...(data.results || []));
+    cursor = data.has_more ? (data.next_cursor || undefined) : undefined;
+  } while (cursor);
+  return all;
+}
+
+function isManagedCallout(block: NotionBlock): boolean {
+  return block.type === 'callout' &&
+    extractPlainTextFromRichText(block.callout?.rich_text || []).includes(MANAGED_LIVE_SYNC_MARKER);
+}
+
+/**
+ * Identify legacy auto-generated blocks to remove during the one-time migration of a
+ * pre-marker page. Deletes only our own recognizable generated section headings and
+ * the bullets/paragraphs that immediately follow them (up to the next block that is
+ * not part of a generated section). User-authored blocks are never included.
+ */
+function collectLegacyGeneratedBlockIds(blocks: NotionBlock[]): string[] {
+  const ids: string[] = [];
+  let inGeneratedSection = false;
+  for (const block of blocks) {
+    const headingText = block.type === 'heading_2'
+      ? extractPlainTextFromRichText(block.heading_2?.rich_text || []).trim()
+      : null;
+    if (headingText && LEGACY_GENERATED_HEADINGS.has(headingText)) {
+      inGeneratedSection = true;
+      ids.push(block.id);
+      continue;
+    }
+    if (inGeneratedSection) {
+      if (block.type === 'bulleted_list_item' || block.type === 'paragraph') {
+        ids.push(block.id);
+        continue;
+      }
+      // Any other block (incl. a non-generated heading) ends the generated run.
+      inGeneratedSection = false;
+    }
+  }
+  return ids;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -454,47 +510,29 @@ async function readUserStatuses(token: string, pageId: string): Promise<Map<stri
   const statuses = new Map<string, 'Submitted' | 'Graded'>();
   const capture = (text: string) => {
     if (text.startsWith('📤 ') || text.startsWith('✅ ')) {
-    const isSubmitted = text.startsWith('📤');
-    const nameMatch = text.match(/^[📤✅⬜⚠️]\s+(.+?)(?:\s+—\s+Due:|$|\s+\[)/);
-    if (nameMatch) {
-      statuses.set(nameMatch[1].trim().toLowerCase(), isSubmitted ? 'Submitted' : 'Graded');
-    }
+      const isSubmitted = text.startsWith('📤');
+      // The `u` flag is required: 📤 (U+1F4E4) is a surrogate pair, so without it
+      // the character class matches only a half-surrogate and the whole match fails,
+      // silently dropping every user-set "Submitted" status. ️? absorbs the
+      // optional variation selector on emoji like ⚠️.
+      const nameMatch = text.match(/^[📤✅⬜⚠️]️?\s+(.+?)(?:\s+—\s+Due:|$|\s+\[)/u);
+      if (nameMatch) {
+        statuses.set(nameMatch[1].trim().toLowerCase(), isSubmitted ? 'Submitted' : 'Graded');
+      }
     }
   };
   try {
-    const resp = await fetch(`${NOTION_BASE}/blocks/${pageId}/children?page_size=100`, {
-      headers: notionHeaders(token),
-    });
-    if (resp.ok) {
-      const data = await resp.json() as {
-        results: Array<{
-          id: string;
-          type: string;
-          callout?: { rich_text: Array<{ plain_text?: string; text?: { content?: string } }> };
-          bulleted_list_item?: { rich_text: Array<{ plain_text: string }> };
-        }>;
-      };
-      for (const block of data.results) {
-        if (block.type === 'bulleted_list_item') {
-          capture((block.bulleted_list_item?.rich_text || []).map(t => t.plain_text).join(''));
-          continue;
-        }
-        if (block.type === 'callout') {
-          const markerText = extractPlainTextFromRichText(block.callout?.rich_text || []);
-          if (markerText.includes(MANAGED_LIVE_SYNC_MARKER)) {
-            const managedResp = await fetch(`${NOTION_BASE}/blocks/${block.id}/children?page_size=100`, {
-              headers: notionHeaders(token),
-            });
-            if (managedResp.ok) {
-              const managedData = await managedResp.json() as {
-                results: Array<{ type: string; bulleted_list_item?: { rich_text: Array<{ plain_text: string }> } }>;
-              };
-              for (const child of managedData.results) {
-                if (child.type !== 'bulleted_list_item') continue;
-                capture((child.bulleted_list_item?.rich_text || []).map(t => t.plain_text).join(''));
-              }
-            }
-          }
+    const blocks = await fetchAllChildren(token, pageId);
+    for (const block of blocks) {
+      if (block.type === 'bulleted_list_item') {
+        capture((block.bulleted_list_item?.rich_text || []).map(t => t.plain_text).join(''));
+        continue;
+      }
+      if (isManagedCallout(block)) {
+        const children = await fetchAllChildren(token, block.id);
+        for (const child of children) {
+          if (child.type !== 'bulleted_list_item') continue;
+          capture((child.bulleted_list_item?.rich_text || []).map(t => t.plain_text).join(''));
         }
       }
     }
@@ -511,82 +549,35 @@ export async function updateCoursePage(
   pageId: string,
   course: CourseData,
 ): Promise<void> {
-  // Read user-set statuses BEFORE deleting blocks
+  // Read user-set statuses BEFORE any content changes and respect them.
   const userStatuses = await readUserStatuses(token, pageId);
-
-  // Apply user-set statuses to course data (don't overwrite user's manual changes)
   for (const a of course.assignments) {
     const userStatus = userStatuses.get(a.name.toLowerCase());
-    if (userStatus) {
-      // User manually marked it — respect their choice
-      a.status = userStatus;
-    }
+    if (userStatus) a.status = userStatus; // user manually marked it — keep it
   }
 
-  const existingAssignmentSnapshots: AssignmentInfo[] = [];
-  if (course.syncMetadata?.preserveExistingAssignments || (course.syncMetadata?.assignmentSourceFailures ?? 0) > 0) {
-    try {
-      const existingResp = await fetch(`${NOTION_BASE}/blocks/${pageId}/children?page_size=100`, {
-        headers: notionHeaders(token),
-      });
-      if (existingResp.ok) {
-        const existingData = await existingResp.json() as {
-          results: Array<{
-            id: string;
-            type: string;
-            callout?: { rich_text: Array<{ plain_text?: string; text?: { content?: string } }> };
-            bulleted_list_item?: { rich_text: Array<{ plain_text: string }> };
-          }>;
-        };
-        for (const block of existingData.results) {
-          if (block.type === 'bulleted_list_item') {
-            const parsed = parseAssignmentLine((block.bulleted_list_item?.rich_text || []).map(t => t.plain_text).join(''));
-            if (parsed) existingAssignmentSnapshots.push(parsed);
-            continue;
-          }
-          if (block.type === 'callout') {
-            const markerText = extractPlainTextFromRichText(block.callout?.rich_text || []);
-            if (!markerText.includes(MANAGED_LIVE_SYNC_MARKER)) continue;
-            const managedResp = await fetch(`${NOTION_BASE}/blocks/${block.id}/children?page_size=100`, {
-              headers: notionHeaders(token),
-            });
-            if (!managedResp.ok) continue;
-            const managedData = await managedResp.json() as {
-              results: Array<{ type: string; bulleted_list_item?: { rich_text: Array<{ plain_text: string }> } }>;
-            };
-            for (const child of managedData.results) {
-              if (child.type !== 'bulleted_list_item') continue;
-              const parsed = parseAssignmentLine((child.bulleted_list_item?.rich_text || []).map(t => t.plain_text).join(''));
-              if (parsed) existingAssignmentSnapshots.push(parsed);
-            }
-          }
-        }
-      }
-    } catch { /* best effort */ }
-  }
+  // Fail-safe preservation: if an assignment source returned EMPTY
+  // (preserveExistingAssignments) or a source FAILED (assignmentSourceFailures > 0),
+  // do NOT rewrite the managed body or assignment-derived properties. This
+  // guarantees a previously-synced record never loses its due date, status, URL,
+  // grade, or points because an upstream source was momentarily empty/unavailable.
+  // We deliberately distinguish a connector FAILURE / empty result from a real
+  // change: only a fully successful, non-empty fetch is allowed to rewrite content.
+  const failures = course.syncMetadata?.assignmentSourceFailures ?? 0;
+  const preserve = course.syncMetadata?.preserveExistingAssignments === true || failures > 0;
 
-  if (existingAssignmentSnapshots.length > 0) {
-    const existingByName = new Set(course.assignments.map(a => a.name.toLowerCase().trim()));
-    for (const existing of existingAssignmentSnapshots) {
-      const key = existing.name.toLowerCase().trim();
-      if (!existingByName.has(key)) {
-        course.assignments.push(existing);
-      }
-    }
-  }
-
-  // Update properties
   const properties = buildCourseProperties(course) as Record<string, unknown>;
-  if (course.syncMetadata?.preserveExistingAssignments) {
+  if (preserve) {
     delete properties['Assignments'];
     delete properties['Next Due'];
+    // Never blank a previously-good grade when the grade source was empty/failed.
+    if (course.grades.length === 0) delete properties['Grade'];
   }
+
   const resp = await fetch(`${NOTION_BASE}/pages/${pageId}`, {
     method: 'PATCH',
     headers: notionHeaders(token),
-    body: JSON.stringify({
-      properties,
-    }),
+    body: JSON.stringify({ properties }),
   });
 
   if (!resp.ok) {
@@ -594,34 +585,30 @@ export async function updateCoursePage(
     throw new Error(`Notion update page failed (${resp.status}): ${err.message ?? 'unknown error'}`);
   }
 
-  if (course.syncMetadata?.preserveExistingAssignments) {
-    return;
+  // Leave both managed and manual body blocks untouched when preserving.
+  if (preserve) return;
+
+  // Full-success path — replace ONLY Horizon-managed content, never manual blocks.
+  const children = await fetchAllChildren(token, pageId);
+  const managedCalloutIds = children.filter(isManagedCallout).map(b => b.id);
+
+  // If the page already uses the managed callout, replace exactly those callouts.
+  // Otherwise it is a LEGACY page: perform a one-time migration that removes our old
+  // unmarked generated sections (so they are not duplicated) while leaving every
+  // user-authored block in place. Idempotent: after the first migration the page has
+  // a managed callout, so subsequent syncs take the callout-replace branch.
+  const idsToDelete = managedCalloutIds.length > 0
+    ? managedCalloutIds
+    : collectLegacyGeneratedBlockIds(children);
+
+  for (const id of idsToDelete) {
+    await fetch(`${NOTION_BASE}/blocks/${id}`, {
+      method: 'DELETE',
+      headers: notionHeaders(token),
+    });
   }
 
-  // Delete existing managed live-sync blocks and replace with new content
-  const blocksResp = await fetch(`${NOTION_BASE}/blocks/${pageId}/children?page_size=100`, {
-    headers: notionHeaders(token),
-  });
-  if (blocksResp.ok) {
-    const blocksData = await blocksResp.json() as {
-      results: Array<{
-        id: string;
-        type: string;
-        callout?: { rich_text: Array<{ plain_text?: string; text?: { content?: string } }> };
-      }>;
-    };
-    for (const block of blocksData.results) {
-      if (block.type !== 'callout') continue;
-      const markerText = extractPlainTextFromRichText(block.callout?.rich_text || []);
-      if (!markerText.includes(MANAGED_LIVE_SYNC_MARKER)) continue;
-      await fetch(`${NOTION_BASE}/blocks/${block.id}`, {
-        method: 'DELETE',
-        headers: notionHeaders(token),
-      });
-    }
-  }
-
-  // Append fresh managed content
+  // Append fresh managed content inside a single marked callout.
   const newBlocks = [{
     object: 'block',
     type: 'callout',
@@ -632,13 +619,11 @@ export async function updateCoursePage(
     },
     children: buildCourseBody(course).slice(0, 99),
   }];
-  if (newBlocks.length > 0) {
-    await fetch(`${NOTION_BASE}/blocks/${pageId}/children`, {
-      method: 'PATCH',
-      headers: notionHeaders(token),
-      body: JSON.stringify({ children: newBlocks }),
-    });
-  }
+  await fetch(`${NOTION_BASE}/blocks/${pageId}/children`, {
+    method: 'PATCH',
+    headers: notionHeaders(token),
+    body: JSON.stringify({ children: newBlocks }),
+  });
 }
 
 /**

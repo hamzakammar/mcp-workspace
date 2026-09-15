@@ -214,4 +214,3 @@ All auth is handled by the Go gateway before requests reach the Node.js server. 
 ## License
 
 MIT
-

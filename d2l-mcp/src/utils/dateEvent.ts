@@ -41,6 +41,13 @@ const PATTERNS = {
       /\bno later than\b/i,
       /\bdue date\b/i,
       /\bsubmission deadline\b/i,
+      // Assessment deliverables — these are graded work, not scheduled meetings.
+      /\bassignment\b/i,
+      /\bhomework\b/i,
+      /\bproblem set\b/i,
+      /\bpset\b/i,
+      /\bproject\b/i,
+      /\bmilestone\b/i,
     ],
     medium: [
       /\bsubmit\b/i,
@@ -103,6 +110,15 @@ const PATTERNS = {
       /\blesson\b/i,
       /\bseminar\b/i,
       /\btutorial\b/i,
+      // Scheduled meetings that are NOT assessments. A graded lab deliverable is
+      // still included via stronger signals (Dropbox entity, or "assignment"/"due"
+      // in the title, which are checked before this category), so a bare "lab" here
+      // only excludes lab meetings that carry no assessment signal.
+      /\boffice hours?\b/i,
+      /\blab\b/i,
+      /\blaboratory\b/i,
+      /\brecitation\b/i,
+      /\bworkshop\b/i,
     ],
   },
 };
