@@ -292,17 +292,6 @@ function buildCourseBody(course: CourseData): unknown[] {
 
 const MANAGED_LIVE_SYNC_MARKER = '🔄 Horizon Live Sync (auto-managed)';
 
-// Exact section headings emitted by buildCourseBody. On pages created before the
-// managed-callout format, these were written as direct page children with no
-// marker; we recognise them to migrate a legacy page exactly once (see
-// updateCoursePage). Only Horizon's buildCourseBody ever produces these strings.
-const LEGACY_GENERATED_HEADINGS = new Set<string>([
-  '📋 Assignments',
-  '📊 Grades',
-  '📅 Weekly Schedule',
-  '📢 Recent Announcements',
-]);
-
 interface NotionBlock {
   id: string;
   type: string;
@@ -339,36 +328,6 @@ async function fetchAllChildren(token: string, blockId: string): Promise<NotionB
 function isManagedCallout(block: NotionBlock): boolean {
   return block.type === 'callout' &&
     extractPlainTextFromRichText(block.callout?.rich_text || []).includes(MANAGED_LIVE_SYNC_MARKER);
-}
-
-/**
- * Identify legacy auto-generated blocks to remove during the one-time migration of a
- * pre-marker page. Deletes only our own recognizable generated section headings and
- * the bullets/paragraphs that immediately follow them (up to the next block that is
- * not part of a generated section). User-authored blocks are never included.
- */
-function collectLegacyGeneratedBlockIds(blocks: NotionBlock[]): string[] {
-  const ids: string[] = [];
-  let inGeneratedSection = false;
-  for (const block of blocks) {
-    const headingText = block.type === 'heading_2'
-      ? extractPlainTextFromRichText(block.heading_2?.rich_text || []).trim()
-      : null;
-    if (headingText && LEGACY_GENERATED_HEADINGS.has(headingText)) {
-      inGeneratedSection = true;
-      ids.push(block.id);
-      continue;
-    }
-    if (inGeneratedSection) {
-      if (block.type === 'bulleted_list_item' || block.type === 'paragraph') {
-        ids.push(block.id);
-        continue;
-      }
-      // Any other block (incl. a non-generated heading) ends the generated run.
-      inGeneratedSection = false;
-    }
-  }
-  return ids;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -588,18 +547,26 @@ export async function updateCoursePage(
   // Leave both managed and manual body blocks untouched when preserving.
   if (preserve) return;
 
-  // Full-success path — replace ONLY Horizon-managed content, never manual blocks.
+  // Full-success path — replace ONLY blocks that are PROVABLY Horizon-managed
+  // (the marked callout), and never delete anything based on its position.
+  //
+  // We delete exactly the managed callout(s) — identified by the stable marker on
+  // the block itself — and re-append fresh managed content. We deliberately do NOT
+  // touch any other block.
+  //
+  // LEGACY PAGES (created before the managed-callout format) have their generated
+  // content as unmarked direct children. We cannot prove an individual bullet or
+  // paragraph is Horizon-generated rather than user-authored, and we must never
+  // remove an unmarked/manual block because of where it sits relative to a generated
+  // heading (a manual paragraph can live between two old sections). So on a legacy
+  // page we delete NOTHING and simply append the managed callout. This is fully
+  // non-destructive and idempotent (subsequent syncs replace only the callout).
+  //
+  // One-time cleanup path: the old unmarked sections remain until the user removes
+  // them once by hand (or an explicit, separately-reviewed migration is run). This
+  // is the documented, guessing-free alternative to risking user data.
   const children = await fetchAllChildren(token, pageId);
-  const managedCalloutIds = children.filter(isManagedCallout).map(b => b.id);
-
-  // If the page already uses the managed callout, replace exactly those callouts.
-  // Otherwise it is a LEGACY page: perform a one-time migration that removes our old
-  // unmarked generated sections (so they are not duplicated) while leaving every
-  // user-authored block in place. Idempotent: after the first migration the page has
-  // a managed callout, so subsequent syncs take the callout-replace branch.
-  const idsToDelete = managedCalloutIds.length > 0
-    ? managedCalloutIds
-    : collectLegacyGeneratedBlockIds(children);
+  const idsToDelete = children.filter(isManagedCallout).map(b => b.id);
 
   for (const id of idsToDelete) {
     await fetch(`${NOTION_BASE}/blocks/${id}`, {

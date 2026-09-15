@@ -673,13 +673,18 @@ describe('course-page safety updates', () => {
     expect(bulletText(a1).startsWith('📤')).toBe(true);
   });
 
-  it('migrates a legacy page once: removes unmarked generated sections, keeps manual blocks, no duplication', async () => {
+  it('never deletes ANY unmarked block on a legacy page — appends the managed callout only', async () => {
+    // A legacy page has generated sections as unmarked direct children, with a
+    // MANUAL paragraph placed BETWEEN two of them. Because no unmarked block can be
+    // proven Horizon-generated, migration must delete nothing (position must never
+    // decide deletion) and simply append the managed callout.
     const r = routedNotionFetch({
       pageId: 'page-1',
       pageChildren: [
-        { id: 'user-note', type: 'paragraph', paragraph: { rich_text: [{ plain_text: 'My own study notes' }] } },
         { id: 'h-assign', type: 'heading_2', heading_2: { rich_text: [{ plain_text: '📋 Assignments' }] } },
         { id: 'b-old', type: 'bulleted_list_item', bulleted_list_item: { rich_text: [{ plain_text: '⬜ Old A' }] } },
+        // Manual paragraph sitting between two recognized legacy generated sections.
+        { id: 'user-note', type: 'paragraph', paragraph: { rich_text: [{ plain_text: 'My own study notes' }] } },
         { id: 'h-grades', type: 'heading_2', heading_2: { rich_text: [{ plain_text: '📊 Grades' }] } },
         { id: 'b-grade', type: 'bulleted_list_item', bulleted_list_item: { rich_text: [{ plain_text: 'Midterm: 90/100' }] } },
       ],
@@ -687,12 +692,35 @@ describe('course-page safety updates', () => {
 
     await updateCoursePage(TOKEN, 'page-1', baseCourseData);
 
-    const deleted = r.deletedIds().sort();
-    // Only our recognizable generated blocks are removed…
-    expect(deleted).toEqual(['b-grade', 'b-old', 'h-assign', 'h-grades']);
-    // …the user's manual paragraph is preserved.
-    expect(deleted).not.toContain('user-note');
-    // Exactly one managed callout appended — legacy content is not duplicated.
+    // Non-destructive guarantee: nothing on a legacy page is deleted or modified.
+    expect(r.deletedIds()).toHaveLength(0);
+    // The manual paragraph between the two generated sections survives byte-for-byte:
+    // it is never the target of a DELETE or a block-update PATCH.
+    const touchedManual = r.calls.some((c) =>
+      c.url.includes('/blocks/user-note') && (c.method === 'DELETE' || c.method === 'PATCH'));
+    expect(touchedManual).toBe(false);
+    // Exactly one managed callout is appended (the documented one-time cleanup path
+    // leaves the old sections for the user to remove once, by hand).
+    expect(r.appendCalls()).toHaveLength(1);
+  });
+
+  it('replaces only the callout on an already-migrated page (no legacy duplication thereafter)', async () => {
+    // After the first sync a legacy page also has a managed callout; subsequent syncs
+    // replace only that callout and still never touch the leftover legacy blocks.
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [
+        { id: 'h-assign', type: 'heading_2', heading_2: { rich_text: [{ plain_text: '📋 Assignments' }] } },
+        { id: 'b-old', type: 'bulleted_list_item', bulleted_list_item: { rich_text: [{ plain_text: '⬜ Old A' }] } },
+        { id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } },
+      ],
+      childrenByBlockId: { mc: [] },
+    });
+
+    await updateCoursePage(TOKEN, 'page-1', baseCourseData);
+
+    expect(r.deletedIds()).toEqual(['mc']);
+    expect(r.deletedIds()).not.toContain('b-old');
     expect(r.appendCalls()).toHaveLength(1);
   });
 
