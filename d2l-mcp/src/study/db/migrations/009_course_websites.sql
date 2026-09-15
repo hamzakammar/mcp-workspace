@@ -23,7 +23,8 @@ create table if not exists public.course_website_snapshots (
   url text not null,                      -- exact fetched URL
   page_type text not null,               -- 'home'|'schedule'|'assignments'|'notes'|'tutorials'|'policies'|'announcements'|'reference'
   http_status int,                        -- null when the request never completed (timeout/DNS/SSRF)
-  fetch_outcome text not null,           -- see FetchOutcome taxonomy in fetcher.ts
+  fetch_outcome text not null,           -- FETCH result taxonomy (fetcher.ts): success/empty/http_error/auth_required/timeout/network_error/too_large/blocked
+  parse_status text not null default 'skipped', -- PARSE result, independent of fetch: 'ok' | 'failed' | 'skipped'
   content_hash text,                      -- sha256 of normalized content; null for non-content outcomes
   parser_version text not null,
   source_updated_at timestamptz,          -- from Last-Modified / page metadata when available
@@ -45,6 +46,25 @@ create index if not exists idx_cws_url on public.course_website_snapshots(url);
 create index if not exists idx_cws_fetched on public.course_website_snapshots(fetched_at);
 
 alter table public.course_website_snapshots disable row level security;
+
+-- APPEND-ONLY enforcement at the DATABASE layer.
+-- Horizon connects with the Supabase service role, which BYPASSES row-level
+-- security and table GRANTs — so RLS/REVOKE cannot make this table append-only for
+-- the app. A BEFORE UPDATE/DELETE trigger DOES apply to every role (including the
+-- service role) and is the strongest enforcement compatible with this architecture:
+-- any UPDATE or DELETE against course_website_snapshots raises an exception. Normal
+-- application paths only INSERT and SELECT snapshots.
+create or replace function public.course_website_snapshots_append_only()
+returns trigger as $$
+begin
+  raise exception 'course_website_snapshots is append-only: % is not permitted', tg_op;
+end;
+$$ language plpgsql;
+
+drop trigger if exists course_website_snapshots_no_mutation on public.course_website_snapshots;
+create trigger course_website_snapshots_no_mutation
+before update or delete on public.course_website_snapshots
+for each row execute function public.course_website_snapshots_append_only();
 
 -- ── Canonical normalized items with provenance ───────────────────────────────
 create table if not exists public.course_website_items (

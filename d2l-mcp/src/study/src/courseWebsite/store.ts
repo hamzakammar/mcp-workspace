@@ -134,6 +134,8 @@ export function shouldInsertSnapshot(latestHash: string | null, newHash: string 
 
 // ── DB layer ────────────────────────────────────────────────────────────────
 
+export type ParseStatus = "ok" | "failed" | "skipped";
+
 interface RecordSnapshotArgs {
   userId: string;
   source: CourseWebsiteSource;
@@ -141,22 +143,36 @@ interface RecordSnapshotArgs {
   fetch: FetchResult;
   extracted: unknown | null;
   parseError: string | null;
+  /** PARSE result, independent of the fetch outcome. Defaults to 'skipped'. */
+  parseStatus?: ParseStatus;
 }
 
-/** Append a snapshot row (deduping unchanged content). Returns the snapshot id used. */
+/**
+ * Append a snapshot row (deduping unchanged content within the SAME
+ * user+course+term+url scope). Throws on a DB write failure so callers can
+ * surface persistence errors (never silently swallow).
+ */
 export async function recordSnapshot(args: RecordSnapshotArgs): Promise<{ snapshotId: string | null; deduped: boolean; hash: string | null }> {
   const { userId, source, pageType, fetch: f } = args;
+  const parseStatus: ParseStatus = args.parseStatus ?? "skipped";
   const hash = isContentOutcome(f.outcome) && f.body ? contentHash(f.body) : null;
 
-  // Look up the newest snapshot for this exact URL to dedup unchanged content.
-  const { data: latest } = await supabase
+  // Dedup lookup is scoped to (user, course, term, final URL) so an identical URL
+  // fetched under a different course or term NEVER dedups against or references
+  // another course/term's snapshot.
+  const { data: latest, error: latestErr } = await supabase
     .from("course_website_snapshots")
     .select("id, content_hash")
     .eq("user_id", userId)
+    .eq("course_code", source.courseCode)
+    .eq("term", source.term)
     .eq("url", f.finalUrl)
     .order("fetched_at", { ascending: false })
     .limit(1)
     .maybeSingle();
+  if (latestErr) {
+    throw new Error(`snapshot lookup failed for ${f.finalUrl}: ${latestErr.message}`);
+  }
 
   const latestHash: string | null = (latest as { content_hash?: string | null } | null)?.content_hash ?? null;
 
@@ -172,6 +188,7 @@ export async function recordSnapshot(args: RecordSnapshotArgs): Promise<{ snapsh
     page_type: pageType,
     http_status: f.httpStatus,
     fetch_outcome: f.outcome,
+    parse_status: parseStatus,
     content_hash: hash,
     parser_version: PARSER_VERSION,
     source_updated_at: f.sourceUpdatedAt,
@@ -186,8 +203,7 @@ export async function recordSnapshot(args: RecordSnapshotArgs): Promise<{ snapsh
     .select("id")
     .maybeSingle();
   if (error) {
-    console.error(`[COURSE_WEB] snapshot insert failed for ${f.finalUrl}: ${error.message}`);
-    return { snapshotId: null, deduped: false, hash };
+    throw new Error(`snapshot insert failed for ${f.finalUrl}: ${error.message}`);
   }
   return { snapshotId: (data as { id?: string } | null)?.id ?? null, deduped: false, hash };
 }
@@ -201,13 +217,16 @@ export async function upsertCanonicalItems(items: CanonicalItem[], snapshotId: s
   let written = 0;
   const nowIso = new Date().toISOString();
   for (const it of items) {
-    const { data: existing } = await supabase
+    const { data: existing, error: readErr } = await supabase
       .from("course_website_items")
       .select("id, due_at, conflicts, first_seen_at")
       .eq("user_id", it.userId)
       .eq("source", it.source)
       .eq("source_ref", it.sourceRef)
       .maybeSingle();
+    if (readErr) {
+      throw new Error(`item lookup failed (${it.sourceRef}): ${readErr.message}`);
+    }
 
     const ex = existing as { id?: string; due_at?: string | null; conflicts?: ConflictFlag[]; first_seen_at?: string } | null;
     const conflicts: ConflictFlag[] = [...(ex?.conflicts ?? []), ...it.conflicts];
@@ -238,8 +257,7 @@ export async function upsertCanonicalItems(items: CanonicalItem[], snapshotId: s
       .from("course_website_items")
       .upsert(row, { onConflict: "user_id,source,source_ref" });
     if (error) {
-      console.error(`[COURSE_WEB] item upsert failed (${it.sourceRef}): ${error.message}`);
-      continue;
+      throw new Error(`item upsert failed (${it.sourceRef}): ${error.message}`);
     }
     written++;
   }
@@ -268,7 +286,7 @@ export async function integrateIntoTasks(items: CanonicalItem[]): Promise<number
       updated_at: new Date().toISOString(),
     };
     const { error } = await supabase.from("tasks").upsert(row, { onConflict: "user_id,source,source_ref" });
-    if (error) { console.error(`[COURSE_WEB] task upsert failed (${it.sourceRef}): ${error.message}`); continue; }
+    if (error) { throw new Error(`task upsert failed (${it.sourceRef}): ${error.message}`); }
     written++;
   }
   return written;
@@ -283,20 +301,20 @@ export async function readCanonicalItems(userId: string, courseCode: string, ter
     .eq("course_code", courseCode)
     .eq("term", term)
     .order("due_at", { ascending: true });
-  if (error) { console.error(`[COURSE_WEB] read items failed: ${error.message}`); return []; }
+  if (error) { throw new Error(`read canonical items failed: ${error.message}`); }
   return data ?? [];
 }
 
 export async function readLatestSnapshots(userId: string, courseCode: string, term: string): Promise<unknown[]> {
   const { data, error } = await supabase
     .from("course_website_snapshots")
-    .select("url, page_type, fetch_outcome, http_status, content_hash, source_updated_at, fetched_at, error")
+    .select("url, page_type, fetch_outcome, parse_status, http_status, content_hash, source_updated_at, fetched_at, error")
     .eq("user_id", userId)
     .eq("course_code", courseCode)
     .eq("term", term)
     .order("fetched_at", { ascending: false })
     .limit(50);
-  if (error) { console.error(`[COURSE_WEB] read snapshots failed: ${error.message}`); return []; }
+  if (error) { throw new Error(`read snapshots failed: ${error.message}`); }
   return data ?? [];
 }
 

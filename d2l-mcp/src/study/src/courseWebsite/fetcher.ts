@@ -123,7 +123,28 @@ export function assertUrlAllowed(
   return u;
 }
 
-/** Resolve DNS and ensure NO resolved address is private/reserved (SSRF guard). */
+/**
+ * Resolve DNS and ensure NO resolved address is private/reserved (SSRF guard).
+ *
+ * DNS-REBINDING RESIDUAL RISK (documented, accepted):
+ * This pre-fetch check and the socket connection performed by global `fetch`
+ * (Node's built-in undici) resolve DNS SEPARATELY, so a TOCTOU rebind — where the
+ * name resolves to a public IP here but to a private IP at connect time — is not
+ * fully eliminated. Pinning the validated IP through the HTTP client would require
+ * a custom undici dispatcher; undici is not a dependency of this service and adding
+ * one is out of scope here, so we document the residual risk rather than pin.
+ *
+ * Why the residual risk is tightly constrained in this design:
+ *   1. Fixed HTTPS-only origin allowlist — every fetched/redirected URL must be one
+ *      of a small, static set of trusted course hosts (student.cs.uwaterloo.ca).
+ *   2. TLS certificate validation — a rebind to an attacker-controlled host would
+ *      have to present a valid certificate for the allowlisted hostname, which an
+ *      attacker cannot obtain; the TLS handshake fails otherwise.
+ *   3. This pre-connect check still rejects the common rebind targets (private /
+ *      loopback / link-local / reserved IPs) at resolve time.
+ * Together (1)+(2) mean a successful rebind to an internal service is not reachable
+ * over HTTPS under a trusted hostname, which is the property this connector relies on.
+ */
 async function assertHostResolvesPublic(host: string, lookupFn: LookupFn): Promise<void> {
   // A bare IP literal host is checked directly.
   if (net.isIP(host)) {

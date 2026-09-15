@@ -13,34 +13,56 @@ vi.mock("node:dns/promises", () => ({
   lookup: async () => [{ address: "142.150.1.1", family: 4 }],
 }));
 
-// Supabase is mocked with a small recording fake (configured per test).
+// Supabase is mocked with a small scope-aware recording fake (configured per test).
 const db = {
-  latestSnapshot: null as null | { id: string; content_hash: string | null },
   existingItem: null as null | { id: string; due_at: string | null; conflicts: unknown[]; first_seen_at: string },
   otherTasks: [] as Array<{ title: string; due_at: string | null; source: string }>,
   canonicalItems: [] as unknown[],
-  snapshots: [] as unknown[],
+  // Scope-aware so dedup lookups respect user+course+term+url.
+  snapshots: [] as Array<{ id: string; user_id: string; course_code: string; term: string; url: string; content_hash: string | null }>,
   recorded: [] as Array<{ table: string; op: string; row?: any; filters: Record<string, unknown> }>,
+  // Force a specific DB stage to fail (to exercise error propagation).
+  failOn: {} as { snapshotInsert?: boolean; itemUpsert?: boolean; taskUpsert?: boolean; snapshotLatest?: boolean; itemsRead?: boolean; snapshotsRead?: boolean },
+  seq: 0,
 };
 function resetDb() {
-  db.latestSnapshot = null; db.existingItem = null; db.otherTasks = [];
-  db.canonicalItems = []; db.snapshots = []; db.recorded = [];
+  db.existingItem = null; db.otherTasks = []; db.canonicalItems = [];
+  db.snapshots = []; db.recorded = []; db.failOn = {}; db.seq = 0;
 }
+const dbErr = (message: string) => ({ data: null, error: { message } });
 
 vi.mock("../../src/utils/supabase.js", () => {
   function makeQuery(table: string) {
     const state = { table, op: "select", row: undefined as any, filters: {} as Record<string, unknown> };
     const resolve = async () => {
       db.recorded.push({ table, op: state.op, row: state.row, filters: { ...state.filters } });
-      if (state.op === "insert") return { data: { id: "snap-new" }, error: null };
-      if (state.op === "upsert") return { data: null, error: null };
+      if (state.op === "insert") { // snapshots only
+        if (db.failOn.snapshotInsert) return dbErr("snapshot insert boom");
+        const id = `snap-${++db.seq}`;
+        db.snapshots.push({ id, user_id: state.row.user_id, course_code: state.row.course_code, term: state.row.term, url: state.row.url, content_hash: state.row.content_hash ?? null });
+        return { data: { id }, error: null };
+      }
+      if (state.op === "upsert") {
+        if (table === "course_website_items" && db.failOn.itemUpsert) return dbErr("item upsert boom");
+        if (table === "tasks" && db.failOn.taskUpsert) return dbErr("task upsert boom");
+        return { data: null, error: null };
+      }
       // selects
       if (table === "course_website_snapshots") {
-        if (state.filters.__latest) return { data: db.latestSnapshot, error: null };
+        if (state.filters.__latest) {
+          if (db.failOn.snapshotLatest) return dbErr("snapshot latest boom");
+          const matches = db.snapshots.filter((s) =>
+            s.user_id === state.filters.user_id && s.course_code === state.filters.course_code &&
+            s.term === state.filters.term && s.url === state.filters.url);
+          const latest = matches.length ? matches[matches.length - 1] : null;
+          return { data: latest ? { id: latest.id, content_hash: latest.content_hash } : null, error: null };
+        }
+        if (db.failOn.snapshotsRead) return dbErr("snapshots read boom");
         return { data: db.snapshots, error: null };
       }
       if (table === "course_website_items") {
         if (state.filters.source_ref !== undefined) return { data: db.existingItem, error: null };
+        if (db.failOn.itemsRead) return dbErr("items read boom");
         return { data: db.canonicalItems, error: null };
       }
       if (table === "tasks") return { data: db.otherTasks, error: null };
@@ -68,7 +90,7 @@ import { parsePage, extractDue } from "../../src/study/src/courseWebsite/parsers
 import { zonedWallTimeToUtcIso } from "../../src/study/src/courseWebsite/timezone.js";
 import {
   contentHash, shouldInsertSnapshot, buildCanonicalItems, flagCrossSourceConflicts,
-  isContentOutcome, sourceRefFor,
+  isContentOutcome, sourceRefFor, recordSnapshot,
 } from "../../src/study/src/courseWebsite/store.js";
 import { SE212_FALL_2026, CS241_FALL_2026, FALL_2026 } from "../../src/study/src/courseWebsite/sources.js";
 import { CourseWebsiteTools } from "../../src/study/src/courseWebsite/tools.js";
@@ -388,5 +410,124 @@ describe("secret + cookie redaction", () => {
     const snap = db.recorded.find((r) => r.table === "course_website_snapshots" && r.op === "insert");
     expect(snap!.row.payload).not.toMatch(/secret=abc/);
     expect(snap!.row.payload).toContain("[redacted]");
+  });
+});
+
+// ─── Snapshot dedup scoping (user + course + term + url) ─────────────────────
+
+describe("snapshot dedup is scoped per user+course+term+url", () => {
+  beforeEach(() => resetDb());
+  const URL = "https://student.cs.uwaterloo.ca/~x/page.html";
+  const mkFetch = (body) => ({ requestedUrl: URL, finalUrl: URL, outcome: "success", httpStatus: 200, contentType: "text/html", sourceUpdatedAt: null, body, error: null });
+
+  it("never dedups or references identical URLs across different courses or terms", async () => {
+    const body = "<p>identical content</p>";
+    // Same URL + identical content, but different course → must NOT dedup.
+    const r1 = await recordSnapshot({ userId: "u1", source: CS241_FALL_2026, pageType: "assignments", fetch: mkFetch(body), extracted: {}, parseError: null, parseStatus: "ok" });
+    expect(r1.deduped).toBe(false);
+    const r2 = await recordSnapshot({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch(body), extracted: {}, parseError: null, parseStatus: "ok" });
+    expect(r2.deduped).toBe(false);                 // different course → independent
+    expect(r2.snapshotId).not.toBe(r1.snapshotId);  // never references the other course's row
+
+    // Same URL + identical content, but different TERM → must NOT dedup.
+    const otherTerm = { ...CS241_FALL_2026, term: "1259" };
+    const r3 = await recordSnapshot({ userId: "u1", source: otherTerm, pageType: "assignments", fetch: mkFetch(body), extracted: {}, parseError: null, parseStatus: "ok" });
+    expect(r3.deduped).toBe(false);
+    expect(r3.snapshotId).not.toBe(r1.snapshotId);
+
+    // Different USER, same everything → independent.
+    const r4 = await recordSnapshot({ userId: "u2", source: CS241_FALL_2026, pageType: "assignments", fetch: mkFetch(body), extracted: {}, parseError: null, parseStatus: "ok" });
+    expect(r4.deduped).toBe(false);
+    expect(r4.snapshotId).not.toBe(r1.snapshotId);
+
+    // SAME scope + identical content → DOES dedup against its own prior snapshot.
+    const r5 = await recordSnapshot({ userId: "u1", source: CS241_FALL_2026, pageType: "assignments", fetch: mkFetch(body), extracted: {}, parseError: null, parseStatus: "ok" });
+    expect(r5.deduped).toBe(true);
+    expect(r5.snapshotId).toBe(r1.snapshotId);
+
+    // The dedup lookup was scoped by course_code, term, and url (not url alone).
+    const latestLookups = db.recorded.filter((r) => r.table === "course_website_snapshots" && r.filters.__latest);
+    expect(latestLookups.every((r) => "course_code" in r.filters && "term" in r.filters && "url" in r.filters && "user_id" in r.filters)).toBe(true);
+  });
+});
+
+// ─── parse_status distinguishes fetch success from parse success ─────────────
+
+describe("parse_status is persisted independently of fetch outcome", () => {
+  beforeEach(() => resetDb());
+  const mkFetch = () => ({ requestedUrl: "u", finalUrl: "https://student.cs.uwaterloo.ca/~x/p.html", outcome: "success", httpStatus: 200, contentType: "text/html", sourceUpdatedAt: null, body: "<p>x</p>", error: null });
+
+  it("stores parse_status=failed on a fetch-success/parse-failure snapshot", async () => {
+    await recordSnapshot({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch(), extracted: null, parseError: "parser_error: boom", parseStatus: "failed" });
+    const ins = db.recorded.find((r) => r.table === "course_website_snapshots" && r.op === "insert");
+    expect(ins.row.fetch_outcome).toBe("success");   // fetch succeeded…
+    expect(ins.row.parse_status).toBe("failed");      // …but parse failed (never "successful ingestion")
+    expect(ins.row.error).toMatch(/parser_error/);
+  });
+
+  it("stores parse_status=ok on a successful parse", async () => {
+    await recordSnapshot({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch(), extracted: {}, parseError: null, parseStatus: "ok" });
+    const ins = db.recorded.find((r) => r.table === "course_website_snapshots" && r.op === "insert");
+    expect(ins.row.parse_status).toBe("ok");
+  });
+});
+
+// ─── Persistence failures propagate (never silently swallowed) ───────────────
+
+describe("refresh_course_websites surfaces persistence failures", () => {
+  beforeEach(() => resetDb());
+  function stubAsn() {
+    vi.stubGlobal("fetch", vi.fn(async (url) =>
+      String(url).startsWith("https://student.cs.uwaterloo.ca/~se212/asn.html")
+        ? { status: 200, ok: true, headers: { get: (k) => (k.toLowerCase() === "content-type" ? "text/html" : null) }, body: null, text: async () => SE212_ASN_HTML }
+        : { status: 404, ok: false, headers: { get: () => null }, body: null, text: async () => "" }));
+  }
+
+  it("fails (success=false) and reports persistError when the snapshot insert fails", async () => {
+    stubAsn(); db.failOn.snapshotInsert = true;
+    const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
+    expect(out.success).toBe(false);
+    expect(out.persistErrors.length).toBeGreaterThan(0);
+    // No canonical items/tasks were written (snapshot failed first).
+    expect(db.recorded.some((r) => r.table === "course_website_items" && r.op === "upsert")).toBe(false);
+    expect(db.recorded.some((r) => r.table === "tasks" && r.op === "upsert")).toBe(false);
+    // The assignments page reports the failure, not success.
+    const asnPage = out.courses[0].pages.find((p) => p.pageType === "assignments");
+    expect(asnPage.ingested).toBe(false);
+    expect(asnPage.itemsIngested).toBe(0);
+    expect(asnPage.persistError).toBeTruthy();
+  });
+
+  it("fails when the canonical-item upsert fails and never claims itemsIngested", async () => {
+    stubAsn(); db.failOn.itemUpsert = true;
+    const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
+    expect(out.success).toBe(false);
+    expect(out.persistErrors.join(" ")).toMatch(/item upsert/);
+    const asnPage = out.courses[0].pages.find((p) => p.pageType === "assignments");
+    expect(asnPage.ingested).toBe(false);
+    expect(asnPage.itemsIngested).toBe(0);
+  });
+
+  it("fails when the task upsert fails", async () => {
+    stubAsn(); db.failOn.taskUpsert = true;
+    const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
+    expect(out.success).toBe(false);
+    expect(out.persistErrors.join(" ")).toMatch(/task upsert/);
+  });
+
+  it("surfaces a read failure in get_course_website_content", async () => {
+    vi.stubGlobal("fetch", vi.fn());
+    db.failOn.itemsRead = true;
+    const out = JSON.parse(await CourseWebsiteTools.get_course_website_content.handler({ courseCode: "CS241", userId: "u1" }));
+    expect(out.success).toBe(false);
+    expect(out.error).toMatch(/read/i);
+  });
+
+  it("reports accurate wording: internal state mutated, external fetch read-only", async () => {
+    stubAsn();
+    const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
+    expect(out.note).toMatch(/external website fetches are read-only/i);
+    expect(out.note).toMatch(/mutated Horizon's internal/i);
+    expect(out.note).not.toMatch(/^Read-only ingestion complete/);
   });
 });
