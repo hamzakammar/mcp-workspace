@@ -518,9 +518,60 @@ describe('sync_to_notion — cross-user isolation', () => {
   });
 });
 
-// ─── Stale-page cleanup safety (empty enrollment is non-authoritative) ─────────
+// ─── Stale-page + Due Soon reconciliation safety ───────────────────────────────
 
-describe('sync_to_notion — stale cleanup safety', () => {
+/**
+ * Stub global fetch against a small Notion model. The Due-Soon-filtered query and
+ * the unfiltered stale-page (queryAllPages) query can each be seeded with EXISTING
+ * rows so tests are non-vacuous, and archive PATCHes are recorded.
+ */
+function stubNotionFetch(opts: {
+  dueSoonRows?: string[];
+  allPagesRows?: Array<{ id: string; code: string; name: string }>;
+  archiveStatusById?: Record<string, number>;
+}) {
+  const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body });
+  const spy = vi.fn(async (url: string, init?: RequestInit) => {
+    const method = (init?.method || 'GET').toUpperCase();
+    const body = init?.body ? String(init.body) : '';
+    if (String(url).endsWith('/query') && method === 'POST') {
+      if (body.includes('Due Soon')) {
+        return ok({ results: (opts.dueSoonRows || []).map((id) => ({ id })), has_more: false });
+      }
+      return ok({
+        results: (opts.allPagesRows || []).map((r) => ({
+          id: r.id,
+          properties: {
+            Name: { title: [{ plain_text: r.name }] },
+            'Course Code': { rich_text: [{ plain_text: r.code }] },
+          },
+        })),
+        has_more: false,
+      });
+    }
+    // Archive PATCH — optionally forced to fail for a given page id.
+    if (method === 'PATCH' && body.includes('"archived":true')) {
+      const id = (String(url).match(/\/pages\/([^/?]+)$/) || [])[1];
+      const failStatus = id ? opts.archiveStatusById?.[id] : undefined;
+      if (failStatus) return { ok: false, status: failStatus, json: async () => ({ message: 'boom' }) };
+    }
+    return ok({});
+  });
+  vi.stubGlobal('fetch', spy);
+
+  const archivedIds = () => spy.mock.calls
+    .filter((c) => (String((c[1] as RequestInit)?.method || '').toUpperCase() === 'PATCH')
+      && String((c[1] as RequestInit)?.body || '').includes('"archived":true'))
+    .map((c) => (String(c[0]).match(/\/pages\/([^/?]+)$/) || [])[1])
+    .filter(Boolean) as string[];
+  const dueSoonQueried = () => spy.mock.calls.some((c) =>
+    String(c[0]).endsWith('/query') && String((c[1] as RequestInit)?.body || '').includes('Due Soon'));
+  const stalePageQueried = () => spy.mock.calls.some((c) =>
+    String(c[0]).endsWith('/query') && !String((c[1] as RequestInit)?.body || '').includes('Due Soon'));
+  return { spy, archivedIds, dueSoonQueried, stalePageQueried };
+}
+
+describe('sync_to_notion — cleanup + Due Soon reconciliation safety', () => {
   beforeEach(() => {
     tokenMock.mockResolvedValue('secret_test');
     dropboxMock.mockResolvedValue([]);
@@ -534,57 +585,94 @@ describe('sync_to_notion — stale cleanup safety', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
-  it('archives NOTHING when enrollment returns an empty (non-authoritative) result', async () => {
-    // Enrollment succeeds but is empty — must NOT be treated as "no courses" for
-    // destructive archival.
+  it('empty enrollment archives NOTHING — existing course pages AND Due Soon rows are preserved', async () => {
     enrollmentsMock.mockResolvedValue({ Items: [] } as any);
-
-    // Notion DB actually contains a course page. If cleanup ran with an empty active
-    // set it would archive this page — the bug we are guarding against. The Due-Soon
-    // task query (filtered) returns nothing so it archives nothing on its own.
-    const fetchSpy = vi.fn(async (url: string, init?: RequestInit) => {
-      const method = (init?.method || 'GET').toUpperCase();
-      const body = init?.body ? String(init.body) : '';
-      if (url.includes('/databases/') && url.endsWith('/query') && method === 'POST') {
-        if (body.includes('Due Soon')) {
-          return { ok: true, status: 200, json: async () => ({ results: [], has_more: false }) };
-        }
-        // Unfiltered queryAllPages (only reached if cleanup runs) → a live-looking page.
-        return {
-          ok: true, status: 200,
-          json: async () => ({
-            results: [{
-              id: 'existing-page',
-              properties: {
-                Name: { title: [{ plain_text: 'Old Course' }] },
-                'Course Code': { rich_text: [{ plain_text: 'OLD101' }] },
-              },
-            }],
-            has_more: false,
-          }),
-        };
-      }
-      return { ok: true, status: 200, json: async () => ({}) };
+    const s = stubNotionFetch({
+      dueSoonRows: ['duesoon-1'], // an existing reminder row is present…
+      allPagesRows: [{ id: 'course-page-1', code: 'OLD101', name: 'Old Course' }],
     });
-    vi.stubGlobal('fetch', fetchSpy);
 
     const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
     expect(result.success).toBe(true);
 
-    // No page was archived…
-    const archivedAny = fetchSpy.mock.calls.some((c) => {
-      const init = c[1] as RequestInit | undefined;
-      return (init?.method || '').toUpperCase() === 'PATCH' && String(init?.body || '').includes('"archived":true');
-    });
-    expect(archivedAny).toBe(false);
+    // …yet neither the reminder nor the course page is archived, and neither the
+    // Due Soon reconciliation nor the stale-page cleanup query is even issued.
+    expect(s.archivedIds()).toEqual([]);
+    expect(s.dueSoonQueried()).toBe(false);
+    expect(s.stalePageQueried()).toBe(false);
+  });
 
-    // …and the unfiltered stale-cleanup query was never even issued (cleanup skipped).
-    const ranStaleQuery = fetchSpy.mock.calls.some((c) => {
-      const init = c[1] as RequestInit | undefined;
-      return String(c[0]).endsWith('/query') && !String(init?.body || '').includes('Due Soon');
+  it('partial source failure archives NO existing Due Soon rows for the affected course', async () => {
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 123, Name: 'Intro to CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    // Dropbox fails → the course carries assignmentSourceFailures > 0 (non-authoritative).
+    dropboxMock.mockRejectedValue(new Error('dropbox unavailable'));
+    const s = stubNotionFetch({
+      dueSoonRows: ['duesoon-cs135'],                                  // existing reminder
+      allPagesRows: [{ id: 'cs135-page', code: 'CS135', name: 'Intro to CS' }], // still-active page
     });
-    expect(ranStaleQuery).toBe(false);
+
+    const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
+    expect(result.success).toBe(true);
+
+    // Due Soon reconciliation is skipped entirely → the existing reminder survives.
+    expect(s.dueSoonQueried()).toBe(false);
+    expect(s.archivedIds()).not.toContain('duesoon-cs135');
+    // (Stale-page cleanup may run since there is a verified active course, but the
+    // active CS135 page is not archived.)
+    expect(s.archivedIds()).not.toContain('cs135-page');
+  });
+
+  it('fully authoritative snapshot DOES archive genuinely stale Due Soon reminders', async () => {
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 123, Name: 'Intro to CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    // A real assignment (>=1, no failures) → no preservation metadata → authoritative.
+    dropboxMock.mockResolvedValue([{
+      Id: 11, Name: 'Assignment 1', DueDate: '2026-09-20T23:59:00Z', Assessment: { ScoreDenominator: 20 },
+    }] as any);
+    const s = stubNotionFetch({
+      dueSoonRows: ['duesoon-stale'], // a stale generated reminder to reconcile away
+      allPagesRows: [],               // cleanup finds no pages → archives nothing itself
+    });
+
+    const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
+    expect(result.success).toBe(true);
+
+    // The reconciliation ran and archived the stale reminder.
+    expect(s.dueSoonQueried()).toBe(true);
+    expect(s.archivedIds()).toContain('duesoon-stale');
+  });
+
+  it('surfaces a non-2xx Due Soon mutation without crashing the sync', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 123, Name: 'Intro to CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    dropboxMock.mockResolvedValue([{
+      Id: 11, Name: 'Assignment 1', DueDate: '2026-09-20T23:59:00Z', Assessment: { ScoreDenominator: 20 },
+    }] as any);
+    // Authoritative sync, but archiving the stale reminder fails with 500.
+    stubNotionFetch({ dueSoonRows: ['duesoon-stale'], archiveStatusById: { 'duesoon-stale': 500 } });
+
+    const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
+    // The overall sync still succeeds…
+    expect(result.success).toBe(true);
+    // …and the Due Soon failure is surfaced via a logged error.
+    const surfaced = errSpy.mock.calls.some((c) => String(c[0]).includes('Due Soon reconciliation failed'));
+    expect(surfaced).toBe(true);
   });
 });

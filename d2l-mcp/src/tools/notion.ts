@@ -500,6 +500,25 @@ function isAcademicCourse(enrollment: RawEnrollment): boolean {
  * Uses a "Type" property set to "📌 Due Soon" to distinguish from course pages.
  * Removes old "Due Soon" entries and re-creates current ones.
  */
+/**
+ * Whether the current sync is AUTHORITATIVE enough to run the destructive Due Soon
+ * reconciliation (which archives all existing generated reminders and rebuilds them
+ * from the in-memory assignment list).
+ *
+ * It is authoritative ONLY when enrollment returned at least one verified active
+ * academic course AND no course carries preservation metadata (an empty source or a
+ * partial source failure). On a non-authoritative sync we must NOT archive existing
+ * Due Soon rows, because rebuilding from a partial/empty snapshot would delete valid
+ * reminders that came from the failed/empty source.
+ */
+function isAuthoritativeForDueSoon(activeCourseCount: number, courses: CourseData[]): boolean {
+  if (activeCourseCount === 0) return false;
+  return !courses.some(c =>
+    c.syncMetadata?.preserveExistingAssignments === true ||
+    (c.syncMetadata?.assignmentSourceFailures ?? 0) > 0,
+  );
+}
+
 async function syncUpcomingTasks(
   notionToken: string,
   databaseId: string,
@@ -507,31 +526,37 @@ async function syncUpcomingTasks(
 ): Promise<number> {
   const headers = { 'Authorization': `Bearer ${notionToken}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' };
 
-  // First, ensure the database has a "Type" property
-  await fetch(`https://api.notion.com/v1/databases/${databaseId}`, {
+  // First, ensure the database has a "Type" property. Check the response.
+  const ensureResp = await fetch(`https://api.notion.com/v1/databases/${databaseId}`, {
     method: 'PATCH', headers,
     body: JSON.stringify({ properties: { 'Type': { select: {} } } }),
   });
+  if (!ensureResp.ok) {
+    throw new Error(`Notion ensure Due Soon "Type" property failed (${ensureResp.status})`);
+  }
 
-  // Remove existing "Due Soon" tagged pages
-  try {
-    const existingResp = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
-      method: 'POST', headers,
-      body: JSON.stringify({
-        filter: { property: 'Type', select: { equals: '📌 Due Soon' } },
-        page_size: 100,
-      }),
+  // Remove existing "Due Soon" tagged rows. Every mutation response is checked and
+  // surfaced — this reconciliation only runs on an authoritative sync (see caller).
+  const existingResp = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      filter: { property: 'Type', select: { equals: '📌 Due Soon' } },
+      page_size: 100,
+    }),
+  });
+  if (!existingResp.ok) {
+    throw new Error(`Notion Due Soon query failed (${existingResp.status})`);
+  }
+  const data = await existingResp.json() as { results: Array<{ id: string }> };
+  for (const page of data.results) {
+    const archiveResp = await fetch(`https://api.notion.com/v1/pages/${page.id}`, {
+      method: 'PATCH', headers,
+      body: JSON.stringify({ archived: true }),
     });
-    if (existingResp.ok) {
-      const data = await existingResp.json() as { results: Array<{ id: string }> };
-      for (const page of data.results) {
-        await fetch(`https://api.notion.com/v1/pages/${page.id}`, {
-          method: 'PATCH', headers,
-          body: JSON.stringify({ archived: true }),
-        });
-      }
+    if (!archiveResp.ok) {
+      throw new Error(`Notion archive Due Soon row ${page.id} failed (${archiveResp.status})`);
     }
-  } catch { /* continue */ }
+  }
 
   // Collect upcoming tasks (next 10 days)
   const now = new Date();
@@ -545,23 +570,24 @@ async function syncUpcomingTasks(
       const due = new Date(a.dueDate);
       if (due < now || due > tenDays) continue;
 
-      try {
-        await fetch('https://api.notion.com/v1/pages', {
-          method: 'POST', headers,
-          body: JSON.stringify({
-            parent: { database_id: databaseId },
-            properties: {
-              'Name': { title: [{ text: { content: `${a.name} (${courseName})` } }] },
-              'Course Code': { rich_text: [{ text: { content: course.code } }] },
-              'Status': { select: { name: a.status === 'Submitted' ? 'Active' : 'Active' } },
-              'Next Due': { date: { start: a.dueDate } },
-              'Grade': { rich_text: [{ text: { content: a.grade || '' } }] },
-              'Type': { select: { name: '📌 Due Soon' } },
-            },
-          }),
-        });
-        created++;
-      } catch { /* skip */ }
+      const createResp = await fetch('https://api.notion.com/v1/pages', {
+        method: 'POST', headers,
+        body: JSON.stringify({
+          parent: { database_id: databaseId },
+          properties: {
+            'Name': { title: [{ text: { content: `${a.name} (${courseName})` } }] },
+            'Course Code': { rich_text: [{ text: { content: course.code } }] },
+            'Status': { select: { name: a.status === 'Submitted' ? 'Active' : 'Active' } },
+            'Next Due': { date: { start: a.dueDate } },
+            'Grade': { rich_text: [{ text: { content: a.grade || '' } }] },
+            'Type': { select: { name: '📌 Due Soon' } },
+          },
+        }),
+      });
+      if (!createResp.ok) {
+        throw new Error(`Notion create Due Soon row for "${a.name}" failed (${createResp.status})`);
+      }
+      created++;
     }
   }
 
@@ -661,10 +687,20 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
       // Sync course pages
       await syncCourses(notionToken, databaseId, courses);
 
-      // Sync "Due Soon" tasks
-      try {
-        await syncUpcomingTasks(notionToken, databaseId, courses);
-      } catch { /* skip */ }
+      // Reconcile "Due Soon" reminder rows — but ONLY on an authoritative sync.
+      // Due Soon reconciliation is destructive (it archives existing generated rows
+      // and rebuilds from the in-memory list). On an empty/non-authoritative
+      // enrollment or any course with preservation metadata (empty/failed source),
+      // we skip it entirely so valid existing reminders are never archived.
+      if (isAuthoritativeForDueSoon(activeCourses.length, courses)) {
+        try {
+          await syncUpcomingTasks(notionToken, databaseId, courses);
+        } catch (e) {
+          console.error(`[NOTION] Due Soon reconciliation failed (preserved existing rows): ${e instanceof Error ? e.message : e}`);
+        }
+      } else {
+        console.error('[NOTION] Skipping Due Soon reconciliation: non-authoritative/partial sync — existing reminders preserved.');
+      }
 
       // Cleanup stale pages — but ONLY when we have a verified, non-empty active
       // course list. A successful-but-empty getMyEnrollments() is NOT authoritative
@@ -748,11 +784,20 @@ export const notionTools = {
       try {
         const result = await syncCourses(notionToken, args.databaseId, courses);
 
-        // 5. Sync "Due Soon" tasks as rows in the same database
+        // 5. Reconcile "Due Soon" reminder rows — only on an authoritative sync.
+        // Destructive reconciliation is skipped on empty/non-authoritative
+        // enrollment or any course with preservation metadata, so valid existing
+        // reminders are never archived from a partial/empty snapshot.
         let upcomingCount = 0;
-        try {
-          upcomingCount = await syncUpcomingTasks(notionToken, args.databaseId, courses);
-        } catch { /* skip */ }
+        if (isAuthoritativeForDueSoon(activeCourses.length, courses)) {
+          try {
+            upcomingCount = await syncUpcomingTasks(notionToken, args.databaseId, courses);
+          } catch (e) {
+            console.error(`[NOTION] Due Soon reconciliation failed (preserved existing rows): ${e instanceof Error ? e.message : e}`);
+          }
+        } else {
+          console.error('[NOTION] Skipping Due Soon reconciliation: non-authoritative/partial sync — existing reminders preserved.');
+        }
 
         // 6. Cleanup stale pages — skip when there are no verified active courses.
         // An empty enrollment snapshot is not authoritative for destructive archival
