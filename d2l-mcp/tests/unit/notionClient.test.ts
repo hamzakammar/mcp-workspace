@@ -25,9 +25,12 @@ vi.mock('../../src/utils/supabase.js', () => ({
 import {
   validateNotionToken,
   queryAllPages,
+  createCoursePage,
+  updateCoursePage,
   createAssignmentPage,
   updateAssignmentPage,
   syncAssignments,
+  type CourseData,
   type NotionAssignment,
 } from '../../src/study/notionClient.js';
 
@@ -61,6 +64,21 @@ afterEach(() => {
 
 const TOKEN = 'secret_test_token_abc123';
 const DB_ID = 'db-1234-5678';
+
+const baseCourseData: CourseData = {
+  orgUnitId: 1,
+  name: 'Intro to CS',
+  code: 'CS135',
+  isActive: true,
+  assignments: [{
+    name: 'Assignment 1',
+    dueDate: '2026-03-15T23:59:00Z',
+    maxPoints: 20,
+    status: 'Not Started',
+  }],
+  grades: [],
+  announcements: [],
+};
 
 // ─── validateNotionToken ───────────────────────────────────────────────────────
 
@@ -476,5 +494,354 @@ describe('syncAssignments', () => {
       { delayMs: 0 },
     );
     expect(result.created).toBe(2);
+  });
+});
+
+const MARKER = '🔄 Horizon Live Sync (auto-managed)';
+
+/** okJson — a fetch-Response-like object for a 200 JSON body. */
+function okJson(body: unknown) {
+  return { status: 200, ok: true, json: async () => body };
+}
+
+/** errJson — a fetch-Response-like object for a non-2xx JSON error. */
+function errJson(status: number, message = 'boom') {
+  return { status, ok: false, json: async () => ({ message }) };
+}
+
+/**
+ * Route Notion fetch calls by URL + method against a simple in-memory page model,
+ * recording every call so tests can assert on deletes/appends/patches. Supports
+ * paginated block-children reads and optional forced failures for specific
+ * mutations (append and per-id delete) to exercise failure paths.
+ */
+function routedNotionFetch(opts: {
+  pageId: string;
+  pageChildren: unknown[];
+  childrenByBlockId?: Record<string, unknown[]>;
+  // Optional pagination for the page's own children: pages after the first.
+  pageChildrenPages?: Array<{ results: unknown[]; nextCursor: string | null }>;
+  // Force failures: non-2xx status for the append PATCH and/or specific DELETEs.
+  failAppendStatus?: number;
+  failDeleteStatusById?: Record<string, number>;
+}) {
+  const calls: Array<{ url: string; method: string; body: any }> = [];
+  const spy = vi.fn(async (url: string, init?: RequestInit) => {
+    const method = (init?.method || 'GET').toUpperCase();
+    const body = init?.body ? JSON.parse(init.body as string) : undefined;
+    calls.push({ url, method, body });
+
+    const childMatch = url.match(/\/blocks\/([^/?]+)\/children/);
+    if (method === 'GET' && childMatch) {
+      const blockId = childMatch[1];
+      if (blockId === opts.pageId) {
+        // Paginated page children.
+        if (opts.pageChildrenPages) {
+          const cursorMatch = url.match(/[?&]start_cursor=([^&]+)/);
+          const cursor = cursorMatch ? decodeURIComponent(cursorMatch[1]) : null;
+          if (cursor === null) {
+            const p = opts.pageChildrenPages[0];
+            return okJson({ results: p.results, has_more: p.nextCursor !== null, next_cursor: p.nextCursor });
+          }
+          const idx = opts.pageChildrenPages.findIndex((_p, i) => opts.pageChildrenPages![i - 1]?.nextCursor === cursor);
+          const p = opts.pageChildrenPages[idx];
+          return okJson({ results: p.results, has_more: p.nextCursor !== null, next_cursor: p.nextCursor });
+        }
+        return okJson({ results: opts.pageChildren, has_more: false, next_cursor: null });
+      }
+      return okJson({ results: opts.childrenByBlockId?.[blockId] || [], has_more: false, next_cursor: null });
+    }
+
+    // Append (PATCH block children) — optionally forced to fail.
+    if (method === 'PATCH' && childMatch && childMatch[1] === opts.pageId && opts.failAppendStatus) {
+      return errJson(opts.failAppendStatus);
+    }
+    // DELETE a specific block — optionally forced to fail.
+    if (method === 'DELETE') {
+      const idMatch = url.match(/\/blocks\/([^/?]+)$/);
+      const id = idMatch?.[1];
+      const failStatus = id ? opts.failDeleteStatusById?.[id] : undefined;
+      if (failStatus) return errJson(failStatus);
+    }
+    // PATCH properties, successful append/delete, POST create → 200 {}.
+    return okJson({});
+  });
+  vi.stubGlobal('fetch', spy);
+
+  const deletedIds = () => calls
+    .filter((c) => c.method === 'DELETE')
+    .map((c) => (c.url.match(/\/blocks\/([^/?]+)$/) || [])[1])
+    .filter(Boolean) as string[];
+  const appendCalls = () => calls.filter((c) =>
+    c.method === 'PATCH' && c.url.includes(`/blocks/${opts.pageId}/children`));
+  const propsPatch = () => calls.find((c) =>
+    c.method === 'PATCH' && c.url.includes(`/pages/${opts.pageId}`));
+  return { spy, calls, deletedIds, appendCalls, propsPatch };
+}
+
+/** Flatten the rich_text of a bullet block into a plain string. */
+function bulletText(block: any): string {
+  return (block?.bulleted_list_item?.rich_text || [])
+    .map((t: any) => t?.text?.content ?? t?.plain_text ?? '')
+    .join('');
+}
+
+describe('course-page safety updates', () => {
+  it('creates course pages with a managed live-sync callout section', async () => {
+    const { spy } = routedNotionFetch({ pageId: 'db', pageChildren: [] });
+
+    await createCoursePage(TOKEN, DB_ID, baseCourseData);
+
+    const body = JSON.parse((spy.mock.calls[0] as [string, RequestInit])[1].body as string);
+    expect(body.children[0].type).toBe('callout');
+    expect(body.children[0].callout.rich_text[0].text.content).toMatch(/live sync/i);
+  });
+
+  it('replaces only the managed callout and never deletes manual blocks', async () => {
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [
+        { id: 'manual-block', type: 'paragraph', paragraph: { rich_text: [{ plain_text: 'Manual notes' }] } },
+        { id: 'managed-callout', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } },
+      ],
+      childrenByBlockId: { 'managed-callout': [] },
+    });
+
+    await updateCoursePage(TOKEN, 'page-1', baseCourseData);
+
+    const deleted = r.deletedIds();
+    expect(deleted).toEqual(['managed-callout']);
+    expect(deleted.some((id) => id.includes('manual-block'))).toBe(false);
+    // Exactly one fresh managed callout is appended.
+    expect(r.appendCalls()).toHaveLength(1);
+  });
+
+  it('skips body replacement AND assignment-property resets when all sources are empty', async () => {
+    const preserveCourse: CourseData = {
+      ...baseCourseData,
+      assignments: [],
+      grades: [],
+      syncMetadata: { preserveExistingAssignments: true },
+    };
+    const r = routedNotionFetch({ pageId: 'page-1', pageChildren: [] });
+
+    await updateCoursePage(TOKEN, 'page-1', preserveCourse);
+
+    expect(r.deletedIds()).toHaveLength(0);
+    expect(r.appendCalls()).toHaveLength(0);
+    // Properties patch must NOT overwrite assignment-derived fields (or blank Grade).
+    const props = r.propsPatch()?.body?.properties ?? {};
+    expect(props).not.toHaveProperty('Assignments');
+    expect(props).not.toHaveProperty('Next Due');
+    expect(props).not.toHaveProperty('Grade');
+  });
+
+  it('preserves existing assignment bullets (with due date, link, status) verbatim on partial source failure', async () => {
+    // A live sync yielded one assignment, but a source FAILED — the previously-synced
+    // '⬜ Homework 9 — Due: Apr 1' (with a link) must NOT be rewritten/degraded.
+    const partialCourse: CourseData = {
+      ...baseCourseData,
+      assignments: [{ name: 'Assignment 1', dueDate: '2026-03-15T23:59:00Z', maxPoints: 20, status: 'Not Started' }],
+      grades: [],
+      syncMetadata: { assignmentSourceFailures: 1 },
+    };
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [{ id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } }],
+      childrenByBlockId: {
+        mc: [{
+          type: 'bulleted_list_item',
+          bulleted_list_item: { rich_text: [{ plain_text: '⬜ Homework 9 — Due: Apr 1, 11:59 PM' }] },
+        }],
+      },
+    });
+
+    await updateCoursePage(TOKEN, 'page-1', partialCourse);
+
+    // Body is left completely untouched → no field can be lost.
+    expect(r.deletedIds()).toHaveLength(0);
+    expect(r.appendCalls()).toHaveLength(0);
+    const props = r.propsPatch()?.body?.properties ?? {};
+    expect(props).not.toHaveProperty('Assignments');
+    expect(props).not.toHaveProperty('Next Due');
+  });
+
+  it('respects a user-set 📤 Submitted status on re-render (Unicode-aware status parsing)', async () => {
+    const course: CourseData = {
+      ...baseCourseData,
+      assignments: [{ name: 'Assignment 1', dueDate: '2026-03-15T23:59:00Z', maxPoints: 20, status: 'Not Started' }],
+    };
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [{ id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } }],
+      childrenByBlockId: {
+        // User manually flipped the emoji to 📤 (Submitted). 📤 is a surrogate pair,
+        // so this only survives if the status regex uses the `u` flag.
+        mc: [{
+          type: 'bulleted_list_item',
+          bulleted_list_item: { rich_text: [{ plain_text: '📤 Assignment 1 — Due: Mar 15, 11:59 PM' }] },
+        }],
+      },
+    });
+
+    await updateCoursePage(TOKEN, 'page-1', course);
+
+    const appended = r.appendCalls()[0]?.body?.children?.[0];
+    const bullets: any[] = (appended?.children || []).filter((b: any) => b.type === 'bulleted_list_item');
+    const a1 = bullets.find((b) => bulletText(b).includes('Assignment 1'));
+    expect(a1).toBeDefined();
+    // Rendered with the Submitted emoji, not reset to ⬜ Not Started.
+    expect(bulletText(a1).startsWith('📤')).toBe(true);
+  });
+
+  it('never deletes ANY unmarked block on a legacy page — appends the managed callout only', async () => {
+    // A legacy page has generated sections as unmarked direct children, with a
+    // MANUAL paragraph placed BETWEEN two of them. Because no unmarked block can be
+    // proven Horizon-generated, migration must delete nothing (position must never
+    // decide deletion) and simply append the managed callout.
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [
+        { id: 'h-assign', type: 'heading_2', heading_2: { rich_text: [{ plain_text: '📋 Assignments' }] } },
+        { id: 'b-old', type: 'bulleted_list_item', bulleted_list_item: { rich_text: [{ plain_text: '⬜ Old A' }] } },
+        // Manual paragraph sitting between two recognized legacy generated sections.
+        { id: 'user-note', type: 'paragraph', paragraph: { rich_text: [{ plain_text: 'My own study notes' }] } },
+        { id: 'h-grades', type: 'heading_2', heading_2: { rich_text: [{ plain_text: '📊 Grades' }] } },
+        { id: 'b-grade', type: 'bulleted_list_item', bulleted_list_item: { rich_text: [{ plain_text: 'Midterm: 90/100' }] } },
+      ],
+    });
+
+    await updateCoursePage(TOKEN, 'page-1', baseCourseData);
+
+    // Non-destructive guarantee: nothing on a legacy page is deleted or modified.
+    expect(r.deletedIds()).toHaveLength(0);
+    // The manual paragraph between the two generated sections survives byte-for-byte:
+    // it is never the target of a DELETE or a block-update PATCH.
+    const touchedManual = r.calls.some((c) =>
+      c.url.includes('/blocks/user-note') && (c.method === 'DELETE' || c.method === 'PATCH'));
+    expect(touchedManual).toBe(false);
+    // Exactly one managed callout is appended (the documented one-time cleanup path
+    // leaves the old sections for the user to remove once, by hand).
+    expect(r.appendCalls()).toHaveLength(1);
+  });
+
+  it('replaces only the callout on an already-migrated page (no legacy duplication thereafter)', async () => {
+    // After the first sync a legacy page also has a managed callout; subsequent syncs
+    // replace only that callout and still never touch the leftover legacy blocks.
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [
+        { id: 'h-assign', type: 'heading_2', heading_2: { rich_text: [{ plain_text: '📋 Assignments' }] } },
+        { id: 'b-old', type: 'bulleted_list_item', bulleted_list_item: { rich_text: [{ plain_text: '⬜ Old A' }] } },
+        { id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } },
+      ],
+      childrenByBlockId: { mc: [] },
+    });
+
+    await updateCoursePage(TOKEN, 'page-1', baseCourseData);
+
+    expect(r.deletedIds()).toEqual(['mc']);
+    expect(r.deletedIds()).not.toContain('b-old');
+    expect(r.appendCalls()).toHaveLength(1);
+  });
+
+  it('is idempotent: syncing a page that already has a managed callout keeps exactly one', async () => {
+    const model = {
+      pageId: 'page-1',
+      pageChildren: [{ id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } }],
+      childrenByBlockId: { mc: [] },
+    };
+    // First sync.
+    let r = routedNotionFetch(model);
+    await updateCoursePage(TOKEN, 'page-1', baseCourseData);
+    expect(r.deletedIds()).toEqual(['mc']);
+    expect(r.appendCalls()).toHaveLength(1);
+
+    // Second sync of the same steady-state page — still exactly one delete + append.
+    r = routedNotionFetch(model);
+    await updateCoursePage(TOKEN, 'page-1', baseCourseData);
+    expect(r.deletedIds()).toEqual(['mc']);
+    expect(r.appendCalls()).toHaveLength(1);
+  });
+
+  it('finds and replaces the managed callout even when it is beyond the first 100 blocks (pagination)', async () => {
+    const fillers = Array.from({ length: 100 }, (_v, i) => ({
+      id: `filler-${i}`, type: 'paragraph', paragraph: { rich_text: [{ plain_text: `note ${i}` }] },
+    }));
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [],
+      pageChildrenPages: [
+        { results: fillers, nextCursor: 'cursor-2' },
+        { results: [{ id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } }], nextCursor: null },
+      ],
+      childrenByBlockId: { mc: [] },
+    });
+
+    await updateCoursePage(TOKEN, 'page-1', baseCourseData);
+
+    // Without pagination the callout (on page 2) would be missed and duplicated.
+    expect(r.deletedIds()).toEqual(['mc']);
+    expect(r.appendCalls()).toHaveLength(1);
+  });
+
+  it('appends the replacement BEFORE deleting the old callout (append-first ordering)', async () => {
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [{ id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } }],
+      childrenByBlockId: { mc: [] },
+    });
+
+    await updateCoursePage(TOKEN, 'page-1', baseCourseData);
+
+    const appendIdx = r.calls.findIndex((c) => c.method === 'PATCH' && c.url.includes('/blocks/page-1/children'));
+    const deleteIdx = r.calls.findIndex((c) => c.method === 'DELETE');
+    expect(appendIdx).toBeGreaterThanOrEqual(0);
+    expect(deleteIdx).toBeGreaterThanOrEqual(0);
+    // The new content must be written before the old callout is removed.
+    expect(appendIdx).toBeLessThan(deleteIdx);
+  });
+
+  it('preserves the old managed callout when the append fails (never erases the body)', async () => {
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [{ id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } }],
+      childrenByBlockId: { mc: [] },
+      failAppendStatus: 500,
+    });
+
+    await expect(updateCoursePage(TOKEN, 'page-1', baseCourseData)).rejects.toThrow(/append managed content failed \(500\)/i);
+    // The append failed, so NOTHING was deleted — the existing callout is intact.
+    expect(r.deletedIds()).toHaveLength(0);
+  });
+
+  it('leaves a recoverable duplicate and reports when old-callout cleanup fails after a successful append', async () => {
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [{ id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } }],
+      childrenByBlockId: { mc: [] },
+      failDeleteStatusById: { mc: 409 },
+    });
+
+    // Cleanup failure is surfaced…
+    await expect(updateCoursePage(TOKEN, 'page-1', baseCourseData)).rejects.toThrow(/cleanup of old managed callout/i);
+    // …the fresh callout WAS appended (append happened before the failed delete)…
+    expect(r.appendCalls()).toHaveLength(1);
+    // …and the delete of the old callout was attempted (both callouts now coexist —
+    // a recoverable duplicate, no data lost).
+    expect(r.calls.some((c) => c.method === 'DELETE' && c.url.endsWith('/blocks/mc'))).toBe(true);
+  });
+
+  it('surfaces a non-2xx properties PATCH as a thrown error', async () => {
+    // Force the page-properties PATCH to fail (a mutation before any body change).
+    const spy = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'GET') return okJson({ results: [], has_more: false, next_cursor: null });
+      if (method === 'PATCH' && url.includes('/pages/page-1')) return errJson(400, 'bad property');
+      return okJson({});
+    });
+    vi.stubGlobal('fetch', spy);
+
+    await expect(updateCoursePage(TOKEN, 'page-1', baseCourseData)).rejects.toThrow(/update page failed \(400\)/i);
   });
 });

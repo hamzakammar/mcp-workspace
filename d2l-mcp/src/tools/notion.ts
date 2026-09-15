@@ -5,8 +5,9 @@
  */
 
 import { z } from 'zod';
-import { getUserId } from '../utils/userContext.js';
+import { getUserId, runWithUserId } from '../utils/userContext.js';
 import { client } from '../client.js';
+import { classifyDateEvent, DateType, Confidence } from '../utils/dateEvent.js';
 import { getNotionToken } from '../study/notionAuth.js';
 import { syncCourses, queryAllPages, type CourseData, type AssignmentInfo, type GradeInfo, type AnnouncementInfo } from '../study/notionClient.js';
 import { fetchCourseOutline, getCurrentTerm, type Assessment } from '../study/outlineClient.js';
@@ -41,13 +42,124 @@ interface RawNewsItem {
   Body: { Html: string } | null;
 }
 
+interface RawCalendarEvent {
+  Title: string;
+  Description?: string | null;
+  EndDateTime?: string | null;
+  StartDateTime?: string | null;
+  CalendarEventViewUrl?: string;
+  OrgUnitName?: string;
+  // The strongest classification signal: D2L links assessment calendar events to
+  // their originating tool (e.g. "…Dropbox", "…Quiz"). Purely-scheduled events
+  // (lectures/tutorials/office hours) have no assessment entity.
+  AssociatedEntity?: {
+    AssociatedEntityType?: string;
+    AssociatedEntityId?: number;
+    Link?: string;
+  } | null;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const CONNECT_HINT =
   'Connect Notion via the Horizon dashboard (/onboard) — click "Connect" next to Notion, ' +
   'then authorise the integration and paste the database ID shown on the page.';
 
+/**
+ * Extract a stable course code (SUBJECT + NUMBER + optional single course-letter
+ * suffix) from a messy D2L code or org-unit name.
+ *
+ * D2L codes glue a section/term token onto the code with a delimiter, e.g.
+ * "1261_CS135_LEC001", "ECE222_W26", "PSYCH207_081_cel_1265", "CS 135 001". We must
+ * NOT let the leading letter of that token (LEC/LAB/W…) be mistaken for a course
+ * suffix, while still keeping genuine suffix variants distinct (PHYS121 != PHYS121L,
+ * CS241 != CS241E). So we split on delimiters into tokens first, rejoin a bare
+ * subject with its following number ("CS" + "135"), and take the first token shaped
+ * like a course code — its optional trailing letter is only ever the code's own,
+ * because the section/term token is a separate token.
+ */
+function normalizeCourseCodeExact(input: string): string | null {
+  if (!input) return null;
+  const rawTokens = input.toUpperCase().split(/[\s_-]+/).filter(Boolean);
+  const tokens: string[] = [];
+  for (let i = 0; i < rawTokens.length; i++) {
+    const t = rawTokens[i];
+    const next = rawTokens[i + 1];
+    // Rejoin a space/delimiter-separated subject and number ("CS" + "135" → "CS135").
+    if (/^[A-Z]{2,6}$/.test(t) && next && /^\d{2,3}[A-Z]?$/.test(next)) {
+      tokens.push(t + next);
+      i++;
+    } else {
+      tokens.push(t);
+    }
+  }
+  for (const t of tokens) {
+    const match = t.match(/^([A-Z]{2,6}\d{2,3}[A-Z]?)/);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/**
+ * Decide whether a D2L calendar event is a real assessment/deadline (INCLUDE) vs a
+ * scheduled meeting or generic course event (EXCLUDE). Reuses the repository's
+ * existing classification logic (classifyDateEvent) and prefers strong metadata
+ * (AssociatedEntityType) over fragile title keywords.
+ */
+function isAssessmentCalendarEvent(event: RawCalendarEvent): boolean {
+  const entityType = event.AssociatedEntity?.AssociatedEntityType || '';
+  // Strong metadata: a Dropbox (assignment) or Quiz association is authoritative.
+  if (/Dropbox|Assignment/i.test(entityType)) return true;
+  if (/Quiz/i.test(entityType)) return true;
+  // Otherwise fall back to title/description classification.
+  const { dateType, confidence } = classifyDateEvent(
+    event.Title || '',
+    event.Description || '',
+    entityType || null,
+  );
+  // Scheduled meetings (lecture/tutorial/lab/office hours/…) are never assessments.
+  if (dateType === DateType.LECTURE) return false;
+  // Deadlines and exams/quizzes are assessments when classified with real signal.
+  if (dateType === DateType.DUE || dateType === DateType.EXAM) {
+    return confidence !== Confidence.LOW;
+  }
+  // Anything else (UNKNOWN, opens/closes-only, feedback) is not ingested as work.
+  return false;
+}
+
+function parseCalendarEventDate(event: {
+  dueDateIso?: string | null;
+  EndDateTime?: string | null;
+  StartDateTime?: string | null;
+  dueDate?: string | null;
+}): string | null {
+  const candidates = [event.dueDateIso, event.EndDateTime, event.StartDateTime, event.dueDate];
+  for (const candidate of candidates) {
+    if (!candidate || !candidate.trim()) continue;
+    const parsed = new Date(candidate);
+    if (!isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+  return null;
+}
+
+function mergeAssignments(assignments: AssignmentInfo[], incoming: AssignmentInfo): void {
+  const key = incoming.name.trim().toLowerCase();
+  const existing = assignments.find((a) => a.name.trim().toLowerCase() === key);
+  if (!existing) {
+    assignments.push(incoming);
+    return;
+  }
+  if (!existing.dueDate && incoming.dueDate) existing.dueDate = incoming.dueDate;
+  if (existing.maxPoints === null && incoming.maxPoints !== null) existing.maxPoints = incoming.maxPoints;
+  if ((!existing.grade || existing.grade.length === 0) && incoming.grade) existing.grade = incoming.grade;
+  if (!existing.url && incoming.url) existing.url = incoming.url;
+  if (existing.status === 'Not Started' && incoming.status !== 'Not Started') existing.status = incoming.status;
+}
+
 async function fetchCourseData(orgUnitId: number, name: string, code: string): Promise<CourseData> {
+  let assignmentSourceFailures = 0;
   const courseData: CourseData = {
     orgUnitId,
     name,
@@ -64,7 +176,7 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
     const raw = (await client.getDropboxFolders(orgUnitId)) as RawAssignment[];
     const folders: RawAssignment[] = Array.isArray(raw) ? raw : [];
     for (const folder of folders) {
-      courseData.assignments.push({
+      mergeAssignments(courseData.assignments, {
         name: folder.Name,
         dueDate: folder.DueDate,
         maxPoints: folder.Assessment?.ScoreDenominator ?? null,
@@ -72,7 +184,9 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
         url: `https://${d2lHost}/d2l/lms/dropbox/user/folder_submit_files.d2l?db=${folder.Id}&grpid=0&isprv=0&bp=0&ou=${orgUnitId}`,
       });
     }
-  } catch { /* course may not expose dropbox */ }
+  } catch {
+    assignmentSourceFailures++;
+  }
 
   // Fetch quizzes with submission status
   try {
@@ -98,7 +212,7 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
       } catch { /* skip attempt check */ }
 
       const quizId = (quiz as any).QuizId || (quiz as any).Id || '0';
-      courseData.assignments.push({
+      mergeAssignments(courseData.assignments, {
         name: quiz.Name,
         dueDate: quiz.DueDate ?? null,
         maxPoints: null,
@@ -106,7 +220,38 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
         url: `https://${d2lHost}/d2l/lms/quizzing/user/quiz_summary.d2l?qi=${quizId}&ou=${orgUnitId}`,
       });
     }
-  } catch { /* quizzes may not be accessible */ }
+  } catch {
+    assignmentSourceFailures++;
+  }
+
+  // Fetch calendar events and merge as additional assignment sources.
+  try {
+    const now = new Date();
+    const startDateTime = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const endDateTime = new Date(now.getTime() + 180 * 24 * 60 * 60 * 1000).toISOString();
+    const calendarRaw = (await client.getMyCalendarEvents(orgUnitId, startDateTime, endDateTime)) as
+      | { Objects: RawCalendarEvent[] }
+      | RawCalendarEvent[];
+    const events = Array.isArray(calendarRaw) ? calendarRaw : (calendarRaw.Objects || []);
+    const targetCode = normalizeCourseCodeExact(code) ?? normalizeCourseCodeExact(name);
+    for (const event of events) {
+      if (!event.Title) continue;
+      const eventCode = normalizeCourseCodeExact(event.OrgUnitName || '');
+      if (targetCode && eventCode && eventCode !== targetCode) continue;
+      // Only ingest assessment/deadline-like events — never lectures, tutorials,
+      // office hours, or bare lab/scheduled meetings.
+      if (!isAssessmentCalendarEvent(event)) continue;
+      mergeAssignments(courseData.assignments, {
+        name: event.Title.trim(),
+        dueDate: parseCalendarEventDate(event),
+        maxPoints: null,
+        status: 'Not Started',
+        url: event.CalendarEventViewUrl || undefined,
+      });
+    }
+  } catch {
+    assignmentSourceFailures++;
+  }
 
   // Fetch grades
   try {
@@ -145,6 +290,13 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
       });
     }
   } catch { /* news may not be accessible */ }
+
+  if (courseData.assignments.length === 0 || assignmentSourceFailures > 0) {
+    courseData.syncMetadata = {
+      preserveExistingAssignments: courseData.assignments.length === 0,
+      assignmentSourceFailures,
+    };
+  }
 
   return courseData;
 }
@@ -212,9 +364,8 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
   for (const course of courses) {
     try {
       // Extract course code from D2L code (e.g. "PSYCH207_081_cel_1265" → "PSYCH207")
-      const codeMatch = course.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6})(\d{2,3})/);
-      if (!codeMatch) continue;
-      const courseCode = `${codeMatch[1]}${codeMatch[2]}`;
+      const courseCode = normalizeCourseCodeExact(course.code) ?? normalizeCourseCodeExact(course.name);
+      if (!courseCode) continue;
 
       const outline = await fetchCourseOutline(cookieHeader, courseCode, term);
 
@@ -252,7 +403,7 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
             if (parsedDate && !existing.dueDate) existing.dueDate = parsedDate;
           } else {
             // New item from outline — add it
-            course.assignments.push({
+            mergeAssignments(course.assignments, {
               name: cleanOutlineText(assessment.name),
               dueDate: parsedDate,
               maxPoints: null,
@@ -349,6 +500,25 @@ function isAcademicCourse(enrollment: RawEnrollment): boolean {
  * Uses a "Type" property set to "📌 Due Soon" to distinguish from course pages.
  * Removes old "Due Soon" entries and re-creates current ones.
  */
+/**
+ * Whether the current sync is AUTHORITATIVE enough to run the destructive Due Soon
+ * reconciliation (which archives all existing generated reminders and rebuilds them
+ * from the in-memory assignment list).
+ *
+ * It is authoritative ONLY when enrollment returned at least one verified active
+ * academic course AND no course carries preservation metadata (an empty source or a
+ * partial source failure). On a non-authoritative sync we must NOT archive existing
+ * Due Soon rows, because rebuilding from a partial/empty snapshot would delete valid
+ * reminders that came from the failed/empty source.
+ */
+function isAuthoritativeForDueSoon(activeCourseCount: number, courses: CourseData[]): boolean {
+  if (activeCourseCount === 0) return false;
+  return !courses.some(c =>
+    c.syncMetadata?.preserveExistingAssignments === true ||
+    (c.syncMetadata?.assignmentSourceFailures ?? 0) > 0,
+  );
+}
+
 async function syncUpcomingTasks(
   notionToken: string,
   databaseId: string,
@@ -356,31 +526,37 @@ async function syncUpcomingTasks(
 ): Promise<number> {
   const headers = { 'Authorization': `Bearer ${notionToken}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' };
 
-  // First, ensure the database has a "Type" property
-  await fetch(`https://api.notion.com/v1/databases/${databaseId}`, {
+  // First, ensure the database has a "Type" property. Check the response.
+  const ensureResp = await fetch(`https://api.notion.com/v1/databases/${databaseId}`, {
     method: 'PATCH', headers,
     body: JSON.stringify({ properties: { 'Type': { select: {} } } }),
   });
+  if (!ensureResp.ok) {
+    throw new Error(`Notion ensure Due Soon "Type" property failed (${ensureResp.status})`);
+  }
 
-  // Remove existing "Due Soon" tagged pages
-  try {
-    const existingResp = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
-      method: 'POST', headers,
-      body: JSON.stringify({
-        filter: { property: 'Type', select: { equals: '📌 Due Soon' } },
-        page_size: 100,
-      }),
+  // Remove existing "Due Soon" tagged rows. Every mutation response is checked and
+  // surfaced — this reconciliation only runs on an authoritative sync (see caller).
+  const existingResp = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
+    method: 'POST', headers,
+    body: JSON.stringify({
+      filter: { property: 'Type', select: { equals: '📌 Due Soon' } },
+      page_size: 100,
+    }),
+  });
+  if (!existingResp.ok) {
+    throw new Error(`Notion Due Soon query failed (${existingResp.status})`);
+  }
+  const data = await existingResp.json() as { results: Array<{ id: string }> };
+  for (const page of data.results) {
+    const archiveResp = await fetch(`https://api.notion.com/v1/pages/${page.id}`, {
+      method: 'PATCH', headers,
+      body: JSON.stringify({ archived: true }),
     });
-    if (existingResp.ok) {
-      const data = await existingResp.json() as { results: Array<{ id: string }> };
-      for (const page of data.results) {
-        await fetch(`https://api.notion.com/v1/pages/${page.id}`, {
-          method: 'PATCH', headers,
-          body: JSON.stringify({ archived: true }),
-        });
-      }
+    if (!archiveResp.ok) {
+      throw new Error(`Notion archive Due Soon row ${page.id} failed (${archiveResp.status})`);
     }
-  } catch { /* continue */ }
+  }
 
   // Collect upcoming tasks (next 10 days)
   const now = new Date();
@@ -394,23 +570,24 @@ async function syncUpcomingTasks(
       const due = new Date(a.dueDate);
       if (due < now || due > tenDays) continue;
 
-      try {
-        await fetch('https://api.notion.com/v1/pages', {
-          method: 'POST', headers,
-          body: JSON.stringify({
-            parent: { database_id: databaseId },
-            properties: {
-              'Name': { title: [{ text: { content: `${a.name} (${courseName})` } }] },
-              'Course Code': { rich_text: [{ text: { content: course.code } }] },
-              'Status': { select: { name: a.status === 'Submitted' ? 'Active' : 'Active' } },
-              'Next Due': { date: { start: a.dueDate } },
-              'Grade': { rich_text: [{ text: { content: a.grade || '' } }] },
-              'Type': { select: { name: '📌 Due Soon' } },
-            },
-          }),
-        });
-        created++;
-      } catch { /* skip */ }
+      const createResp = await fetch('https://api.notion.com/v1/pages', {
+        method: 'POST', headers,
+        body: JSON.stringify({
+          parent: { database_id: databaseId },
+          properties: {
+            'Name': { title: [{ text: { content: `${a.name} (${courseName})` } }] },
+            'Course Code': { rich_text: [{ text: { content: course.code } }] },
+            'Status': { select: { name: a.status === 'Submitted' ? 'Active' : 'Active' } },
+            'Next Due': { date: { start: a.dueDate } },
+            'Grade': { rich_text: [{ text: { content: a.grade || '' } }] },
+            'Type': { select: { name: '📌 Due Soon' } },
+          },
+        }),
+      });
+      if (!createResp.ok) {
+        throw new Error(`Notion create Due Soon row for "${a.name}" failed (${createResp.status})`);
+      }
+      created++;
     }
   }
 
@@ -422,6 +599,22 @@ async function syncUpcomingTasks(
  * Remove Notion pages for courses no longer enrolled.
  * Compares by extracting the short course code (e.g. PSYCH207) from both sides.
  */
+/**
+ * Build the set of "active" course identifiers used to decide which Notion pages
+ * are stale. Includes BOTH the normalized code and the raw uppercased code for each
+ * course so a stored page key matches whether it was written as the raw D2L code or
+ * a normalized one — preventing a live course's page from being wrongly archived.
+ */
+function buildActiveCodes(courses: CourseData[]): Set<string> {
+  const codes = new Set<string>();
+  for (const c of courses) {
+    const norm = normalizeCourseCodeExact(c.code) ?? normalizeCourseCodeExact(c.name);
+    if (norm) codes.add(norm);
+    if (c.code) codes.add(c.code.toUpperCase());
+  }
+  return codes;
+}
+
 async function cleanupStalePages(
   notionToken: string,
   databaseId: string,
@@ -433,9 +626,8 @@ async function cleanupStalePages(
     for (const [key, pageId] of existingPages) {
       // Only check courseCode-only keys (not "code|title" compound keys)
       if (key.includes('|')) continue;
-      // Extract short code from the Notion page's Course Code (e.g. "PSYCH207_081_cel_1265" → "PSYCH207")
-      const shortCode = key.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{2,3})/)?.[1] || key;
-      if (!activeCodes.has(shortCode) && !activeCodes.has(key)) {
+      const normalizedCode = normalizeCourseCodeExact(key) ?? key;
+      if (!activeCodes.has(normalizedCode) && !activeCodes.has(key) && !activeCodes.has(key.toUpperCase())) {
         await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
           method: 'PATCH',
           headers: { 'Authorization': `Bearer ${notionToken}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' },
@@ -455,6 +647,11 @@ async function cleanupStalePages(
  * Throttled to max once per hour.
  */
 export async function backgroundNotionSync(userId: string): Promise<void> {
+  // Fail CLOSED: background sync (which writes to a user's Notion) runs ONLY when
+  // explicitly enabled. An unset/empty/any-other value means DISABLED so a default
+  // or misconfigured deployment never performs background writes. Manual
+  // sync_to_notion is intentionally NOT gated by this and remains available.
+  if (process.env.BACKGROUND_NOTION_SYNC_ENABLED !== 'true') return;
   if (syncInProgress.has(userId)) return;
 
   // Throttle: skip if synced less than 1 hour ago
@@ -470,36 +667,54 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
     const databaseId = userDatabaseIds.get(userId);
     if (!databaseId) return;
 
-    // Fetch enrollments — only real academic courses
-    const enrollmentsRaw = (await client.getMyEnrollments()) as { Items: RawEnrollment[] };
-    const activeCourses = (enrollmentsRaw.Items || []).filter(isAcademicCourse);
+    // Bind the D2L identity to this userId for the whole sync so cross-user
+    // isolation cannot break if this is ever called outside a request's async
+    // context (the D2L `client` proxy resolves the user from AsyncLocalStorage).
+    await runWithUserId(userId, async () => {
+      // Fetch enrollments — only real academic courses
+      const enrollmentsRaw = (await client.getMyEnrollments()) as { Items: RawEnrollment[] };
+      const activeCourses = (enrollmentsRaw.Items || []).filter(isAcademicCourse);
 
-    // Fetch course data in parallel (faster)
-    const courses = await Promise.all(
-      activeCourses.map(e => fetchCourseData(e.OrgUnit.Id, e.OrgUnit.Name, e.OrgUnit.Code || ''))
-    );
+      // Fetch course data in parallel (faster)
+      const courses = await Promise.all(
+        activeCourses.map(e => fetchCourseData(e.OrgUnit.Id, e.OrgUnit.Name, e.OrgUnit.Code || ''))
+      );
 
-    // Enrich with outline data
-    await enrichWithOutline(courses, userId);
-    markOverdueAssignments(courses);
+      // Enrich with outline data
+      await enrichWithOutline(courses, userId);
+      markOverdueAssignments(courses);
 
-    // Sync course pages
-    await syncCourses(notionToken, databaseId, courses);
+      // Sync course pages
+      await syncCourses(notionToken, databaseId, courses);
 
-    // Sync "Due Soon" tasks
-    try {
-      await syncUpcomingTasks(notionToken, databaseId, courses);
-    } catch { /* skip */ }
+      // Reconcile "Due Soon" reminder rows — but ONLY on an authoritative sync.
+      // Due Soon reconciliation is destructive (it archives existing generated rows
+      // and rebuilds from the in-memory list). On an empty/non-authoritative
+      // enrollment or any course with preservation metadata (empty/failed source),
+      // we skip it entirely so valid existing reminders are never archived.
+      if (isAuthoritativeForDueSoon(activeCourses.length, courses)) {
+        try {
+          await syncUpcomingTasks(notionToken, databaseId, courses);
+        } catch (e) {
+          console.error(`[NOTION] Due Soon reconciliation failed (preserved existing rows): ${e instanceof Error ? e.message : e}`);
+        }
+      } else {
+        console.error('[NOTION] Skipping Due Soon reconciliation: non-authoritative/partial sync — existing reminders preserved.');
+      }
 
-    // Cleanup stale pages
-    const activeCodes = new Set(courses.map(c => {
-      const m = c.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{2,3})/);
-      return m ? m[1] : c.code;
-    }));
-    await cleanupStalePages(notionToken, databaseId, activeCodes);
+      // Cleanup stale pages — but ONLY when we have a verified, non-empty active
+      // course list. A successful-but-empty getMyEnrollments() is NOT authoritative
+      // for destructive archival: treating it as "no courses" would archive every
+      // page. When there are zero verified active academic courses we skip cleanup.
+      if (activeCourses.length > 0) {
+        await cleanupStalePages(notionToken, databaseId, buildActiveCodes(courses));
+      } else {
+        console.error('[NOTION] Skipping stale-page cleanup: no verified active courses (non-authoritative empty enrollment).');
+      }
 
-    lastSyncTime.set(userId, Date.now());
-    console.error(`[NOTION] Background sync complete: ${courses.length} courses`);
+      lastSyncTime.set(userId, Date.now());
+      console.error(`[NOTION] Background sync complete: ${courses.length} courses`);
+    });
   } catch (e) {
     console.error(`[NOTION] Background sync error: ${e instanceof Error ? e.message : e}`);
   } finally {
@@ -569,18 +784,27 @@ export const notionTools = {
       try {
         const result = await syncCourses(notionToken, args.databaseId, courses);
 
-        // 5. Sync "Due Soon" tasks as rows in the same database
+        // 5. Reconcile "Due Soon" reminder rows — only on an authoritative sync.
+        // Destructive reconciliation is skipped on empty/non-authoritative
+        // enrollment or any course with preservation metadata, so valid existing
+        // reminders are never archived from a partial/empty snapshot.
         let upcomingCount = 0;
-        try {
-          upcomingCount = await syncUpcomingTasks(notionToken, args.databaseId, courses);
-        } catch { /* skip */ }
+        if (isAuthoritativeForDueSoon(activeCourses.length, courses)) {
+          try {
+            upcomingCount = await syncUpcomingTasks(notionToken, args.databaseId, courses);
+          } catch (e) {
+            console.error(`[NOTION] Due Soon reconciliation failed (preserved existing rows): ${e instanceof Error ? e.message : e}`);
+          }
+        } else {
+          console.error('[NOTION] Skipping Due Soon reconciliation: non-authoritative/partial sync — existing reminders preserved.');
+        }
 
-        // 6. Cleanup stale pages
-        const activeCodes = new Set(courses.map(c => {
-          const m = c.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{2,3})/);
-          return m ? m[1] : c.code;
-        }));
-        const archived = await cleanupStalePages(notionToken, args.databaseId, activeCodes);
+        // 6. Cleanup stale pages — skip when there are no verified active courses.
+        // An empty enrollment snapshot is not authoritative for destructive archival
+        // (it would otherwise archive every page).
+        const archived = activeCourses.length > 0
+          ? await cleanupStalePages(notionToken, args.databaseId, buildActiveCodes(courses))
+          : 0;
 
         lastSyncTime.set(userId!, Date.now());
 

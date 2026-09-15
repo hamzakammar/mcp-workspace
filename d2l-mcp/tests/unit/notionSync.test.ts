@@ -26,6 +26,7 @@ vi.mock('../../src/utils/supabase.js', () => ({
 
 vi.mock('../../src/utils/userContext.js', () => ({
   getUserId: vi.fn().mockReturnValue('user-test-1'),
+  runWithUserId: vi.fn((_userId: string, fn: () => unknown) => fn()),
 }));
 
 vi.mock('../../src/study/notionClient.js', () => ({
@@ -42,20 +43,27 @@ vi.mock('../../src/client.js', () => ({
   client: {
     getMyEnrollments: vi.fn(),
     getDropboxFolders: vi.fn(),
+    getQuizzes: vi.fn(),
+    getQuizAttempts: vi.fn(),
+    getMyCalendarEvents: vi.fn(),
     getMyGradeValues: vi.fn(),
     getNews: vi.fn(),
   },
 }));
 
-import { notionTools } from '../../src/tools/notion.js';
+import { notionTools, backgroundNotionSync } from '../../src/tools/notion.js';
 import { syncCourses } from '../../src/study/notionClient.js';
 import { getNotionToken } from '../../src/study/notionAuth.js';
 import { client } from '../../src/client.js';
+import { getUserId } from '../../src/utils/userContext.js';
 
 const syncMock = vi.mocked(syncCourses);
 const tokenMock = vi.mocked(getNotionToken);
 const enrollmentsMock = vi.mocked(client.getMyEnrollments);
 const dropboxMock = vi.mocked(client.getDropboxFolders);
+const quizzesMock = vi.mocked(client.getQuizzes);
+const quizAttemptsMock = vi.mocked(client.getQuizAttempts);
+const calendarMock = vi.mocked(client.getMyCalendarEvents);
 const gradesMock = vi.mocked(client.getMyGradeValues);
 const newsMock = vi.mocked(client.getNews);
 
@@ -103,6 +111,9 @@ describe('sync_to_notion — course data', () => {
       }],
     } as any);
     dropboxMock.mockResolvedValue([]);
+    quizzesMock.mockResolvedValue([]);
+    quizAttemptsMock.mockResolvedValue([]);
+    calendarMock.mockResolvedValue({ Objects: [] } as any);
     gradesMock.mockResolvedValue([]);
     newsMock.mockResolvedValue([]);
   });
@@ -166,6 +177,187 @@ describe('sync_to_notion — course data', () => {
     expect(capturedCourses[0].announcements).toHaveLength(1);
     expect(capturedCourses[0].announcements[0].title).toBe('Welcome!');
   });
+
+  it('marks assignment sync metadata to preserve existing content when all live sources are empty', async () => {
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
+      return { created: 1, updated: 0, failed: 0 };
+    });
+
+    await TOOL.handler({ databaseId: 'db-1' });
+    expect(capturedCourses[0].assignments).toHaveLength(0);
+    expect(capturedCourses[0].syncMetadata?.preserveExistingAssignments).toBe(true);
+  });
+
+  it('merges mixed assignment sources (dropbox + quizzes + calendar) without duplicates', async () => {
+    dropboxMock.mockResolvedValue([{
+      Id: 11,
+      Name: 'Assignment 1',
+      DueDate: '2026-10-01T23:59:00Z',
+      Assessment: { ScoreDenominator: 20 },
+    }] as any);
+    quizzesMock.mockResolvedValue({
+      Objects: [{
+        Id: 22,
+        Name: 'Quiz 1',
+        DueDate: '2026-10-02T23:59:00Z',
+        IsActive: true,
+        AttemptsAllowed: 1,
+      }],
+    } as any);
+    quizAttemptsMock.mockResolvedValue({ Objects: [{ Attempt: { AttemptNumber: 1 } }] } as any);
+    calendarMock.mockResolvedValue({
+      Objects: [
+        {
+          Title: 'Assignment 1',
+          EndDateTime: '2026-10-01T23:59:00Z',
+          OrgUnitName: 'CS135',
+          CalendarEventViewUrl: 'https://calendar/a1',
+        },
+        {
+          Title: 'Project Milestone',
+          EndDateTime: null,
+          OrgUnitName: 'CS135',
+          CalendarEventViewUrl: 'https://calendar/p1',
+        },
+        // Non-assessment events on the same course must be filtered out entirely.
+        { Title: 'Weekly Lecture', EndDateTime: '2026-10-03T10:00:00Z', OrgUnitName: 'CS135' },
+        { Title: 'CS135 Office Hours', EndDateTime: '2026-10-04T10:00:00Z', OrgUnitName: 'CS135' },
+      ],
+    } as any);
+
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
+      return { created: 1, updated: 0, failed: 0 };
+    });
+
+    await TOOL.handler({ databaseId: 'db-1' });
+    const names = capturedCourses[0].assignments.map((a: any) => a.name);
+    // Assignment 1 (dropbox + calendar dedup), Quiz 1, and the calendar 'Project
+    // Milestone' (assessment keyword) are included; lecture/office-hours are dropped.
+    expect(names).toEqual(['Assignment 1', 'Quiz 1', 'Project Milestone']);
+    expect(names).not.toContain('Weekly Lecture');
+    expect(names).not.toContain('CS135 Office Hours');
+    expect(capturedCourses[0].assignments[2].dueDate).toBeNull();
+  });
+
+  it('uses exact normalized course-code matching for calendar merges', async () => {
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 999, Name: 'Physics Lab', Code: 'PHYS121L', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    // Both events are genuine assessments (Dropbox-associated), so the ONLY reason
+    // the PHYS121 event is excluded is the exact course-code mismatch with PHYS121L.
+    calendarMock.mockResolvedValue({
+      Objects: [
+        {
+          Title: 'Assignment 2',
+          EndDateTime: '2026-10-01T10:00:00Z',
+          OrgUnitName: 'PHYS121',
+          AssociatedEntity: { AssociatedEntityType: 'Dropbox' },
+        },
+        {
+          Title: 'Lab Report 3',
+          EndDateTime: '2026-10-03T10:00:00Z',
+          OrgUnitName: 'PHYS121L',
+          AssociatedEntity: { AssociatedEntityType: 'Dropbox' },
+        },
+      ],
+    } as any);
+
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
+      return { created: 1, updated: 0, failed: 0 };
+    });
+
+    await TOOL.handler({ databaseId: 'db-1' });
+    expect(capturedCourses[0].assignments.map((a: any) => a.name)).toEqual(['Lab Report 3']);
+  });
+
+  it('records partial source failures so existing assignments can be preserved downstream', async () => {
+    dropboxMock.mockRejectedValue(new Error('dropbox unavailable'));
+    quizzesMock.mockResolvedValue({ Objects: [] } as any);
+    calendarMock.mockResolvedValue({
+      // A real assessment survives the successful calendar source...
+      Objects: [{ Title: 'Assignment 4', EndDateTime: '2026-10-05T10:00:00Z', OrgUnitName: 'CS135' }],
+    } as any);
+
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
+      return { created: 1, updated: 0, failed: 0 };
+    });
+
+    await TOOL.handler({ databaseId: 'db-1' });
+    expect(capturedCourses[0].assignments.map((a: any) => a.name)).toContain('Assignment 4');
+    // ...and the dropbox failure is recorded so downstream can preserve records.
+    expect(capturedCourses[0].syncMetadata?.assignmentSourceFailures).toBeGreaterThan(0);
+  });
+
+  it('normalizes realistic D2L codes (section/term tokens) without cross-course bleed', async () => {
+    // Real D2L code glues a section token onto the code ("1261_CS135_LEC001"); the
+    // leading letter of LEC must NOT be read as a course suffix, and CS135 must stay
+    // distinct from the lab CS135L.
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 123, Name: 'Intro to CS', Code: '1261_CS135_LEC001', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    calendarMock.mockResolvedValue({
+      Objects: [
+        { Title: 'Assignment 7', OrgUnitName: 'CS135', AssociatedEntity: { AssociatedEntityType: 'Dropbox' } },
+        { Title: 'Assignment 8', OrgUnitName: 'CS135L', AssociatedEntity: { AssociatedEntityType: 'Dropbox' } },
+      ],
+    } as any);
+
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
+      return { created: 1, updated: 0, failed: 0 };
+    });
+
+    await TOOL.handler({ databaseId: 'db-1' });
+    const names = capturedCourses[0].assignments.map((a: any) => a.name);
+    expect(names).toContain('Assignment 7');   // CS135 matches the lecture section
+    expect(names).not.toContain('Assignment 8'); // CS135L (lab) is a distinct course
+  });
+
+  it('excludes lectures, tutorials, office hours, and bare lab meetings from calendar ingestion', async () => {
+    calendarMock.mockResolvedValue({
+      Objects: [
+        { Title: 'Assignment 5', EndDateTime: '2026-11-01T10:00:00Z', OrgUnitName: 'CS135' },
+        { Title: 'Quiz 3', EndDateTime: '2026-11-02T10:00:00Z', OrgUnitName: 'CS135', AssociatedEntity: { AssociatedEntityType: 'Quiz' } },
+        { Title: 'Final Exam', EndDateTime: '2026-11-03T10:00:00Z', OrgUnitName: 'CS135' },
+        { Title: 'Course Project Proposal due', EndDateTime: '2026-11-04T10:00:00Z', OrgUnitName: 'CS135' },
+        { Title: 'Lecture 12', EndDateTime: '2026-11-05T10:00:00Z', OrgUnitName: 'CS135' },
+        { Title: 'Tutorial 4', EndDateTime: '2026-11-06T10:00:00Z', OrgUnitName: 'CS135' },
+        { Title: 'Instructor Office Hours', EndDateTime: '2026-11-07T10:00:00Z', OrgUnitName: 'CS135' },
+        { Title: 'Lab 2', EndDateTime: '2026-11-08T10:00:00Z', OrgUnitName: 'CS135' },
+        { Title: 'CS135 Weekly Seminar', EndDateTime: '2026-11-09T10:00:00Z', OrgUnitName: 'CS135' },
+      ],
+    } as any);
+
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
+      return { created: 1, updated: 0, failed: 0 };
+    });
+
+    await TOOL.handler({ databaseId: 'db-1' });
+    const names = capturedCourses[0].assignments.map((a: any) => a.name);
+    // Assessment / deadline events are included…
+    expect(names).toEqual(expect.arrayContaining(['Assignment 5', 'Quiz 3', 'Final Exam', 'Course Project Proposal due']));
+    // …scheduled meetings are excluded.
+    for (const excluded of ['Lecture 12', 'Tutorial 4', 'Instructor Office Hours', 'Lab 2', 'CS135 Weekly Seminar']) {
+      expect(names).not.toContain(excluded);
+    }
+  });
 });
 
 // ─── Summary format ──────────────────────────────────────────────────────────
@@ -180,6 +372,9 @@ describe('sync_to_notion — summary format', () => {
       }],
     } as any);
     dropboxMock.mockResolvedValue([]);
+    quizzesMock.mockResolvedValue([]);
+    quizAttemptsMock.mockResolvedValue([]);
+    calendarMock.mockResolvedValue({ Objects: [] } as any);
     gradesMock.mockResolvedValue([]);
     newsMock.mockResolvedValue([]);
   });
@@ -230,6 +425,9 @@ describe('sync_to_notion — error resilience', () => {
       }],
     } as any);
     dropboxMock.mockResolvedValue([]);
+    quizzesMock.mockResolvedValue([]);
+    quizAttemptsMock.mockResolvedValue([]);
+    calendarMock.mockResolvedValue({ Objects: [] } as any);
     gradesMock.mockResolvedValue([]);
     newsMock.mockResolvedValue([]);
     syncMock.mockRejectedValue(new Error('Notion query failed (404): object_not_found'));
@@ -237,5 +435,244 @@ describe('sync_to_notion — error resilience', () => {
     const result = JSON.parse(await TOOL.handler({ databaseId: 'bad-db-id' }));
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/404|not_found|Notion/i);
+  });
+});
+
+// ─── Background sync fail-closed ───────────────────────────────────────────────
+
+describe('backgroundNotionSync — fail closed', () => {
+  const ORIGINAL = process.env.BACKGROUND_NOTION_SYNC_ENABLED;
+
+  beforeEach(() => {
+    tokenMock.mockResolvedValue('secret_test');
+  });
+
+  afterEach(() => {
+    if (ORIGINAL === undefined) delete process.env.BACKGROUND_NOTION_SYNC_ENABLED;
+    else process.env.BACKGROUND_NOTION_SYNC_ENABLED = ORIGINAL;
+  });
+
+  it('does NOT run when the enable flag is unset (unset means disabled)', async () => {
+    delete process.env.BACKGROUND_NOTION_SYNC_ENABLED;
+    await backgroundNotionSync('fc-unset');
+    expect(tokenMock).not.toHaveBeenCalled();
+    expect(enrollmentsMock).not.toHaveBeenCalled();
+  });
+
+  it('does NOT run for any value other than the exact string "true"', async () => {
+    process.env.BACKGROUND_NOTION_SYNC_ENABLED = 'false';
+    await backgroundNotionSync('fc-false');
+    process.env.BACKGROUND_NOTION_SYNC_ENABLED = '1';
+    await backgroundNotionSync('fc-one');
+    process.env.BACKGROUND_NOTION_SYNC_ENABLED = 'TRUE';
+    await backgroundNotionSync('fc-upper');
+    expect(tokenMock).not.toHaveBeenCalled();
+    expect(enrollmentsMock).not.toHaveBeenCalled();
+  });
+
+  it('runs only when the flag is exactly "true"', async () => {
+    process.env.BACKGROUND_NOTION_SYNC_ENABLED = 'true';
+    await backgroundNotionSync('fc-true');
+    expect(tokenMock).toHaveBeenCalledWith('fc-true');
+  });
+});
+
+// ─── Cross-user isolation ──────────────────────────────────────────────────────
+
+describe('sync_to_notion — cross-user isolation', () => {
+  const getUserIdMock = vi.mocked(getUserId);
+
+  beforeEach(() => {
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 123, Name: 'Intro to CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    dropboxMock.mockResolvedValue([]);
+    quizzesMock.mockResolvedValue([]);
+    quizAttemptsMock.mockResolvedValue([]);
+    calendarMock.mockResolvedValue({ Objects: [] } as any);
+    gradesMock.mockResolvedValue([]);
+    newsMock.mockResolvedValue([]);
+    syncMock.mockResolvedValue({ created: 1, updated: 0, failed: 0 } as any);
+  });
+
+  afterEach(() => {
+    getUserIdMock.mockReturnValue('user-test-1');
+  });
+
+  it('scopes the Notion token and database to the current user, with no leakage between users', async () => {
+    tokenMock.mockImplementation(async (uid: string) => `token-for-${uid}`);
+
+    getUserIdMock.mockReturnValue('userA');
+    await TOOL.handler({ databaseId: 'dbA' });
+
+    getUserIdMock.mockReturnValue('userB');
+    await TOOL.handler({ databaseId: 'dbB' });
+
+    const tokensUsed = syncMock.mock.calls.map((c) => c[0]);
+    const dbsUsed = syncMock.mock.calls.map((c) => c[1]);
+    expect(tokensUsed).toEqual(['token-for-userA', 'token-for-userB']);
+    expect(dbsUsed).toEqual(['dbA', 'dbB']);
+  });
+});
+
+// ─── Stale-page + Due Soon reconciliation safety ───────────────────────────────
+
+/**
+ * Stub global fetch against a small Notion model. The Due-Soon-filtered query and
+ * the unfiltered stale-page (queryAllPages) query can each be seeded with EXISTING
+ * rows so tests are non-vacuous, and archive PATCHes are recorded.
+ */
+function stubNotionFetch(opts: {
+  dueSoonRows?: string[];
+  allPagesRows?: Array<{ id: string; code: string; name: string }>;
+  archiveStatusById?: Record<string, number>;
+}) {
+  const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body });
+  const spy = vi.fn(async (url: string, init?: RequestInit) => {
+    const method = (init?.method || 'GET').toUpperCase();
+    const body = init?.body ? String(init.body) : '';
+    if (String(url).endsWith('/query') && method === 'POST') {
+      if (body.includes('Due Soon')) {
+        return ok({ results: (opts.dueSoonRows || []).map((id) => ({ id })), has_more: false });
+      }
+      return ok({
+        results: (opts.allPagesRows || []).map((r) => ({
+          id: r.id,
+          properties: {
+            Name: { title: [{ plain_text: r.name }] },
+            'Course Code': { rich_text: [{ plain_text: r.code }] },
+          },
+        })),
+        has_more: false,
+      });
+    }
+    // Archive PATCH — optionally forced to fail for a given page id.
+    if (method === 'PATCH' && body.includes('"archived":true')) {
+      const id = (String(url).match(/\/pages\/([^/?]+)$/) || [])[1];
+      const failStatus = id ? opts.archiveStatusById?.[id] : undefined;
+      if (failStatus) return { ok: false, status: failStatus, json: async () => ({ message: 'boom' }) };
+    }
+    return ok({});
+  });
+  vi.stubGlobal('fetch', spy);
+
+  const archivedIds = () => spy.mock.calls
+    .filter((c) => (String((c[1] as RequestInit)?.method || '').toUpperCase() === 'PATCH')
+      && String((c[1] as RequestInit)?.body || '').includes('"archived":true'))
+    .map((c) => (String(c[0]).match(/\/pages\/([^/?]+)$/) || [])[1])
+    .filter(Boolean) as string[];
+  const dueSoonQueried = () => spy.mock.calls.some((c) =>
+    String(c[0]).endsWith('/query') && String((c[1] as RequestInit)?.body || '').includes('Due Soon'));
+  const stalePageQueried = () => spy.mock.calls.some((c) =>
+    String(c[0]).endsWith('/query') && !String((c[1] as RequestInit)?.body || '').includes('Due Soon'));
+  return { spy, archivedIds, dueSoonQueried, stalePageQueried };
+}
+
+describe('sync_to_notion — cleanup + Due Soon reconciliation safety', () => {
+  beforeEach(() => {
+    tokenMock.mockResolvedValue('secret_test');
+    dropboxMock.mockResolvedValue([]);
+    quizzesMock.mockResolvedValue([]);
+    quizAttemptsMock.mockResolvedValue([]);
+    calendarMock.mockResolvedValue({ Objects: [] } as any);
+    gradesMock.mockResolvedValue([]);
+    newsMock.mockResolvedValue([]);
+    syncMock.mockResolvedValue({ created: 0, updated: 0, failed: 0 } as any);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('empty enrollment archives NOTHING — existing course pages AND Due Soon rows are preserved', async () => {
+    enrollmentsMock.mockResolvedValue({ Items: [] } as any);
+    const s = stubNotionFetch({
+      dueSoonRows: ['duesoon-1'], // an existing reminder row is present…
+      allPagesRows: [{ id: 'course-page-1', code: 'OLD101', name: 'Old Course' }],
+    });
+
+    const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
+    expect(result.success).toBe(true);
+
+    // …yet neither the reminder nor the course page is archived, and neither the
+    // Due Soon reconciliation nor the stale-page cleanup query is even issued.
+    expect(s.archivedIds()).toEqual([]);
+    expect(s.dueSoonQueried()).toBe(false);
+    expect(s.stalePageQueried()).toBe(false);
+  });
+
+  it('partial source failure archives NO existing Due Soon rows for the affected course', async () => {
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 123, Name: 'Intro to CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    // Dropbox fails → the course carries assignmentSourceFailures > 0 (non-authoritative).
+    dropboxMock.mockRejectedValue(new Error('dropbox unavailable'));
+    const s = stubNotionFetch({
+      dueSoonRows: ['duesoon-cs135'],                                  // existing reminder
+      allPagesRows: [{ id: 'cs135-page', code: 'CS135', name: 'Intro to CS' }], // still-active page
+    });
+
+    const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
+    expect(result.success).toBe(true);
+
+    // Due Soon reconciliation is skipped entirely → the existing reminder survives.
+    expect(s.dueSoonQueried()).toBe(false);
+    expect(s.archivedIds()).not.toContain('duesoon-cs135');
+    // (Stale-page cleanup may run since there is a verified active course, but the
+    // active CS135 page is not archived.)
+    expect(s.archivedIds()).not.toContain('cs135-page');
+  });
+
+  it('fully authoritative snapshot DOES archive genuinely stale Due Soon reminders', async () => {
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 123, Name: 'Intro to CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    // A real assignment (>=1, no failures) → no preservation metadata → authoritative.
+    dropboxMock.mockResolvedValue([{
+      Id: 11, Name: 'Assignment 1', DueDate: '2026-09-20T23:59:00Z', Assessment: { ScoreDenominator: 20 },
+    }] as any);
+    const s = stubNotionFetch({
+      dueSoonRows: ['duesoon-stale'], // a stale generated reminder to reconcile away
+      allPagesRows: [],               // cleanup finds no pages → archives nothing itself
+    });
+
+    const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
+    expect(result.success).toBe(true);
+
+    // The reconciliation ran and archived the stale reminder.
+    expect(s.dueSoonQueried()).toBe(true);
+    expect(s.archivedIds()).toContain('duesoon-stale');
+  });
+
+  it('surfaces a non-2xx Due Soon mutation without crashing the sync', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 123, Name: 'Intro to CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    dropboxMock.mockResolvedValue([{
+      Id: 11, Name: 'Assignment 1', DueDate: '2026-09-20T23:59:00Z', Assessment: { ScoreDenominator: 20 },
+    }] as any);
+    // Authoritative sync, but archiving the stale reminder fails with 500.
+    stubNotionFetch({ dueSoonRows: ['duesoon-stale'], archiveStatusById: { 'duesoon-stale': 500 } });
+
+    const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
+    // The overall sync still succeeds…
+    expect(result.success).toBe(true);
+    // …and the Due Soon failure is surfaced via a logged error.
+    const surfaced = errSpy.mock.calls.some((c) => String(c[0]).includes('Due Soon reconciliation failed'));
+    expect(surfaced).toBe(true);
   });
 });
