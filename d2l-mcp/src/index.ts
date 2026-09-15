@@ -669,14 +669,17 @@ function createServer(): McpServer {
   );
 
   // Register outline tools (outline.uwaterloo.ca)
-  registerMutatingTool(
+  // User-facing retrieval: they fetch + parse an outline and return it. The
+  // incidental upsertOutline cache write does not make them mutating from the
+  // user's perspective, so they are classified read-only (readOnlyHint: true).
+  registerReadTool(
     "get_course_outline",
     OutlineTools.get_course_outline.description,
     OutlineTools.get_course_outline.schema,
     wrapStudyToolHandler("get_course_outline", OutlineTools.get_course_outline.handler)
   );
 
-  registerMutatingTool(
+  registerReadTool(
     "get_my_course_outlines",
     OutlineTools.get_my_course_outlines.description,
     OutlineTools.get_my_course_outlines.schema,

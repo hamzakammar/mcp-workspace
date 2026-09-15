@@ -46,6 +46,8 @@ const expectedReadOnlyTools = [
   'plan_week',
   'piazza_semantic_search',
   'piazza_suggest_for_item',
+  'get_course_outline',
+  'get_my_course_outlines',
   'get_cached_outline',
   'get_quizzes',
   'get_assignment_rubric',
@@ -68,8 +70,6 @@ const expectedMutatingTools = [
   'tasks_add',
   'piazza_sync',
   'piazza_embed_missing',
-  'get_course_outline',
-  'get_my_course_outlines',
   'connect_crowdmark',
   'connect_outline',
   'connect_piazza',
@@ -90,6 +90,42 @@ describe('MCP tool annotations', () => {
       expect(mutatingToolNames.has(toolName)).toBe(true);
       expect(readOnlyToolNames.has(toolName)).toBe(false);
     }
+  });
+
+  it('explicitly classifies the outline retrieval tools as read-only', () => {
+    // Regression for owner correction on PR #6: get_course_outline and
+    // get_my_course_outlines are user-facing retrieval operations. Their
+    // incidental outline-cache write must not force approval gating.
+    for (const toolName of ['get_course_outline', 'get_my_course_outlines']) {
+      expect(readOnlyToolNames.has(toolName)).toBe(true);
+      expect(mutatingToolNames.has(toolName)).toBe(false);
+    }
+  });
+
+  it('never classifies a tool as both read-only and mutating', () => {
+    const overlap = [...readOnlyToolNames].filter((name) => mutatingToolNames.has(name));
+    expect(overlap).toEqual([]);
+  });
+
+  it('registers every string-named tool through an annotating registrar', () => {
+    // A bare `server.tool("name", ...)` bypasses readOnlyHint annotation.
+    // Only the two registrar helpers may call server.tool, and they pass the
+    // name via a variable — so any string-literal name here means a tool was
+    // registered without an explicit annotation. Fail loudly if so.
+    const bareRegistrations = Array.from(
+      indexSource.matchAll(/server\.tool\(\s*"([^"]+)"/g),
+      (match) => match[1]
+    );
+    expect(bareRegistrations).toEqual([]);
+  });
+
+  it('accounts for every registered tool in the expected read-only/mutating lists', () => {
+    // Any newly registered tool that is not classified in one of the expected
+    // lists must fail here, forcing a deliberate read-only vs mutating decision.
+    const classified = new Set<string>([...expectedReadOnlyTools, ...expectedMutatingTools]);
+    const registered = new Set<string>([...readOnlyToolNames, ...mutatingToolNames]);
+    const unaccounted = [...registered].filter((name) => !classified.has(name));
+    expect(unaccounted).toEqual([]);
   });
 
   it('registers all legacy piazza get/search tools as read-only', () => {
