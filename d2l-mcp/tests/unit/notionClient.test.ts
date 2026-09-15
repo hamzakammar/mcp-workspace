@@ -504,10 +504,16 @@ function okJson(body: unknown) {
   return { status: 200, ok: true, json: async () => body };
 }
 
+/** errJson — a fetch-Response-like object for a non-2xx JSON error. */
+function errJson(status: number, message = 'boom') {
+  return { status, ok: false, json: async () => ({ message }) };
+}
+
 /**
  * Route Notion fetch calls by URL + method against a simple in-memory page model,
  * recording every call so tests can assert on deletes/appends/patches. Supports
- * paginated block-children reads keyed by an optional cursor map.
+ * paginated block-children reads and optional forced failures for specific
+ * mutations (append and per-id delete) to exercise failure paths.
  */
 function routedNotionFetch(opts: {
   pageId: string;
@@ -515,6 +521,9 @@ function routedNotionFetch(opts: {
   childrenByBlockId?: Record<string, unknown[]>;
   // Optional pagination for the page's own children: pages after the first.
   pageChildrenPages?: Array<{ results: unknown[]; nextCursor: string | null }>;
+  // Force failures: non-2xx status for the append PATCH and/or specific DELETEs.
+  failAppendStatus?: number;
+  failDeleteStatusById?: Record<string, number>;
 }) {
   const calls: Array<{ url: string; method: string; body: any }> = [];
   const spy = vi.fn(async (url: string, init?: RequestInit) => {
@@ -542,7 +551,19 @@ function routedNotionFetch(opts: {
       }
       return okJson({ results: opts.childrenByBlockId?.[blockId] || [], has_more: false, next_cursor: null });
     }
-    // PATCH properties, PATCH append children, DELETE block, POST create → 200 {}.
+
+    // Append (PATCH block children) — optionally forced to fail.
+    if (method === 'PATCH' && childMatch && childMatch[1] === opts.pageId && opts.failAppendStatus) {
+      return errJson(opts.failAppendStatus);
+    }
+    // DELETE a specific block — optionally forced to fail.
+    if (method === 'DELETE') {
+      const idMatch = url.match(/\/blocks\/([^/?]+)$/);
+      const id = idMatch?.[1];
+      const failStatus = id ? opts.failDeleteStatusById?.[id] : undefined;
+      if (failStatus) return errJson(failStatus);
+    }
+    // PATCH properties, successful append/delete, POST create → 200 {}.
     return okJson({});
   });
   vi.stubGlobal('fetch', spy);
@@ -762,5 +783,65 @@ describe('course-page safety updates', () => {
     // Without pagination the callout (on page 2) would be missed and duplicated.
     expect(r.deletedIds()).toEqual(['mc']);
     expect(r.appendCalls()).toHaveLength(1);
+  });
+
+  it('appends the replacement BEFORE deleting the old callout (append-first ordering)', async () => {
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [{ id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } }],
+      childrenByBlockId: { mc: [] },
+    });
+
+    await updateCoursePage(TOKEN, 'page-1', baseCourseData);
+
+    const appendIdx = r.calls.findIndex((c) => c.method === 'PATCH' && c.url.includes('/blocks/page-1/children'));
+    const deleteIdx = r.calls.findIndex((c) => c.method === 'DELETE');
+    expect(appendIdx).toBeGreaterThanOrEqual(0);
+    expect(deleteIdx).toBeGreaterThanOrEqual(0);
+    // The new content must be written before the old callout is removed.
+    expect(appendIdx).toBeLessThan(deleteIdx);
+  });
+
+  it('preserves the old managed callout when the append fails (never erases the body)', async () => {
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [{ id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } }],
+      childrenByBlockId: { mc: [] },
+      failAppendStatus: 500,
+    });
+
+    await expect(updateCoursePage(TOKEN, 'page-1', baseCourseData)).rejects.toThrow(/append managed content failed \(500\)/i);
+    // The append failed, so NOTHING was deleted — the existing callout is intact.
+    expect(r.deletedIds()).toHaveLength(0);
+  });
+
+  it('leaves a recoverable duplicate and reports when old-callout cleanup fails after a successful append', async () => {
+    const r = routedNotionFetch({
+      pageId: 'page-1',
+      pageChildren: [{ id: 'mc', type: 'callout', callout: { rich_text: [{ plain_text: MARKER }] } }],
+      childrenByBlockId: { mc: [] },
+      failDeleteStatusById: { mc: 409 },
+    });
+
+    // Cleanup failure is surfaced…
+    await expect(updateCoursePage(TOKEN, 'page-1', baseCourseData)).rejects.toThrow(/cleanup of old managed callout/i);
+    // …the fresh callout WAS appended (append happened before the failed delete)…
+    expect(r.appendCalls()).toHaveLength(1);
+    // …and the delete of the old callout was attempted (both callouts now coexist —
+    // a recoverable duplicate, no data lost).
+    expect(r.calls.some((c) => c.method === 'DELETE' && c.url.endsWith('/blocks/mc'))).toBe(true);
+  });
+
+  it('surfaces a non-2xx properties PATCH as a thrown error', async () => {
+    // Force the page-properties PATCH to fail (a mutation before any body change).
+    const spy = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = (init?.method || 'GET').toUpperCase();
+      if (method === 'GET') return okJson({ results: [], has_more: false, next_cursor: null });
+      if (method === 'PATCH' && url.includes('/pages/page-1')) return errJson(400, 'bad property');
+      return okJson({});
+    });
+    vi.stubGlobal('fetch', spy);
+
+    await expect(updateCoursePage(TOKEN, 'page-1', baseCourseData)).rejects.toThrow(/update page failed \(400\)/i);
   });
 });

@@ -565,17 +565,19 @@ export async function updateCoursePage(
   // One-time cleanup path: the old unmarked sections remain until the user removes
   // them once by hand (or an explicit, separately-reviewed migration is run). This
   // is the documented, guessing-free alternative to risking user data.
+  //
+  // Replacement is FAILURE-SAFE and ordered append-first:
+  //   1. Discover the existing managed callout ID(s).
+  //   2. APPEND the fresh managed callout and verify the response succeeded.
+  //   3. Only then DELETE the previously-discovered old callout(s), verifying each.
+  // If the append fails we throw before deleting anything, so the existing body is
+  // never erased. If the append succeeds but a delete fails, both callouts are left
+  // in place (a recoverable duplicate) and we throw to surface the failure rather
+  // than risk losing the body. Every mutation response is checked.
   const children = await fetchAllChildren(token, pageId);
-  const idsToDelete = children.filter(isManagedCallout).map(b => b.id);
+  const oldManagedIds = children.filter(isManagedCallout).map(b => b.id);
 
-  for (const id of idsToDelete) {
-    await fetch(`${NOTION_BASE}/blocks/${id}`, {
-      method: 'DELETE',
-      headers: notionHeaders(token),
-    });
-  }
-
-  // Append fresh managed content inside a single marked callout.
+  // Append fresh managed content inside a single marked callout — FIRST.
   const newBlocks = [{
     object: 'block',
     type: 'callout',
@@ -586,11 +588,36 @@ export async function updateCoursePage(
     },
     children: buildCourseBody(course).slice(0, 99),
   }];
-  await fetch(`${NOTION_BASE}/blocks/${pageId}/children`, {
+  const appendResp = await fetch(`${NOTION_BASE}/blocks/${pageId}/children`, {
     method: 'PATCH',
     headers: notionHeaders(token),
     body: JSON.stringify({ children: newBlocks }),
   });
+  if (!appendResp.ok) {
+    const err = await appendResp.json().catch(() => ({})) as { message?: string };
+    // Nothing was deleted yet — the existing managed body is intact.
+    throw new Error(`Notion append managed content failed (${appendResp.status}): ${err.message ?? 'unknown error'}`);
+  }
+
+  // Now that the replacement exists, delete the OLD managed callout(s). If any delete
+  // fails, keep both callouts (recoverable duplicate) and report — never lose data.
+  const deleteFailures: string[] = [];
+  for (const id of oldManagedIds) {
+    const delResp = await fetch(`${NOTION_BASE}/blocks/${id}`, {
+      method: 'DELETE',
+      headers: notionHeaders(token),
+    });
+    if (!delResp.ok) {
+      deleteFailures.push(`${id} (${delResp.status})`);
+    }
+  }
+  if (deleteFailures.length > 0) {
+    throw new Error(
+      `Notion cleanup of old managed callout(s) failed: ${deleteFailures.join(', ')}. ` +
+      `The refreshed managed content was appended successfully; the stale callout(s) ` +
+      `remain and can be removed on the next successful sync (no data was lost).`,
+    );
+  }
 }
 
 /**

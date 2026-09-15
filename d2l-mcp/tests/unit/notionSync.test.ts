@@ -517,3 +517,74 @@ describe('sync_to_notion — cross-user isolation', () => {
     expect(dbsUsed).toEqual(['dbA', 'dbB']);
   });
 });
+
+// ─── Stale-page cleanup safety (empty enrollment is non-authoritative) ─────────
+
+describe('sync_to_notion — stale cleanup safety', () => {
+  beforeEach(() => {
+    tokenMock.mockResolvedValue('secret_test');
+    dropboxMock.mockResolvedValue([]);
+    quizzesMock.mockResolvedValue([]);
+    quizAttemptsMock.mockResolvedValue([]);
+    calendarMock.mockResolvedValue({ Objects: [] } as any);
+    gradesMock.mockResolvedValue([]);
+    newsMock.mockResolvedValue([]);
+    syncMock.mockResolvedValue({ created: 0, updated: 0, failed: 0 } as any);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('archives NOTHING when enrollment returns an empty (non-authoritative) result', async () => {
+    // Enrollment succeeds but is empty — must NOT be treated as "no courses" for
+    // destructive archival.
+    enrollmentsMock.mockResolvedValue({ Items: [] } as any);
+
+    // Notion DB actually contains a course page. If cleanup ran with an empty active
+    // set it would archive this page — the bug we are guarding against. The Due-Soon
+    // task query (filtered) returns nothing so it archives nothing on its own.
+    const fetchSpy = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = (init?.method || 'GET').toUpperCase();
+      const body = init?.body ? String(init.body) : '';
+      if (url.includes('/databases/') && url.endsWith('/query') && method === 'POST') {
+        if (body.includes('Due Soon')) {
+          return { ok: true, status: 200, json: async () => ({ results: [], has_more: false }) };
+        }
+        // Unfiltered queryAllPages (only reached if cleanup runs) → a live-looking page.
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            results: [{
+              id: 'existing-page',
+              properties: {
+                Name: { title: [{ plain_text: 'Old Course' }] },
+                'Course Code': { rich_text: [{ plain_text: 'OLD101' }] },
+              },
+            }],
+            has_more: false,
+          }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
+    expect(result.success).toBe(true);
+
+    // No page was archived…
+    const archivedAny = fetchSpy.mock.calls.some((c) => {
+      const init = c[1] as RequestInit | undefined;
+      return (init?.method || '').toUpperCase() === 'PATCH' && String(init?.body || '').includes('"archived":true');
+    });
+    expect(archivedAny).toBe(false);
+
+    // …and the unfiltered stale-cleanup query was never even issued (cleanup skipped).
+    const ranStaleQuery = fetchSpy.mock.calls.some((c) => {
+      const init = c[1] as RequestInit | undefined;
+      return String(c[0]).endsWith('/query') && !String(init?.body || '').includes('Due Soon');
+    });
+    expect(ranStaleQuery).toBe(false);
+  });
+});

@@ -666,8 +666,15 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
         await syncUpcomingTasks(notionToken, databaseId, courses);
       } catch { /* skip */ }
 
-      // Cleanup stale pages
-      await cleanupStalePages(notionToken, databaseId, buildActiveCodes(courses));
+      // Cleanup stale pages — but ONLY when we have a verified, non-empty active
+      // course list. A successful-but-empty getMyEnrollments() is NOT authoritative
+      // for destructive archival: treating it as "no courses" would archive every
+      // page. When there are zero verified active academic courses we skip cleanup.
+      if (activeCourses.length > 0) {
+        await cleanupStalePages(notionToken, databaseId, buildActiveCodes(courses));
+      } else {
+        console.error('[NOTION] Skipping stale-page cleanup: no verified active courses (non-authoritative empty enrollment).');
+      }
 
       lastSyncTime.set(userId, Date.now());
       console.error(`[NOTION] Background sync complete: ${courses.length} courses`);
@@ -747,8 +754,12 @@ export const notionTools = {
           upcomingCount = await syncUpcomingTasks(notionToken, args.databaseId, courses);
         } catch { /* skip */ }
 
-        // 6. Cleanup stale pages
-        const archived = await cleanupStalePages(notionToken, args.databaseId, buildActiveCodes(courses));
+        // 6. Cleanup stale pages — skip when there are no verified active courses.
+        // An empty enrollment snapshot is not authoritative for destructive archival
+        // (it would otherwise archive every page).
+        const archived = activeCourses.length > 0
+          ? await cleanupStalePages(notionToken, args.databaseId, buildActiveCodes(courses))
+          : 0;
 
         lastSyncTime.set(userId!, Date.now());
 
