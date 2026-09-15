@@ -41,13 +41,59 @@ interface RawNewsItem {
   Body: { Html: string } | null;
 }
 
+interface RawCalendarEvent {
+  Title: string;
+  EndDateTime?: string | null;
+  StartDateTime?: string | null;
+  CalendarEventViewUrl?: string;
+  OrgUnitName?: string;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const CONNECT_HINT =
   'Connect Notion via the Horizon dashboard (/onboard) — click "Connect" next to Notion, ' +
   'then authorise the integration and paste the database ID shown on the page.';
 
+function normalizeCourseCodeExact(input: string): string | null {
+  const normalized = input.replace(/[\s_-]+/g, '').toUpperCase();
+  const match = normalized.match(/([A-Z]{2,6}\d{2,3}[A-Z]?)/);
+  return match ? match[1] : null;
+}
+
+function parseCalendarEventDate(event: {
+  dueDateIso?: string | null;
+  EndDateTime?: string | null;
+  StartDateTime?: string | null;
+  dueDate?: string | null;
+}): string | null {
+  const candidates = [event.dueDateIso, event.EndDateTime, event.StartDateTime, event.dueDate];
+  for (const candidate of candidates) {
+    if (!candidate || !candidate.trim()) continue;
+    const parsed = new Date(candidate);
+    if (!isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+  return null;
+}
+
+function mergeAssignments(assignments: AssignmentInfo[], incoming: AssignmentInfo): void {
+  const key = incoming.name.trim().toLowerCase();
+  const existing = assignments.find((a) => a.name.trim().toLowerCase() === key);
+  if (!existing) {
+    assignments.push(incoming);
+    return;
+  }
+  if (!existing.dueDate && incoming.dueDate) existing.dueDate = incoming.dueDate;
+  if (existing.maxPoints === null && incoming.maxPoints !== null) existing.maxPoints = incoming.maxPoints;
+  if ((!existing.grade || existing.grade.length === 0) && incoming.grade) existing.grade = incoming.grade;
+  if (!existing.url && incoming.url) existing.url = incoming.url;
+  if (existing.status === 'Not Started' && incoming.status !== 'Not Started') existing.status = incoming.status;
+}
+
 async function fetchCourseData(orgUnitId: number, name: string, code: string): Promise<CourseData> {
+  let assignmentSourceFailures = 0;
   const courseData: CourseData = {
     orgUnitId,
     name,
@@ -64,7 +110,7 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
     const raw = (await client.getDropboxFolders(orgUnitId)) as RawAssignment[];
     const folders: RawAssignment[] = Array.isArray(raw) ? raw : [];
     for (const folder of folders) {
-      courseData.assignments.push({
+      mergeAssignments(courseData.assignments, {
         name: folder.Name,
         dueDate: folder.DueDate,
         maxPoints: folder.Assessment?.ScoreDenominator ?? null,
@@ -72,7 +118,9 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
         url: `https://${d2lHost}/d2l/lms/dropbox/user/folder_submit_files.d2l?db=${folder.Id}&grpid=0&isprv=0&bp=0&ou=${orgUnitId}`,
       });
     }
-  } catch { /* course may not expose dropbox */ }
+  } catch {
+    assignmentSourceFailures++;
+  }
 
   // Fetch quizzes with submission status
   try {
@@ -98,7 +146,7 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
       } catch { /* skip attempt check */ }
 
       const quizId = (quiz as any).QuizId || (quiz as any).Id || '0';
-      courseData.assignments.push({
+      mergeAssignments(courseData.assignments, {
         name: quiz.Name,
         dueDate: quiz.DueDate ?? null,
         maxPoints: null,
@@ -106,7 +154,35 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
         url: `https://${d2lHost}/d2l/lms/quizzing/user/quiz_summary.d2l?qi=${quizId}&ou=${orgUnitId}`,
       });
     }
-  } catch { /* quizzes may not be accessible */ }
+  } catch {
+    assignmentSourceFailures++;
+  }
+
+  // Fetch calendar events and merge as additional assignment sources.
+  try {
+    const now = new Date();
+    const startDateTime = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const endDateTime = new Date(now.getTime() + 180 * 24 * 60 * 60 * 1000).toISOString();
+    const calendarRaw = (await client.getMyCalendarEvents(orgUnitId, startDateTime, endDateTime)) as
+      | { Objects: RawCalendarEvent[] }
+      | RawCalendarEvent[];
+    const events = Array.isArray(calendarRaw) ? calendarRaw : (calendarRaw.Objects || []);
+    const targetCode = normalizeCourseCodeExact(code) ?? normalizeCourseCodeExact(name);
+    for (const event of events) {
+      if (!event.Title) continue;
+      const eventCode = normalizeCourseCodeExact(event.OrgUnitName || '');
+      if (targetCode && eventCode && eventCode !== targetCode) continue;
+      mergeAssignments(courseData.assignments, {
+        name: event.Title.trim(),
+        dueDate: parseCalendarEventDate(event),
+        maxPoints: null,
+        status: 'Not Started',
+        url: event.CalendarEventViewUrl || undefined,
+      });
+    }
+  } catch {
+    assignmentSourceFailures++;
+  }
 
   // Fetch grades
   try {
@@ -145,6 +221,13 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
       });
     }
   } catch { /* news may not be accessible */ }
+
+  if (courseData.assignments.length === 0 || assignmentSourceFailures > 0) {
+    courseData.syncMetadata = {
+      preserveExistingAssignments: courseData.assignments.length === 0,
+      assignmentSourceFailures,
+    };
+  }
 
   return courseData;
 }
@@ -212,9 +295,8 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
   for (const course of courses) {
     try {
       // Extract course code from D2L code (e.g. "PSYCH207_081_cel_1265" → "PSYCH207")
-      const codeMatch = course.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6})(\d{2,3})/);
-      if (!codeMatch) continue;
-      const courseCode = `${codeMatch[1]}${codeMatch[2]}`;
+      const courseCode = normalizeCourseCodeExact(course.code) ?? normalizeCourseCodeExact(course.name);
+      if (!courseCode) continue;
 
       const outline = await fetchCourseOutline(cookieHeader, courseCode, term);
 
@@ -252,7 +334,7 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
             if (parsedDate && !existing.dueDate) existing.dueDate = parsedDate;
           } else {
             // New item from outline — add it
-            course.assignments.push({
+            mergeAssignments(course.assignments, {
               name: cleanOutlineText(assessment.name),
               dueDate: parsedDate,
               maxPoints: null,
@@ -433,9 +515,8 @@ async function cleanupStalePages(
     for (const [key, pageId] of existingPages) {
       // Only check courseCode-only keys (not "code|title" compound keys)
       if (key.includes('|')) continue;
-      // Extract short code from the Notion page's Course Code (e.g. "PSYCH207_081_cel_1265" → "PSYCH207")
-      const shortCode = key.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{2,3})/)?.[1] || key;
-      if (!activeCodes.has(shortCode) && !activeCodes.has(key)) {
+      const normalizedCode = normalizeCourseCodeExact(key) ?? key;
+      if (!activeCodes.has(normalizedCode) && !activeCodes.has(key)) {
         await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
           method: 'PATCH',
           headers: { 'Authorization': `Bearer ${notionToken}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' },
@@ -455,6 +536,7 @@ async function cleanupStalePages(
  * Throttled to max once per hour.
  */
 export async function backgroundNotionSync(userId: string): Promise<void> {
+  if (process.env.BACKGROUND_NOTION_SYNC_ENABLED === 'false') return;
   if (syncInProgress.has(userId)) return;
 
   // Throttle: skip if synced less than 1 hour ago
@@ -492,10 +574,7 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
     } catch { /* skip */ }
 
     // Cleanup stale pages
-    const activeCodes = new Set(courses.map(c => {
-      const m = c.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{2,3})/);
-      return m ? m[1] : c.code;
-    }));
+    const activeCodes = new Set(courses.map(c => normalizeCourseCodeExact(c.code) ?? c.code));
     await cleanupStalePages(notionToken, databaseId, activeCodes);
 
     lastSyncTime.set(userId, Date.now());
@@ -576,10 +655,7 @@ export const notionTools = {
         } catch { /* skip */ }
 
         // 6. Cleanup stale pages
-        const activeCodes = new Set(courses.map(c => {
-          const m = c.code.replace(/\s+/g, '').toUpperCase().match(/([A-Z]{2,6}\d{2,3})/);
-          return m ? m[1] : c.code;
-        }));
+        const activeCodes = new Set(courses.map(c => normalizeCourseCodeExact(c.code) ?? c.code));
         const archived = await cleanupStalePages(notionToken, args.databaseId, activeCodes);
 
         lastSyncTime.set(userId!, Date.now());

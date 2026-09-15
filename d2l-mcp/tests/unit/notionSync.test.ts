@@ -42,6 +42,9 @@ vi.mock('../../src/client.js', () => ({
   client: {
     getMyEnrollments: vi.fn(),
     getDropboxFolders: vi.fn(),
+    getQuizzes: vi.fn(),
+    getQuizAttempts: vi.fn(),
+    getMyCalendarEvents: vi.fn(),
     getMyGradeValues: vi.fn(),
     getNews: vi.fn(),
   },
@@ -56,6 +59,9 @@ const syncMock = vi.mocked(syncCourses);
 const tokenMock = vi.mocked(getNotionToken);
 const enrollmentsMock = vi.mocked(client.getMyEnrollments);
 const dropboxMock = vi.mocked(client.getDropboxFolders);
+const quizzesMock = vi.mocked(client.getQuizzes);
+const quizAttemptsMock = vi.mocked(client.getQuizAttempts);
+const calendarMock = vi.mocked(client.getMyCalendarEvents);
 const gradesMock = vi.mocked(client.getMyGradeValues);
 const newsMock = vi.mocked(client.getNews);
 
@@ -103,6 +109,9 @@ describe('sync_to_notion — course data', () => {
       }],
     } as any);
     dropboxMock.mockResolvedValue([]);
+    quizzesMock.mockResolvedValue([]);
+    quizAttemptsMock.mockResolvedValue([]);
+    calendarMock.mockResolvedValue({ Objects: [] } as any);
     gradesMock.mockResolvedValue([]);
     newsMock.mockResolvedValue([]);
   });
@@ -166,6 +175,109 @@ describe('sync_to_notion — course data', () => {
     expect(capturedCourses[0].announcements).toHaveLength(1);
     expect(capturedCourses[0].announcements[0].title).toBe('Welcome!');
   });
+
+  it('marks assignment sync metadata to preserve existing content when all live sources are empty', async () => {
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
+      return { created: 1, updated: 0, failed: 0 };
+    });
+
+    await TOOL.handler({ databaseId: 'db-1' });
+    expect(capturedCourses[0].assignments).toHaveLength(0);
+    expect(capturedCourses[0].syncMetadata?.preserveExistingAssignments).toBe(true);
+  });
+
+  it('merges mixed assignment sources (dropbox + quizzes + calendar) without duplicates', async () => {
+    dropboxMock.mockResolvedValue([{
+      Id: 11,
+      Name: 'Assignment 1',
+      DueDate: '2026-10-01T23:59:00Z',
+      Assessment: { ScoreDenominator: 20 },
+    }] as any);
+    quizzesMock.mockResolvedValue({
+      Objects: [{
+        Id: 22,
+        Name: 'Quiz 1',
+        DueDate: '2026-10-02T23:59:00Z',
+        IsActive: true,
+        AttemptsAllowed: 1,
+      }],
+    } as any);
+    quizAttemptsMock.mockResolvedValue({ Objects: [{ Attempt: { AttemptNumber: 1 } }] } as any);
+    calendarMock.mockResolvedValue({
+      Objects: [
+        {
+          Title: 'Assignment 1',
+          EndDateTime: '2026-10-01T23:59:00Z',
+          OrgUnitName: 'CS135',
+          CalendarEventViewUrl: 'https://calendar/a1',
+        },
+        {
+          Title: 'Project Milestone',
+          EndDateTime: null,
+          OrgUnitName: 'CS135',
+          CalendarEventViewUrl: 'https://calendar/p1',
+        },
+      ],
+    } as any);
+
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
+      return { created: 1, updated: 0, failed: 0 };
+    });
+
+    await TOOL.handler({ databaseId: 'db-1' });
+    expect(capturedCourses[0].assignments.map((a: any) => a.name)).toEqual([
+      'Assignment 1',
+      'Quiz 1',
+      'Project Milestone',
+    ]);
+    expect(capturedCourses[0].assignments[2].dueDate).toBeNull();
+  });
+
+  it('uses exact normalized course-code matching for calendar merges', async () => {
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 999, Name: 'Physics Lab', Code: 'PHYS121L', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    calendarMock.mockResolvedValue({
+      Objects: [
+        { Title: 'Main Course Event', EndDateTime: '2026-10-01T10:00:00Z', OrgUnitName: 'PHYS121' },
+        { Title: 'Lab Event', EndDateTime: '2026-10-03T10:00:00Z', OrgUnitName: 'PHYS121L' },
+      ],
+    } as any);
+
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
+      return { created: 1, updated: 0, failed: 0 };
+    });
+
+    await TOOL.handler({ databaseId: 'db-1' });
+    expect(capturedCourses[0].assignments.map((a: any) => a.name)).toEqual(['Lab Event']);
+  });
+
+  it('records partial source failures so existing assignments can be preserved downstream', async () => {
+    dropboxMock.mockRejectedValue(new Error('dropbox unavailable'));
+    quizzesMock.mockResolvedValue({ Objects: [] } as any);
+    calendarMock.mockResolvedValue({
+      Objects: [{ Title: 'Calendar Task', EndDateTime: '2026-10-05T10:00:00Z', OrgUnitName: 'CS135' }],
+    } as any);
+
+    let capturedCourses: any[] = [];
+    syncMock.mockImplementation(async (_t, _db, courses) => {
+      capturedCourses = courses;
+      return { created: 1, updated: 0, failed: 0 };
+    });
+
+    await TOOL.handler({ databaseId: 'db-1' });
+    expect(capturedCourses[0].assignments.map((a: any) => a.name)).toContain('Calendar Task');
+    expect(capturedCourses[0].syncMetadata?.assignmentSourceFailures).toBeGreaterThan(0);
+  });
 });
 
 // ─── Summary format ──────────────────────────────────────────────────────────
@@ -180,6 +292,9 @@ describe('sync_to_notion — summary format', () => {
       }],
     } as any);
     dropboxMock.mockResolvedValue([]);
+    quizzesMock.mockResolvedValue([]);
+    quizAttemptsMock.mockResolvedValue([]);
+    calendarMock.mockResolvedValue({ Objects: [] } as any);
     gradesMock.mockResolvedValue([]);
     newsMock.mockResolvedValue([]);
   });
@@ -230,6 +345,9 @@ describe('sync_to_notion — error resilience', () => {
       }],
     } as any);
     dropboxMock.mockResolvedValue([]);
+    quizzesMock.mockResolvedValue([]);
+    quizAttemptsMock.mockResolvedValue([]);
+    calendarMock.mockResolvedValue({ Objects: [] } as any);
     gradesMock.mockResolvedValue([]);
     newsMock.mockResolvedValue([]);
     syncMock.mockRejectedValue(new Error('Notion query failed (404): object_not_found'));

@@ -25,9 +25,12 @@ vi.mock('../../src/utils/supabase.js', () => ({
 import {
   validateNotionToken,
   queryAllPages,
+  createCoursePage,
+  updateCoursePage,
   createAssignmentPage,
   updateAssignmentPage,
   syncAssignments,
+  type CourseData,
   type NotionAssignment,
 } from '../../src/study/notionClient.js';
 
@@ -61,6 +64,21 @@ afterEach(() => {
 
 const TOKEN = 'secret_test_token_abc123';
 const DB_ID = 'db-1234-5678';
+
+const baseCourseData: CourseData = {
+  orgUnitId: 1,
+  name: 'Intro to CS',
+  code: 'CS135',
+  isActive: true,
+  assignments: [{
+    name: 'Assignment 1',
+    dueDate: '2026-03-15T23:59:00Z',
+    maxPoints: 20,
+    status: 'Not Started',
+  }],
+  grades: [],
+  announcements: [],
+};
 
 // ─── validateNotionToken ───────────────────────────────────────────────────────
 
@@ -476,5 +494,94 @@ describe('syncAssignments', () => {
       { delayMs: 0 },
     );
     expect(result.created).toBe(2);
+  });
+});
+
+describe('course-page safety updates', () => {
+  it('creates course pages with a managed live-sync callout section', async () => {
+    const spy = vi.fn().mockResolvedValue({ status: 200, ok: true, json: async () => ({ id: 'page-1' }) });
+    vi.stubGlobal('fetch', spy);
+
+    await createCoursePage(TOKEN, DB_ID, baseCourseData);
+
+    const body = JSON.parse((spy.mock.calls[0] as [string, RequestInit])[1].body as string);
+    expect(body.children[0].type).toBe('callout');
+    expect(body.children[0].callout.rich_text[0].text.content).toMatch(/live sync/i);
+  });
+
+  it('preserves non-managed manual blocks when updating a course page', async () => {
+    const spy = vi.fn()
+      // read statuses
+      .mockResolvedValueOnce({
+        status: 200,
+        ok: true,
+        json: async () => ({
+          results: [
+            {
+              id: 'manual-block',
+              type: 'paragraph',
+              paragraph: { rich_text: [{ plain_text: 'Manual notes' }] },
+            },
+            {
+              id: 'managed-callout',
+              type: 'callout',
+              callout: { rich_text: [{ plain_text: '🔄 Horizon Live Sync (auto-managed)' }] },
+            },
+          ],
+        }),
+      })
+      // managed callout children for statuses
+      .mockResolvedValueOnce({ status: 200, ok: true, json: async () => ({ results: [] }) })
+      // page properties patch
+      .mockResolvedValueOnce({ status: 200, ok: true, json: async () => ({}) })
+      // list blocks for managed deletion
+      .mockResolvedValueOnce({
+        status: 200,
+        ok: true,
+        json: async () => ({
+          results: [
+            { id: 'manual-block', type: 'paragraph' },
+            { id: 'managed-callout', type: 'callout', callout: { rich_text: [{ plain_text: '🔄 Horizon Live Sync (auto-managed)' }] } },
+          ],
+        }),
+      })
+      // delete only managed callout
+      .mockResolvedValueOnce({ status: 200, ok: true, json: async () => ({}) })
+      // append managed callout
+      .mockResolvedValueOnce({ status: 200, ok: true, json: async () => ({}) });
+    vi.stubGlobal('fetch', spy);
+
+    await updateCoursePage(TOKEN, 'page-1', baseCourseData);
+
+    const deletedUrls = spy.mock.calls
+      .filter((c) => ((c[1] as RequestInit)?.method || 'GET') === 'DELETE')
+      .map((c) => c[0] as string);
+    expect(deletedUrls.length).toBe(1);
+    expect(deletedUrls).not.toContain(expect.stringContaining('/blocks/manual-block'));
+  });
+
+  it('skips managed-content replacement when source data is empty and must be preserved', async () => {
+    const preserveCourse: CourseData = {
+      ...baseCourseData,
+      assignments: [],
+      syncMetadata: { preserveExistingAssignments: true },
+    };
+    const spy = vi.fn()
+      // read statuses
+      .mockResolvedValueOnce({ status: 200, ok: true, json: async () => ({ results: [] }) })
+      // read snapshots
+      .mockResolvedValueOnce({ status: 200, ok: true, json: async () => ({ results: [] }) })
+      // patch properties only
+      .mockResolvedValueOnce({ status: 200, ok: true, json: async () => ({}) });
+    vi.stubGlobal('fetch', spy);
+
+    await updateCoursePage(TOKEN, 'page-1', preserveCourse);
+
+    const hasDelete = spy.mock.calls.some((c) => ((c[1] as RequestInit)?.method || 'GET') === 'DELETE');
+    const hasChildrenPatch = spy.mock.calls.some((c) =>
+      (c[0] as string).includes('/blocks/page-1/children') && ((c[1] as RequestInit)?.method === 'PATCH')
+    );
+    expect(hasDelete).toBe(false);
+    expect(hasChildrenPatch).toBe(false);
   });
 });
