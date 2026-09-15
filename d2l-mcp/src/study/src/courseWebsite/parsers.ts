@@ -170,8 +170,10 @@ function parseAssessments($: cheerio.CheerioAPI, baseUrl: string, source: Course
     const itemType = classifyAssessment(text);
     if (!itemType) return;
     const { dueText, dueAtIso } = extractDue(text, fallbackYear, source.timezone);
-    // Require either a due date or an explicit "due" marker to treat as an assessment.
-    if (!dueText && !/\bdue\b/i.test(text)) return;
+    // Require a PARSED date to treat a row as a dated assessment. This avoids
+    // false positives from prose that merely contains the word "due" (e.g. an
+    // extension policy) with no actual date.
+    if (!dueText) return;
 
     const title = deriveTitle(text);
     const key = title.toLowerCase();

@@ -101,27 +101,26 @@ export const CS241_FALL_2026: CourseWebsiteSource = {
   term: FALL_2026,
   timezone: "America/Toronto",
   allowedOrigins: [STUDENT_CS],
+  // Canonical CS241 pages are directory index pages (confirmed via live
+  // verification), not *.shtml. Assignments (A1–A8 with exact due times) live at
+  // /~cs241/assignments/. Schedule (classes.uwaterloo.ca) and policies/outline
+  // (outline.uwaterloo.ca) are on OTHER origins — out of this connector's scope
+  // and handled by the existing outline connector; recorded as blind spots below.
   approvedUrls: [
     { url: `${STUDENT_CS}/~cs241/`, pageType: "home", parser: "generic",
-      expectedContent: ["links to assignments/schedule/notes/tutorials/policies"] },
-    // Canonical page candidates. Exact filenames are confirmed during live
-    // verification; discovery (below) also picks up the real same-origin pages.
-    { url: `${STUDENT_CS}/~cs241/a/`, pageType: "assignments", parser: "cs241-assignments",
+      expectedContent: ["links to assignments/notes/tools", "Piazza", "outline link"] },
+    { url: `${STUDENT_CS}/~cs241/assignments/`, pageType: "assignments", parser: "cs241-assignments",
       expectedContent: ["A1 through A8", "exact due dates and times"] },
-    { url: `${STUDENT_CS}/~cs241/schedule.shtml`, pageType: "schedule", parser: "cs241-schedule",
-      expectedContent: ["lecture schedule", "topics"] },
-    { url: `${STUDENT_CS}/~cs241/notes.shtml`, pageType: "notes", parser: "notes-index",
+    { url: `${STUDENT_CS}/~cs241/notes/`, pageType: "notes", parser: "notes-index",
       expectedContent: ["lecture notes / slides"] },
-    { url: `${STUDENT_CS}/~cs241/tutorials.shtml`, pageType: "tutorials", parser: "generic",
-      expectedContent: ["tutorial materials"] },
-    { url: `${STUDENT_CS}/~cs241/policies.shtml`, pageType: "policies", parser: "generic",
-      expectedContent: ["late policy", "academic integrity"] },
+    { url: `${STUDENT_CS}/~cs241/tools/`, pageType: "reference", parser: "generic",
+      expectedContent: ["tools / reference material"] },
   ],
   linkDiscovery: {
     enabled: true,
+    // Same-origin CS241 pages: directory index pages and .s?html files.
     allowPatterns: [
-      /^https:\/\/student\.cs\.uwaterloo\.ca\/~cs241\/[a-z0-9/._-]*\.(s?html)$/i,
-      /^https:\/\/student\.cs\.uwaterloo\.ca\/~cs241\/a\/?$/i,
+      /^https:\/\/student\.cs\.uwaterloo\.ca\/~cs241\/[a-z0-9/_-]*(\/|\.s?html)$/i,
     ],
     referenceOnlyPatterns: [
       /\.pdf($|\?)/i,
@@ -134,6 +133,8 @@ export const CS241_FALL_2026: CourseWebsiteSource = {
   submissionBlindSpots: [
     "MarkUs submission status is not observable from public course pages",
     "Crowdmark grade/feedback status is not observable from public course pages",
+    "CS241 lecture schedule lives on classes.uwaterloo.ca (different origin) — out of scope here",
+    "CS241 policies/outline live on outline.uwaterloo.ca (different origin) — handled by the outline connector",
     "Authenticated CS241 pages (if any) are treated as unavailable — auth is never bypassed",
   ],
 };
