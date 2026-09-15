@@ -2,32 +2,30 @@
  * Course-website ingestion connector — unit tests.
  *
  * Deterministic: inline HTML fixtures + stubbed global fetch + injected DNS
- * resolver. No live network is required for the normal suite.
+ * resolver + a scope-aware, failure-injectable Supabase fake (including the atomic
+ * ingest RPC). No live network is required for the normal suite.
  */
 
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 
-// Keep the normal suite off the network: the connector's default DNS resolver is
-// mocked to a fixed public UW address so no real DNS lookups occur.
-vi.mock("node:dns/promises", () => ({
-  lookup: async () => [{ address: "142.150.1.1", family: 4 }],
-}));
+vi.mock("node:dns/promises", () => ({ lookup: async () => [{ address: "142.150.1.1", family: 4 }] }));
 
-// Supabase is mocked with a small scope-aware recording fake (configured per test).
+interface FakeSnap { id: string; user_id: string; course_code: string; term: string; url: string; content_hash: string | null; parser_version: string; parse_status: string }
 const db = {
-  existingItem: null as null | { id: string; due_at: string | null; conflicts: unknown[]; first_seen_at: string },
+  existingItem: null as any,
   otherTasks: [] as Array<{ title: string; due_at: string | null; source: string }>,
   canonicalItems: [] as unknown[],
-  // Scope-aware so dedup lookups respect user+course+term+url.
-  snapshots: [] as Array<{ id: string; user_id: string; course_code: string; term: string; url: string; content_hash: string | null }>,
-  recorded: [] as Array<{ table: string; op: string; row?: any; filters: Record<string, unknown> }>,
-  // Force a specific DB stage to fail (to exercise error propagation).
-  failOn: {} as { snapshotInsert?: boolean; itemUpsert?: boolean; taskUpsert?: boolean; snapshotLatest?: boolean; itemsRead?: boolean; snapshotsRead?: boolean },
+  snapshots: [] as FakeSnap[],
+  recorded: [] as Array<{ table?: string; op: string; row?: any; filters?: Record<string, unknown> }>,
+  rpcCalls: [] as Array<{ name: string; payload: any }>,
+  // Force a stage to fail. rpcFail simulates the atomic ingest rolling back.
+  failOn: {} as { snapshotInsert?: boolean; snapshotLatest?: boolean; itemsRead?: boolean; snapshotsRead?: boolean },
+  rpcFail: null as null | { stage: "snapshot" | "canonical_item" | "task"; sourceRef?: string },
   seq: 0,
 };
 function resetDb() {
   db.existingItem = null; db.otherTasks = []; db.canonicalItems = [];
-  db.snapshots = []; db.recorded = []; db.failOn = {}; db.seq = 0;
+  db.snapshots = []; db.recorded = []; db.rpcCalls = []; db.failOn = {}; db.rpcFail = null; db.seq = 0;
 }
 const dbErr = (message: string) => ({ data: null, error: { message } });
 
@@ -36,29 +34,23 @@ vi.mock("../../src/utils/supabase.js", () => {
     const state = { table, op: "select", row: undefined as any, filters: {} as Record<string, unknown> };
     const resolve = async () => {
       db.recorded.push({ table, op: state.op, row: state.row, filters: { ...state.filters } });
-      if (state.op === "insert") { // snapshots only
+      if (state.op === "insert") { // recordSnapshotOnly path (snapshots)
         if (db.failOn.snapshotInsert) return dbErr("snapshot insert boom");
         const id = `snap-${++db.seq}`;
-        db.snapshots.push({ id, user_id: state.row.user_id, course_code: state.row.course_code, term: state.row.term, url: state.row.url, content_hash: state.row.content_hash ?? null });
+        db.snapshots.push({ id, user_id: state.row.user_id, course_code: state.row.course_code, term: state.row.term, url: state.row.url, content_hash: state.row.content_hash ?? null, parser_version: state.row.parser_version, parse_status: state.row.parse_status });
         return { data: { id }, error: null };
       }
-      if (state.op === "upsert") {
-        if (table === "course_website_items" && db.failOn.itemUpsert) return dbErr("item upsert boom");
-        if (table === "tasks" && db.failOn.taskUpsert) return dbErr("task upsert boom");
-        return { data: null, error: null };
-      }
-      // selects
       if (table === "course_website_snapshots") {
-        if (state.filters.__latest) {
-          if (db.failOn.snapshotLatest) return dbErr("snapshot latest boom");
-          const matches = db.snapshots.filter((s) =>
-            s.user_id === state.filters.user_id && s.course_code === state.filters.course_code &&
-            s.term === state.filters.term && s.url === state.filters.url);
-          const latest = matches.length ? matches[matches.length - 1] : null;
-          return { data: latest ? { id: latest.id, content_hash: latest.content_hash } : null, error: null };
-        }
+        // Scoped dedup lookup / snapshot read (newest-first).
+        if (db.failOn.snapshotLatest) return dbErr("snapshot lookup boom");
         if (db.failOn.snapshotsRead) return dbErr("snapshots read boom");
-        return { data: db.snapshots, error: null };
+        const f = state.filters;
+        const matches = db.snapshots.filter((s) =>
+          (f.user_id === undefined || s.user_id === f.user_id) &&
+          (f.course_code === undefined || s.course_code === f.course_code) &&
+          (f.term === undefined || s.term === f.term) &&
+          (f.url === undefined || s.url === f.url));
+        return { data: [...matches].reverse(), error: null }; // newest first
       }
       if (table === "course_website_items") {
         if (state.filters.source_ref !== undefined) return { data: db.existingItem, error: null };
@@ -69,34 +61,49 @@ vi.mock("../../src/utils/supabase.js", () => {
       return { data: null, error: null };
     };
     const q: any = {};
-    q.select = () => q;
-    q.eq = (k: string, v: unknown) => { state.filters[k] = v; return q; };
-    q.neq = (k: string, v: unknown) => { state.filters[`neq_${k}`] = v; return q; };
-    q.order = () => q;
-    q.limit = () => q;
+    q.select = () => q; q.eq = (k: string, v: unknown) => { state.filters[k] = v; return q; };
+    q.neq = () => q; q.order = () => q; q.limit = () => q;
     q.insert = (row: any) => { state.op = "insert"; state.row = row; return q; };
     q.upsert = (row: any) => { state.op = "upsert"; state.row = row; return q; };
-    q.maybeSingle = () => { if (table === "course_website_snapshots" && state.op === "select") state.filters.__latest = true; return resolve(); };
+    q.maybeSingle = () => resolve();
     q.then = (res: any, rej: any) => resolve().then(res, rej);
     return q;
   }
-  return { supabase: { from: (t: string) => makeQuery(t) } };
+  async function rpc(name: string, params: any) {
+    db.rpcCalls.push({ name, payload: params?.p_payload });
+    if (name === "ingest_course_website_page") {
+      if (db.rpcFail) {
+        // Atomic function raised → whole page transaction rolls back (nothing committed).
+        return dbErr(`stage=${db.rpcFail.stage} source_ref=${db.rpcFail.sourceRef ?? ""} boom`);
+      }
+      const p = params.p_payload;
+      const dedup = p.dedup_snapshot_id;
+      let snapshotId = dedup;
+      let inserted = 0;
+      if (!dedup) {
+        const id = `snap-${++db.seq}`;
+        db.snapshots.push({ id, user_id: p.user_id, course_code: p.course_code, term: p.term, url: p.url, content_hash: p.content_hash ?? null, parser_version: p.parser_version, parse_status: p.parse_status });
+        snapshotId = id; inserted = 1;
+      }
+      return { data: { snapshot_id: snapshotId, deduped: !!dedup, snapshots_inserted: inserted, items_upserted: (p.items || []).length, tasks_upserted: (p.tasks || []).length }, error: null };
+    }
+    return { data: null, error: null };
+  }
+  return { supabase: { from: (t: string) => makeQuery(t), rpc } };
 });
 
-import {
-  isPrivateIp, assertUrlAllowed, fetchPage, type LookupFn,
-} from "../../src/study/src/courseWebsite/fetcher.js";
+import { isPrivateIp, assertUrlAllowed, fetchPage, type LookupFn } from "../../src/study/src/courseWebsite/fetcher.js";
 import { parsePage, extractDue } from "../../src/study/src/courseWebsite/parsers.js";
 import { zonedWallTimeToUtcIso } from "../../src/study/src/courseWebsite/timezone.js";
 import {
-  contentHash, shouldInsertSnapshot, buildCanonicalItems, flagCrossSourceConflicts,
-  isContentOutcome, sourceRefFor, recordSnapshot,
+  contentHash, buildCanonicalItems, flagCrossSourceConflicts, sourceRefFor,
+  pickDedupSnapshotId, ingestPage, recordSnapshotOnly, buildTaskRows,
 } from "../../src/study/src/courseWebsite/store.js";
 import { SE212_FALL_2026, CS241_FALL_2026, FALL_2026 } from "../../src/study/src/courseWebsite/sources.js";
 import { CourseWebsiteTools } from "../../src/study/src/courseWebsite/tools.js";
 
-const publicLookup: LookupFn = async () => [{ address: "142.150.1.1" }];       // UW public range
-const privateLookup: LookupFn = async () => [{ address: "10.0.0.5" }];          // SSRF target
+const publicLookup: LookupFn = async () => [{ address: "142.150.1.1" }];
+const privateLookup: LookupFn = async () => [{ address: "10.0.0.5" }];
 
 function htmlResponse(body: string, headers: Record<string, string> = {}) {
   const h = new Map(Object.entries({ "content-type": "text/html", ...headers }).map(([k, v]) => [k.toLowerCase(), v]));
@@ -107,37 +114,33 @@ function statusResponse(status: number, location?: string) {
   if (location) h.set("location", location);
   return { status, ok: status >= 200 && status < 300, headers: { get: (k: string) => h.get(k.toLowerCase()) ?? null }, body: null, text: async () => "" };
 }
+function mkFetch(url: string, body: string | null, outcome = "success", httpStatus: number | null = 200) {
+  return { requestedUrl: url, finalUrl: url, outcome, httpStatus, contentType: "text/html", sourceUpdatedAt: null, body, error: null } as any;
+}
 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); resetDb(); });
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────────
 
+const SE212_HOME_HTML = `<html><body><h1>SE212</h1><a href="schedule.html">Schedule</a><a href="asn.html">Assignments</a><a href="notes.html">Lectures</a></body></html>`;
+const SE212_NOTES_HTML = `<html><body><h1>Lectures</h1><a href="notes/m1.pdf">Module 1 notes</a></body></html>`;
 const SE212_ASN_HTML = `
-<html><body>
-<h1>SE 212 Assignments</h1>
+<html><body><h1>SE 212 Assignments</h1>
 <table>
   <tr><th>Assignment</th><th>Due</th><th>Handout</th></tr>
   <tr><td>Assignment 1: Propositional Logic</td><td>Due Friday, September 25, 2026 at 5:00 PM</td><td><a href="a1.pdf">A1 handout</a></td></tr>
   <tr><td>Assignment 2: Predicate Logic</td><td>Due Friday, October 9, 2026 at 5:00 PM</td><td><a href="a2.pdf">A2 handout</a></td></tr>
 </table>
-<p>Submit on <a href="https://markus.uwaterloo.ca/se212">MarkUs</a>.</p>
-</body></html>`;
-
+<p>Submit on <a href="https://markus.uwaterloo.ca/se212">MarkUs</a>.</p></body></html>`;
 const SE212_SCHEDULE_HTML = `
-<html><body>
-<h1>SE 212 Schedule</h1>
+<html><body><h1>SE 212 Schedule</h1>
 <table>
   <tr><th>Date</th><th>Topic</th></tr>
   <tr><td>September 8, 2026</td><td>Lecture: Introduction to Logic</td></tr>
   <tr><td>September 10, 2026</td><td>Tutorial: Jape basics</td></tr>
-</table>
-</body></html>`;
-
-// CS241 A1..A8 with exact due times.
+</table></body></html>`;
 const CS241_ASN_HTML = `
-<html><body>
-<h1>CS 241 Assignments</h1>
-<ul>
+<html><body><h1>CS 241 Assignments</h1><ul>
   <li>A1 — Due Wednesday, September 16, 2026 at 5:00 pm</li>
   <li>A2 — Due Wednesday, September 23, 2026 at 5:00 pm</li>
   <li>A3 — Due Wednesday, September 30, 2026 at 5:00 pm</li>
@@ -146,122 +149,77 @@ const CS241_ASN_HTML = `
   <li>A6 — Due Wednesday, October 28, 2026 at 5:00 pm</li>
   <li>A7 — Due Wednesday, November 4, 2026 at 5:00 pm</li>
   <li>A8 — Due Wednesday, November 18, 2026 at 11:59 pm</li>
-</ul>
-</body></html>`;
+</ul></body></html>`;
 
-// ─── SE212 parsing ──────────────────────────────────────────────────────────────
+// A full-content stub for every SE212 approved page (fully-successful run).
+function stubSE212AllOk() {
+  const map: Record<string, string> = {
+    "https://student.cs.uwaterloo.ca/~se212/": SE212_HOME_HTML,
+    "https://student.cs.uwaterloo.ca/~se212/schedule.html": SE212_SCHEDULE_HTML,
+    "https://student.cs.uwaterloo.ca/~se212/asn.html": SE212_ASN_HTML,
+    "https://student.cs.uwaterloo.ca/~se212/notes.html": SE212_NOTES_HTML,
+  };
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+    const key = Object.keys(map).find((k) => url === k);
+    return key ? htmlResponse(map[key]) : statusResponse(404);
+  }));
+}
+// Only the assignments page returns content; the other approved pages 404.
+function stubSE212AsnOnly() {
+  vi.stubGlobal("fetch", vi.fn(async (url: string) =>
+    url.startsWith("https://student.cs.uwaterloo.ca/~se212/asn.html") ? htmlResponse(SE212_ASN_HTML) : statusResponse(404)));
+}
+
+// ─── SE212 / CS241 parsing (pure) ────────────────────────────────────────────
 
 describe("SE212 parsing", () => {
-  it("parses assignments with due dates and handout links, records MarkUs as a reference", () => {
+  it("parses assignments with due dates + handout links; records MarkUs as a reference", () => {
     const r = parsePage(SE212_ASN_HTML, "https://student.cs.uwaterloo.ca/~se212/asn.html", "assignments", "se212-assignments", SE212_FALL_2026);
-    const names = r.items.map((i) => i.title);
-    expect(names.some((n) => /Assignment 1/i.test(n))).toBe(true);
-    expect(names.some((n) => /Assignment 2/i.test(n))).toBe(true);
     const a1 = r.items.find((i) => /Assignment 1/i.test(i.title))!;
-    expect(a1.itemType).toBe("assignment");
-    // 5:00 PM EDT on 2026-09-25 = 21:00 UTC.
     expect(a1.dueAtIso).toBe("2026-09-25T21:00:00.000Z");
     expect(a1.dueText).toMatch(/September 25, 2026 at 5:00 PM/);
-    // MarkUs link recorded as a reference (blind spot), not fetched.
     expect(r.references.some((ref) => ref.kind === "markus")).toBe(true);
-    // a1.pdf recorded as reference.
     expect(r.references.some((ref) => ref.kind === "pdf")).toBe(true);
   });
-
-  it("parses the schedule as lecture/tutorial items (never assignments)", () => {
+  it("parses schedule as lecture/tutorial (never assignments)", () => {
     const r = parsePage(SE212_SCHEDULE_HTML, "https://student.cs.uwaterloo.ca/~se212/schedule.html", "schedule", "se212-schedule", SE212_FALL_2026);
     const types = r.items.map((i) => i.itemType);
-    expect(types).toContain("lecture");
-    expect(types).toContain("tutorial");
-    expect(types).not.toContain("assignment");
+    expect(types).toContain("lecture"); expect(types).toContain("tutorial"); expect(types).not.toContain("assignment");
   });
 });
-
-// ─── CS241 A1–A8 ─────────────────────────────────────────────────────────────
 
 describe("CS241 A1–A8 parsing with exact due times", () => {
   it("extracts all eight assignments with exact due instants", () => {
     const r = parsePage(CS241_ASN_HTML, "https://student.cs.uwaterloo.ca/~cs241/a/", "assignments", "cs241-assignments", CS241_FALL_2026);
-    const assignments = r.items.filter((i) => i.itemType === "assignment");
-    expect(assignments).toHaveLength(8);
-    const byTitle = Object.fromEntries(assignments.map((a) => [a.title.match(/A\d/)?.[0], a.dueAtIso]));
-    expect(byTitle.A1).toBe("2026-09-16T21:00:00.000Z"); // 5pm EDT
-    expect(byTitle.A8).toBe("2026-11-19T04:59:00.000Z"); // 11:59pm EST (Nov 18) → next-day UTC
-    // Every assignment has an exact time.
-    expect(assignments.every((a) => a.dueAtIso !== null)).toBe(true);
+    const a = r.items.filter((i) => i.itemType === "assignment");
+    expect(a).toHaveLength(8);
+    const byT = Object.fromEntries(a.map((x) => [x.title.match(/A\d/)?.[0], x.dueAtIso]));
+    expect(byT.A1).toBe("2026-09-16T21:00:00.000Z");
+    expect(byT.A8).toBe("2026-11-19T04:59:00.000Z");
+    expect(a.every((x) => x.dueAtIso !== null)).toBe(true);
   });
 });
-
-// ─── Timezone + original date preservation ───────────────────────────────────
 
 describe("timezone conversion + original date text", () => {
-  it("converts America/Toronto wall time to correct UTC across DST", () => {
-    // EDT (summer, UTC-4)
+  it("converts America/Toronto wall time to UTC across DST", () => {
     expect(zonedWallTimeToUtcIso({ year: 2026, month: 10, day: 3, hour: 17, minute: 0 }, "America/Toronto")).toBe("2026-10-03T21:00:00.000Z");
-    // EST (winter, UTC-5)
     expect(zonedWallTimeToUtcIso({ year: 2026, month: 12, day: 1, hour: 17, minute: 0 }, "America/Toronto")).toBe("2026-12-01T22:00:00.000Z");
   });
-  it("preserves the original date text verbatim and leaves undated items null", () => {
-    const withTime = extractDue("Due Oct 3, 2026 at 5:00 PM", 2026, "America/Toronto");
-    expect(withTime.dueText).toBe("Due Oct 3, 2026 at 5:00 PM");
-    expect(withTime.dueAtIso).toBe("2026-10-03T21:00:00.000Z");
-    const dateOnly = extractDue("Posted October 3", 2026, "America/Toronto");
-    expect(dateOnly.dueText).toBe("Posted October 3");
-    expect(dateOnly.dueAtIso).toBeNull(); // never invent a time
-    const noDate = extractDue("See the notes page", 2026, "America/Toronto");
-    expect(noDate.dueText).toBeNull();
+  it("preserves original date text and leaves undated items null", () => {
+    expect(extractDue("Due Oct 3, 2026 at 5:00 PM", 2026, "America/Toronto")).toEqual({ dueText: "Due Oct 3, 2026 at 5:00 PM", dueAtIso: "2026-10-03T21:00:00.000Z" });
+    expect(extractDue("Posted October 3", 2026, "America/Toronto")).toEqual({ dueText: "Posted October 3", dueAtIso: null });
+    expect(extractDue("See notes", 2026, "America/Toronto")).toEqual({ dueText: null, dueAtIso: null });
   });
 });
-
-// ─── Snapshot dedup / change detection ───────────────────────────────────────
-
-describe("snapshot dedup + change detection", () => {
-  it("dedupes an unchanged content fetch and creates a new snapshot on change", () => {
-    const h1 = contentHash("<p>Hello   world</p>");
-    const h1b = contentHash("<p>Hello world</p>"); // whitespace-normalized → same
-    expect(h1).toBe(h1b);
-    expect(shouldInsertSnapshot(h1, h1b, "success")).toBe(false); // dedup
-    const h2 = contentHash("<p>Hello world CHANGED</p>");
-    expect(shouldInsertSnapshot(h1, h2, "success")).toBe(true);  // changed → new snapshot
-  });
-  it("always records non-content outcomes as history (never deduped away)", () => {
-    expect(shouldInsertSnapshot("abc", null, "empty")).toBe(true);
-    expect(shouldInsertSnapshot("abc", null, "http_error")).toBe(true);
-    expect(shouldInsertSnapshot("abc", null, "auth_required")).toBe(true);
-    expect(isContentOutcome("success")).toBe(true);
-    expect(isContentOutcome("empty")).toBe(false);
-  });
-});
-
-// ─── Cross-source conflict flagging ──────────────────────────────────────────
-
-describe("conflicting dates across website and D2L", () => {
-  it("flags a due-date disagreement instead of silently choosing one", () => {
-    const items = buildCanonicalItems("u1", SE212_FALL_2026, "assignments", "https://student.cs.uwaterloo.ca/~se212/asn.html", [
-      { itemType: "assignment", title: "Assignment 1", dueText: "Sep 25 5pm", dueAtIso: "2026-09-25T21:00:00.000Z", points: null, url: null, statusNote: null },
-    ]);
-    const other = new Map([["assignment 1", { dueIso: "2026-09-26T21:00:00.000Z", source: "learn" }]]);
-    const flagged = flagCrossSourceConflicts(items, other, "2026-09-01T00:00:00.000Z");
-    expect(flagged[0].conflicts).toHaveLength(1);
-    expect(flagged[0].conflicts[0].kind).toBe("cross-source");
-    expect(flagged[0].conflicts[0].otherSource).toBe("learn");
-    // Website value is NOT discarded; both are retained.
-    expect(flagged[0].dueAt).toBe("2026-09-25T21:00:00.000Z");
-    expect(flagged[0].conflicts[0].previous).toBe("2026-09-26T21:00:00.000Z");
-  });
-});
-
-// ─── Malformed HTML / layout changes ─────────────────────────────────────────
 
 describe("malformed HTML + layout changes", () => {
-  it("does not throw and still extracts what it can from broken markup", () => {
-    const broken = `<html><body><h1>CS 241 <ul><li>A1 Due September 16, 2026 at 5:00 pm<li>A2 no closing tags`;
+  it("does not throw on broken markup", () => {
+    const broken = `<html><body><h1>CS 241 <ul><li>A1 Due September 16, 2026 at 5:00 pm<li>A2 no close`;
     const r = parsePage(broken, "https://student.cs.uwaterloo.ca/~cs241/a/", "assignments", "cs241-assignments", CS241_FALL_2026);
     expect(r.items.some((i) => i.dueAtIso === "2026-09-16T21:00:00.000Z")).toBe(true);
   });
-  it("adapts when assignments are laid out as list items instead of a table", () => {
-    const listLayout = `<html><body><ul><li>Assignment 1 due Sept 25, 2026 at 5:00 PM</li></ul></body></html>`;
-    const r = parsePage(listLayout, "https://student.cs.uwaterloo.ca/~se212/asn.html", "assignments", "se212-assignments", SE212_FALL_2026);
+  it("adapts to list layout instead of table", () => {
+    const r = parsePage(`<html><body><ul><li>Assignment 1 due Sept 25, 2026 at 5:00 PM</li></ul></body></html>`, "https://student.cs.uwaterloo.ca/~se212/asn.html", "assignments", "se212-assignments", SE212_FALL_2026);
     expect(r.items).toHaveLength(1);
     expect(r.items[0].dueAtIso).toBe("2026-09-25T21:00:00.000Z");
   });
@@ -271,263 +229,247 @@ describe("malformed HTML + layout changes", () => {
 
 describe("SSRF + redirect protection", () => {
   it("classifies private/reserved IPs as unsafe", () => {
-    expect(isPrivateIp("10.0.0.1")).toBe(true);
-    expect(isPrivateIp("127.0.0.1")).toBe(true);
-    expect(isPrivateIp("169.254.1.1")).toBe(true);
-    expect(isPrivateIp("192.168.1.1")).toBe(true);
-    expect(isPrivateIp("172.16.5.4")).toBe(true);
-    expect(isPrivateIp("::1")).toBe(true);
-    expect(isPrivateIp("fd00::1")).toBe(true);
-    expect(isPrivateIp("142.150.1.1")).toBe(false); // public
+    for (const ip of ["10.0.0.1", "127.0.0.1", "169.254.1.1", "192.168.1.1", "172.16.5.4", "::1", "fd00::1"]) expect(isPrivateIp(ip)).toBe(true);
+    expect(isPrivateIp("142.150.1.1")).toBe(false);
   });
-  it("rejects non-https, wrong-origin, and non-allowlisted URLs", () => {
-    const origins = ["https://student.cs.uwaterloo.ca"];
-    const patterns = [/^https:\/\/student\.cs\.uwaterloo\.ca\/~se212\/[a-z.]+$/i];
-    expect(() => assertUrlAllowed("http://student.cs.uwaterloo.ca/~se212/", origins, patterns, false)).toThrow(/scheme/);
-    expect(() => assertUrlAllowed("https://evil.com/~se212/", origins, patterns, false)).toThrow(/origin/);
-    expect(() => assertUrlAllowed("https://student.cs.uwaterloo.ca/~cs999/x", origins, patterns, true)).toThrow(/allowlist/);
+  it("rejects non-https, wrong-origin, non-allowlisted URLs", () => {
+    const o = ["https://student.cs.uwaterloo.ca"]; const p = [/^https:\/\/student\.cs\.uwaterloo\.ca\/~se212\/[a-z.]+$/i];
+    expect(() => assertUrlAllowed("http://student.cs.uwaterloo.ca/~se212/", o, p, false)).toThrow(/scheme/);
+    expect(() => assertUrlAllowed("https://evil.com/~se212/", o, p, false)).toThrow(/origin/);
+    expect(() => assertUrlAllowed("https://student.cs.uwaterloo.ca/~cs999/x", o, p, true)).toThrow(/allowlist/);
   });
-  it("blocks a fetch whose host resolves to a private IP (SSRF)", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(htmlResponse("<p>should never be read</p>")));
-    const res = await fetchPage("https://student.cs.uwaterloo.ca/~se212/", {
-      allowedOrigins: SE212_FALL_2026.allowedOrigins,
-      allowPatterns: SE212_FALL_2026.linkDiscovery.allowPatterns,
-      lookupFn: privateLookup, maxRetries: 0,
-    });
-    expect(res.outcome).toBe("blocked");
+  it("blocks a fetch resolving to a private IP", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(htmlResponse("x")));
+    const r = await fetchPage("https://student.cs.uwaterloo.ca/~se212/", { allowedOrigins: SE212_FALL_2026.allowedOrigins, allowPatterns: SE212_FALL_2026.linkDiscovery.allowPatterns, lookupFn: privateLookup, maxRetries: 0 });
+    expect(r.outcome).toBe("blocked");
   });
-  it("blocks a redirect that leaves the allowlist", async () => {
-    const fetchSpy = vi.fn().mockResolvedValue(statusResponse(302, "https://evil.example.com/steal"));
-    vi.stubGlobal("fetch", fetchSpy);
-    const res = await fetchPage("https://student.cs.uwaterloo.ca/~se212/", {
-      allowedOrigins: SE212_FALL_2026.allowedOrigins,
-      allowPatterns: SE212_FALL_2026.linkDiscovery.allowPatterns,
-      lookupFn: publicLookup, maxRetries: 0,
-    });
-    expect(res.outcome).toBe("blocked");
-  });
-  it("reports auth honestly on a login redirect (never bypasses)", async () => {
+  it("blocks a redirect leaving the allowlist; reports auth on login redirect", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(statusResponse(302, "https://evil.example.com/x")));
+    expect((await fetchPage("https://student.cs.uwaterloo.ca/~se212/", { allowedOrigins: SE212_FALL_2026.allowedOrigins, allowPatterns: SE212_FALL_2026.linkDiscovery.allowPatterns, lookupFn: publicLookup, maxRetries: 0 })).outcome).toBe("blocked");
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(statusResponse(302, "https://auth.uwaterloo.ca/oidc/login")));
-    const res = await fetchPage("https://student.cs.uwaterloo.ca/~cs241/", {
-      allowedOrigins: CS241_FALL_2026.allowedOrigins,
-      allowPatterns: CS241_FALL_2026.linkDiscovery.allowPatterns,
-      lookupFn: publicLookup, maxRetries: 0,
-    });
-    expect(res.outcome).toBe("auth_required");
+    expect((await fetchPage("https://student.cs.uwaterloo.ca/~cs241/", { allowedOrigins: CS241_FALL_2026.allowedOrigins, allowPatterns: CS241_FALL_2026.linkDiscovery.allowPatterns, lookupFn: publicLookup, maxRetries: 0 })).outcome).toBe("auth_required");
   });
-  it("maps HTTP 404 / 403 to http_error / auth_required", async () => {
+  it("maps 404→http_error, 403→auth_required", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(statusResponse(404)));
-    const r404 = await fetchPage("https://student.cs.uwaterloo.ca/~se212/", { allowedOrigins: SE212_FALL_2026.allowedOrigins, allowPatterns: SE212_FALL_2026.linkDiscovery.allowPatterns, lookupFn: publicLookup, maxRetries: 0 });
-    expect(r404.outcome).toBe("http_error");
+    expect((await fetchPage("https://student.cs.uwaterloo.ca/~se212/", { allowedOrigins: SE212_FALL_2026.allowedOrigins, allowPatterns: SE212_FALL_2026.linkDiscovery.allowPatterns, lookupFn: publicLookup, maxRetries: 0 })).outcome).toBe("http_error");
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(statusResponse(403)));
-    const r403 = await fetchPage("https://student.cs.uwaterloo.ca/~se212/", { allowedOrigins: SE212_FALL_2026.allowedOrigins, allowPatterns: SE212_FALL_2026.linkDiscovery.allowPatterns, lookupFn: publicLookup, maxRetries: 0 });
-    expect(r403.outcome).toBe("auth_required");
+    expect((await fetchPage("https://student.cs.uwaterloo.ca/~se212/", { allowedOrigins: SE212_FALL_2026.allowedOrigins, allowPatterns: SE212_FALL_2026.linkDiscovery.allowPatterns, lookupFn: publicLookup, maxRetries: 0 })).outcome).toBe("auth_required");
   });
 });
 
-// ─── Tool behavior: preservation, no-Notion, isolation ───────────────────────
+// ─── Cross-source conflict flagging (pure) ───────────────────────────────────
 
-const CW_FETCH_OPTS_NOTE = "tool tests drive the real handler with stubbed fetch + mocked supabase";
-
-describe(`refresh_course_websites — ${CW_FETCH_OPTS_NOTE}`, () => {
-  beforeEach(() => { resetDb(); });
-
-  function stubFetchReturning(map: Record<string, ReturnType<typeof htmlResponse> | ReturnType<typeof statusResponse>>) {
-    const spy = vi.fn(async (url: string) => {
-      // exact match first, else any approved SE212 page returns the same fixture
-      const key = Object.keys(map).find((k) => url.startsWith(k));
-      return key ? map[key] : statusResponse(404);
-    });
-    vi.stubGlobal("fetch", spy);
-    return spy;
-  }
-  // Patch the DNS resolver used by the connector by monkey-patching fetchPage opts:
-  // the tool uses the default resolver, so we stub global fetch AND rely on the
-  // resolver being bypassed for IP hosts. To keep it deterministic we stub fetch to
-  // resolve immediately; DNS still runs, so we point tests at the real public host.
-
-  it("ingests canonical items + tasks on a successful SE212 assignments fetch", async () => {
-    // Only the assignments page returns content; others 404 (still preserved).
-    stubFetchReturning({ "https://student.cs.uwaterloo.ca/~se212/asn.html": htmlResponse(SE212_ASN_HTML) });
-    // Point the source's DNS through a public resolver by overriding fetchPage? The
-    // tool calls fetchPage with default lookup; to avoid real DNS we assert on the
-    // recorded DB writes that happen only for the content page.
-    const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
-    expect(out.success).toBe(true);
-    // Item + task upserts happened for the assignments page.
-    const itemUpserts = db.recorded.filter((r) => r.table === "course_website_items" && r.op === "upsert");
-    const taskUpserts = db.recorded.filter((r) => r.table === "tasks" && r.op === "upsert");
-    expect(itemUpserts.length).toBeGreaterThan(0);
-    expect(taskUpserts.length).toBeGreaterThan(0);
-    // NEVER touches Notion or triggers background sync.
-    const fetchCalls = (globalThis.fetch as any).mock.calls.map((c: any[]) => String(c[0]));
-    expect(fetchCalls.some((u: string) => u.includes("api.notion.com"))).toBe(false);
-  });
-
-  it("preserves existing records on empty/failed fetches (no item or task writes)", async () => {
-    // All pages 404 → non-content outcomes → snapshots recorded, but NO item/task writes.
-    stubFetchReturning({});
-    const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
-    expect(out.success).toBe(true);
-    const itemUpserts = db.recorded.filter((r) => r.table === "course_website_items" && r.op === "upsert");
-    const taskUpserts = db.recorded.filter((r) => r.table === "tasks" && r.op === "upsert");
-    expect(itemUpserts).toHaveLength(0);
-    expect(taskUpserts).toHaveLength(0);
-    // Snapshots WERE recorded (history of the failure).
-    const snapInserts = db.recorded.filter((r) => r.table === "course_website_snapshots" && r.op === "insert");
-    expect(snapInserts.length).toBeGreaterThan(0);
+describe("conflicting dates across website and D2L", () => {
+  it("flags a due-date disagreement without choosing a winner", () => {
+    const items = buildCanonicalItems("u1", SE212_FALL_2026, "assignments", "https://student.cs.uwaterloo.ca/~se212/asn.html", [
+      { itemType: "assignment", title: "Assignment 1", dueText: "Sep 25 5pm", dueAtIso: "2026-09-25T21:00:00.000Z", points: null, url: null, statusNote: null },
+    ]);
+    const flagged = flagCrossSourceConflicts(items, new Map([["assignment 1", { dueIso: "2026-09-26T21:00:00.000Z", source: "learn" }]]), "2026-09-01T00:00:00.000Z");
+    expect(flagged[0].conflicts[0].kind).toBe("cross-source");
+    expect(flagged[0].dueAt).toBe("2026-09-25T21:00:00.000Z");
+    expect(flagged[0].conflicts[0].previous).toBe("2026-09-26T21:00:00.000Z");
   });
 });
 
-describe("get_course_website_content — read-only + cross-user/course isolation", () => {
-  it("scopes reads to the requesting user and course", async () => {
-    resetDb();
-    vi.stubGlobal("fetch", vi.fn()); // must never be called by a read-only tool
-    await CourseWebsiteTools.get_course_website_content.handler({ courseCode: "CS241", term: FALL_2026, userId: "userA" });
-    const itemReads = db.recorded.filter((r) => r.table === "course_website_items" && r.op === "select");
-    expect(itemReads.length).toBeGreaterThan(0);
-    // Every read filtered by the requesting user AND the requested course.
-    expect(itemReads.every((r) => r.filters.user_id === "userA")).toBe(true);
-    expect(itemReads.every((r) => r.filters.course_code === "CS241")).toBe(true);
-    // No network for a read-only tool.
-    expect((globalThis.fetch as any).mock.calls.length).toBe(0);
+// ─── Dedup semantics (parse_status + parser_version aware) ───────────────────
+
+describe("pickDedupSnapshotId — dedup requires content_hash + parser_version + parse_status=ok", () => {
+  const V = "cw-parser@1";
+  it("a failed parse is NEVER reused by a later successful parse of identical content", () => {
+    const existing = [{ id: "failed-1", content_hash: "H", parser_version: V, parse_status: "failed" }];
+    expect(pickDedupSnapshotId(existing, "H", V)).toBeNull(); // must create a fresh ok snapshot
+  });
+  it("a parser-version change is never deduped (re-parse of record)", () => {
+    const existing = [{ id: "ok-v1", content_hash: "H", parser_version: "v1", parse_status: "ok" }];
+    expect(pickDedupSnapshotId(existing, "H", "v2")).toBeNull();
+  });
+  it("repeated successful parse of identical content + same version dedups", () => {
+    const existing = [{ id: "ok-1", content_hash: "H", parser_version: V, parse_status: "ok" }];
+    expect(pickDedupSnapshotId(existing, "H", V)).toBe("ok-1");
+  });
+  it("picks the newest matching ok snapshot; never a null hash", () => {
+    const existing = [{ id: "ok-new", content_hash: "H", parser_version: V, parse_status: "ok" }, { id: "ok-old", content_hash: "H", parser_version: V, parse_status: "ok" }];
+    expect(pickDedupSnapshotId(existing, "H", V)).toBe("ok-new");
+    expect(pickDedupSnapshotId(existing, null, V)).toBeNull();
   });
 });
 
-// ─── Secret / cookie redaction ───────────────────────────────────────────────
-
-describe("secret + cookie redaction", () => {
-  it("source_ref is stable and slugged (no PII); sanitizer strips sensitive tokens", async () => {
-    expect(sourceRefFor(SE212_FALL_2026, "assignments", "Assignment 1: Logic")).toBe("SE212|1269|assignments|assignment-1-logic");
-    // The store never persists cookies/authorization; verify the sanitizer via a snapshot insert.
-    resetDb();
-    const mod = await import("../../src/study/src/courseWebsite/store.js");
-    await mod.recordSnapshot({
-      userId: "u1", source: SE212_FALL_2026, pageType: "home",
-      fetch: { requestedUrl: "x", finalUrl: "https://student.cs.uwaterloo.ca/~se212/", outcome: "success", httpStatus: 200, contentType: "text/html", sourceUpdatedAt: null, body: "Set-Cookie: secret=abc; Authorization: Bearer tok123", error: null },
-      extracted: null, parseError: null,
-    });
-    const snap = db.recorded.find((r) => r.table === "course_website_snapshots" && r.op === "insert");
-    expect(snap!.row.payload).not.toMatch(/secret=abc/);
-    expect(snap!.row.payload).toContain("[redacted]");
-  });
-});
-
-// ─── Snapshot dedup scoping (user + course + term + url) ─────────────────────
-
-describe("snapshot dedup is scoped per user+course+term+url", () => {
+describe("ingestPage dedup is scoped and never reuses a failed snapshot as provenance", () => {
   beforeEach(() => resetDb());
-  const URL = "https://student.cs.uwaterloo.ca/~x/page.html";
-  const mkFetch = (body) => ({ requestedUrl: URL, finalUrl: URL, outcome: "success", httpStatus: 200, contentType: "text/html", sourceUpdatedAt: null, body, error: null });
+  const URL = "https://student.cs.uwaterloo.ca/~x/p.html";
+  const body = "<p>same</p>";
 
-  it("never dedups or references identical URLs across different courses or terms", async () => {
-    const body = "<p>identical content</p>";
-    // Same URL + identical content, but different course → must NOT dedup.
-    const r1 = await recordSnapshot({ userId: "u1", source: CS241_FALL_2026, pageType: "assignments", fetch: mkFetch(body), extracted: {}, parseError: null, parseStatus: "ok" });
+  it("does not dedup identical content across course/term/user; dedups only within the exact scope", async () => {
+    const r1 = await ingestPage({ userId: "u1", source: CS241_FALL_2026, pageType: "assignments", fetch: mkFetch(URL, body), extracted: {}, items: [] });
     expect(r1.deduped).toBe(false);
-    const r2 = await recordSnapshot({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch(body), extracted: {}, parseError: null, parseStatus: "ok" });
-    expect(r2.deduped).toBe(false);                 // different course → independent
-    expect(r2.snapshotId).not.toBe(r1.snapshotId);  // never references the other course's row
-
-    // Same URL + identical content, but different TERM → must NOT dedup.
-    const otherTerm = { ...CS241_FALL_2026, term: "1259" };
-    const r3 = await recordSnapshot({ userId: "u1", source: otherTerm, pageType: "assignments", fetch: mkFetch(body), extracted: {}, parseError: null, parseStatus: "ok" });
+    // different course, same url+content → independent
+    const r2 = await ingestPage({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch(URL, body), extracted: {}, items: [] });
+    expect(r2.deduped).toBe(false);
+    expect(r2.snapshotId).not.toBe(r1.snapshotId);
+    // different term → independent
+    const r3 = await ingestPage({ userId: "u1", source: { ...CS241_FALL_2026, term: "1259" }, pageType: "assignments", fetch: mkFetch(URL, body), extracted: {}, items: [] });
     expect(r3.deduped).toBe(false);
-    expect(r3.snapshotId).not.toBe(r1.snapshotId);
-
-    // Different USER, same everything → independent.
-    const r4 = await recordSnapshot({ userId: "u2", source: CS241_FALL_2026, pageType: "assignments", fetch: mkFetch(body), extracted: {}, parseError: null, parseStatus: "ok" });
+    // different user → independent
+    const r4 = await ingestPage({ userId: "u2", source: CS241_FALL_2026, pageType: "assignments", fetch: mkFetch(URL, body), extracted: {}, items: [] });
     expect(r4.deduped).toBe(false);
-    expect(r4.snapshotId).not.toBe(r1.snapshotId);
-
-    // SAME scope + identical content → DOES dedup against its own prior snapshot.
-    const r5 = await recordSnapshot({ userId: "u1", source: CS241_FALL_2026, pageType: "assignments", fetch: mkFetch(body), extracted: {}, parseError: null, parseStatus: "ok" });
+    // same scope + identical content → dedups against its own prior ok snapshot
+    const r5 = await ingestPage({ userId: "u1", source: CS241_FALL_2026, pageType: "assignments", fetch: mkFetch(URL, body), extracted: {}, items: [] });
     expect(r5.deduped).toBe(true);
     expect(r5.snapshotId).toBe(r1.snapshotId);
+    // the dedup lookup was scoped by user_id + course_code + term + url
+    const lookups = db.recorded.filter((r) => r.table === "course_website_snapshots" && r.op === "select");
+    expect(lookups.every((r) => ["user_id", "course_code", "term", "url"].every((k) => k in (r.filters || {})))).toBe(true);
+  });
 
-    // The dedup lookup was scoped by course_code, term, and url (not url alone).
-    const latestLookups = db.recorded.filter((r) => r.table === "course_website_snapshots" && r.filters.__latest);
-    expect(latestLookups.every((r) => "course_code" in r.filters && "term" in r.filters && "url" in r.filters && "user_id" in r.filters)).toBe(true);
+  it("a prior FAILED parse of identical content does not become provenance; a fresh snapshot is inserted", async () => {
+    // record a failed-parse snapshot of the content
+    await recordSnapshotOnly({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch(URL, body), parseStatus: "failed", parseError: "boom" });
+    const r = await ingestPage({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch(URL, body), extracted: {}, items: [] });
+    expect(r.deduped).toBe(false);               // did NOT reuse the failed snapshot
+    expect(r.snapshotId).not.toBe("snap-1");      // links items to a new ok snapshot
+    // ingest was called with dedup_snapshot_id null
+    const call = db.rpcCalls.find((c) => c.name === "ingest_course_website_page")!;
+    expect(call.payload.dedup_snapshot_id).toBeNull();
   });
 });
 
-// ─── parse_status distinguishes fetch success from parse success ─────────────
+// ─── recordSnapshotOnly persists parse_status ────────────────────────────────
 
-describe("parse_status is persisted independently of fetch outcome", () => {
+describe("recordSnapshotOnly persists parse_status independently of fetch_outcome", () => {
   beforeEach(() => resetDb());
-  const mkFetch = () => ({ requestedUrl: "u", finalUrl: "https://student.cs.uwaterloo.ca/~x/p.html", outcome: "success", httpStatus: 200, contentType: "text/html", sourceUpdatedAt: null, body: "<p>x</p>", error: null });
-
-  it("stores parse_status=failed on a fetch-success/parse-failure snapshot", async () => {
-    await recordSnapshot({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch(), extracted: null, parseError: "parser_error: boom", parseStatus: "failed" });
-    const ins = db.recorded.find((r) => r.table === "course_website_snapshots" && r.op === "insert");
-    expect(ins.row.fetch_outcome).toBe("success");   // fetch succeeded…
-    expect(ins.row.parse_status).toBe("failed");      // …but parse failed (never "successful ingestion")
+  it("stores parse_status=failed for a fetch-success/parse-failure", async () => {
+    await recordSnapshotOnly({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch("u", "<p>x</p>"), parseStatus: "failed", parseError: "parser_error: boom" });
+    const ins = db.recorded.find((r) => r.table === "course_website_snapshots" && r.op === "insert")!;
+    expect(ins.row.fetch_outcome).toBe("success");
+    expect(ins.row.parse_status).toBe("failed");
     expect(ins.row.error).toMatch(/parser_error/);
   });
-
-  it("stores parse_status=ok on a successful parse", async () => {
-    await recordSnapshot({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch(), extracted: {}, parseError: null, parseStatus: "ok" });
-    const ins = db.recorded.find((r) => r.table === "course_website_snapshots" && r.op === "insert");
-    expect(ins.row.parse_status).toBe("ok");
+  it("stores parse_status=skipped for a non-content outcome", async () => {
+    await recordSnapshotOnly({ userId: "u1", source: SE212_FALL_2026, pageType: "home", fetch: mkFetch("u", null, "http_error", 404), parseStatus: "skipped", parseError: null });
+    const ins = db.recorded.find((r) => r.table === "course_website_snapshots" && r.op === "insert")!;
+    expect(ins.row.parse_status).toBe("skipped");
+    expect(ins.row.content_hash).toBeNull();
   });
 });
 
-// ─── Persistence failures propagate (never silently swallowed) ───────────────
+// ─── Atomic persistence + truthful results ───────────────────────────────────
 
-describe("refresh_course_websites surfaces persistence failures", () => {
+describe("refresh_course_websites — atomic persistence + result semantics", () => {
   beforeEach(() => resetDb());
-  function stubAsn() {
-    vi.stubGlobal("fetch", vi.fn(async (url) =>
-      String(url).startsWith("https://student.cs.uwaterloo.ca/~se212/asn.html")
-        ? { status: 200, ok: true, headers: { get: (k) => (k.toLowerCase() === "content-type" ? "text/html" : null) }, body: null, text: async () => SE212_ASN_HTML }
-        : { status: 404, ok: false, headers: { get: () => null }, body: null, text: async () => "" }));
-  }
 
-  it("fails (success=false) and reports persistError when the snapshot insert fails", async () => {
-    stubAsn(); db.failOn.snapshotInsert = true;
+  it("fully successful run: success:true, partial:false, items+tasks committed via the atomic RPC", async () => {
+    stubSE212AllOk();
     const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
-    expect(out.success).toBe(false);
-    expect(out.persistErrors.length).toBeGreaterThan(0);
-    // No canonical items/tasks were written (snapshot failed first).
+    expect(out.success).toBe(true);
+    expect(out.partial).toBe(false);
+    expect(out.failures).toHaveLength(0);
+    // The assignments page committed its items + tasks atomically.
+    const asn = out.courses[0].pages.find((p: any) => p.pageType === "assignments");
+    expect(asn.succeeded).toBe(true);
+    expect(asn.itemsCommitted).toBeGreaterThan(0);
+    expect(asn.tasksCommitted).toBeGreaterThan(0);
+    // Persisted via the transactional RPC, never per-row .from().upsert().
+    expect(db.rpcCalls.some((c) => c.name === "ingest_course_website_page")).toBe(true);
     expect(db.recorded.some((r) => r.table === "course_website_items" && r.op === "upsert")).toBe(false);
-    expect(db.recorded.some((r) => r.table === "tasks" && r.op === "upsert")).toBe(false);
-    // The assignments page reports the failure, not success.
-    const asnPage = out.courses[0].pages.find((p) => p.pageType === "assignments");
-    expect(asnPage.ingested).toBe(false);
-    expect(asnPage.itemsIngested).toBe(0);
-    expect(asnPage.persistError).toBeTruthy();
+    // Never touches Notion.
+    expect((globalThis.fetch as any).mock.calls.map((c: any[]) => String(c[0])).some((u: string) => u.includes("api.notion.com"))).toBe(false);
   });
 
-  it("fails when the canonical-item upsert fails and never claims itemsIngested", async () => {
-    stubAsn(); db.failOn.itemUpsert = true;
+  it("partial run: one approved page 404s while another ingests → success:false, partial:true", async () => {
+    stubSE212AsnOnly(); // asn ok, home/schedule/notes 404
     const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
     expect(out.success).toBe(false);
-    expect(out.persistErrors.join(" ")).toMatch(/item upsert/);
-    const asnPage = out.courses[0].pages.find((p) => p.pageType === "assignments");
-    expect(asnPage.ingested).toBe(false);
-    expect(asnPage.itemsIngested).toBe(0);
+    expect(out.partial).toBe(true);
+    // structured failures include the 404 approved pages
+    expect(out.failures.length).toBeGreaterThan(0);
+    expect(out.failures[0]).toHaveProperty("course");
+    expect(out.failures[0]).toHaveProperty("url");
+    expect(out.failures[0]).toHaveProperty("stage");
+    expect(out.failures[0]).toHaveProperty("outcome");
+    // the asn page still ingested successfully
+    expect(out.courses[0].pages.find((p: any) => p.pageType === "assignments").succeeded).toBe(true);
   });
 
-  it("fails when the task upsert fails", async () => {
-    stubAsn(); db.failOn.taskUpsert = true;
+  it("completely failed run: all approved pages 404 → success:false, partial:false, nothing ingested", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => statusResponse(404)));
     const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
     expect(out.success).toBe(false);
-    expect(out.persistErrors.join(" ")).toMatch(/task upsert/);
+    expect(out.partial).toBe(false);
+    expect(db.rpcCalls.some((c) => c.name === "ingest_course_website_page")).toBe(false);
+    // Snapshots were still recorded honestly (history), but no items/tasks.
+    expect(db.recorded.some((r) => r.table === "course_website_snapshots" && r.op === "insert")).toBe(true);
   });
 
-  it("surfaces a read failure in get_course_website_content", async () => {
+  it.each([
+    ["snapshot", "snapshot"],
+    ["canonical_item", "canonical_item"],
+    ["task", "task"],
+  ])("atomic rollback on %s-stage failure: success:false, 0 committed, structured failure", async (stage) => {
+    stubSE212AsnOnly();
+    db.rpcFail = { stage: stage as any, sourceRef: "SE212|1269|assignments|assignment-1" };
+    const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
+    expect(out.success).toBe(false);
+    const asn = out.courses[0].pages.find((p: any) => p.pageType === "assignments");
+    expect(asn.ingested).toBe(false);
+    // Complete rollback ⇒ zero committed rows for the page.
+    expect(asn.itemsCommitted).toBe(0);
+    expect(asn.tasksCommitted).toBe(0);
+    expect(asn.snapshotsCommitted).toBe(0);
+    expect(asn.failedStage).toBe(stage);
+    expect(asn.failedSourceRef).toBe("SE212|1269|assignments|assignment-1");
+    const f = out.failures.find((x: any) => x.stage === stage);
+    expect(f).toBeTruthy();
+  });
+
+  it("accurate wording: internal state mutated, external fetch read-only", async () => {
+    stubSE212AllOk();
+    const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
+    expect(out.note).toMatch(/external website fetches are read-only/i);
+    expect(out.note).toMatch(/mutated Horizon's internal/i);
+    expect(out.note).not.toMatch(/^Read-only ingestion complete/);
+  });
+});
+
+// ─── get_course_website_content: read-only + isolation + read failure ────────
+
+describe("get_course_website_content", () => {
+  beforeEach(() => resetDb());
+  it("scopes reads to the requesting user + course; does no network", async () => {
+    vi.stubGlobal("fetch", vi.fn());
+    await CourseWebsiteTools.get_course_website_content.handler({ courseCode: "CS241", term: FALL_2026, userId: "userA" });
+    const reads = db.recorded.filter((r) => r.table === "course_website_items" && r.op === "select");
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads.every((r) => r.filters!.user_id === "userA" && r.filters!.course_code === "CS241")).toBe(true);
+    expect((globalThis.fetch as any).mock.calls.length).toBe(0);
+  });
+  it("surfaces a read failure as success:false", async () => {
     vi.stubGlobal("fetch", vi.fn());
     db.failOn.itemsRead = true;
     const out = JSON.parse(await CourseWebsiteTools.get_course_website_content.handler({ courseCode: "CS241", userId: "u1" }));
     expect(out.success).toBe(false);
     expect(out.error).toMatch(/read/i);
   });
+});
 
-  it("reports accurate wording: internal state mutated, external fetch read-only", async () => {
-    stubAsn();
-    const out = JSON.parse(await CourseWebsiteTools.refresh_course_websites.handler({ courseCode: "SE212", userId: "u1" }));
-    expect(out.note).toMatch(/external website fetches are read-only/i);
-    expect(out.note).toMatch(/mutated Horizon's internal/i);
-    expect(out.note).not.toMatch(/^Read-only ingestion complete/);
+// ─── Secret / cookie redaction + stable source_ref ───────────────────────────
+
+describe("secret redaction + source_ref", () => {
+  beforeEach(() => resetDb());
+  it("source_ref is stable/slugged; sanitizer strips cookies/authorization", async () => {
+    expect(sourceRefFor(SE212_FALL_2026, "assignments", "Assignment 1: Logic")).toBe("SE212|1269|assignments|assignment-1-logic");
+    await recordSnapshotOnly({ userId: "u1", source: SE212_FALL_2026, pageType: "home", fetch: mkFetch("https://student.cs.uwaterloo.ca/~se212/", "Set-Cookie: secret=abc; Authorization: Bearer tok123"), parseStatus: "skipped", parseError: null });
+    const ins = db.recorded.find((r) => r.table === "course_website_snapshots" && r.op === "insert")!;
+    expect(ins.row.payload).not.toMatch(/secret=abc/);
+    expect(ins.row.payload).toContain("[redacted]");
+  });
+  it("buildTaskRows only emits dated assessment items", () => {
+    const items = buildCanonicalItems("u1", SE212_FALL_2026, "assignments", "u", [
+      { itemType: "assignment", title: "A1", dueText: "x", dueAtIso: "2026-09-25T21:00:00.000Z", points: null, url: "https://x/a1", statusNote: null },
+      { itemType: "lecture", title: "L1", dueText: "x", dueAtIso: "2026-09-08T14:00:00.000Z", points: null, url: null, statusNote: null },
+      { itemType: "assignment", title: "A2 undated", dueText: null, dueAtIso: null, points: null, url: null, statusNote: null },
+    ]);
+    const rows = buildTaskRows(items);
+    expect(rows).toHaveLength(1);
+    expect((rows[0] as any).source_ref).toContain("a1");
   });
 });

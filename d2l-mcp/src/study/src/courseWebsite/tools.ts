@@ -29,9 +29,9 @@ import {
 import { fetchPage } from "./fetcher.js";
 import { parsePage } from "./parsers.js";
 import {
-  recordSnapshot, buildCanonicalItems, flagCrossSourceConflicts, upsertCanonicalItems,
-  integrateIntoTasks, readCanonicalItems, readLatestSnapshots, isContentOutcome,
-  loadOtherSourceDueByTitle,
+  buildCanonicalItems, flagCrossSourceConflicts, ingestPage, recordSnapshotOnly,
+  readCanonicalItems, readLatestSnapshots, isContentOutcome, loadOtherSourceDueByTitle,
+  PersistError,
 } from "./store.js";
 
 const MAX_DISCOVERED_PER_SOURCE = 8;
@@ -39,12 +39,20 @@ const MAX_DISCOVERED_PER_SOURCE = 8;
 interface PageReport {
   url: string;
   pageType: string;
+  approved: boolean;            // an approved page vs a best-effort discovered link
   fetchOutcome: string;         // did the external fetch succeed?
   parseStatus: "ok" | "failed" | "skipped"; // did parsing succeed? (independent of fetch)
   httpStatus: number | null;
+  succeeded: boolean;           // fetch ok + parse ok + fully persisted
   ingested: boolean;            // were canonical items/tasks persisted for this page?
-  itemsIngested: number;        // only > 0 when ingested === true
+  // Exact COMMITTED counts (atomic per page: all-or-nothing). Zero on any failure.
+  snapshotsCommitted: number;
+  itemsCommitted: number;
+  tasksCommitted: number;
+  itemsIngested: number;        // alias of itemsCommitted for report readability
   deduped: boolean;
+  failedStage: "fetch" | "parse" | "snapshot" | "canonical_item" | "task" | "ingest" | null;
+  failedSourceRef: string | null;
   persistError: string | null;  // a DB write failure for this page (never swallowed)
   note: string | null;
 }
@@ -63,70 +71,68 @@ async function refreshSource(userId: string, source: CourseWebsiteSource): Promi
     allowPatterns: source.linkDiscovery.allowPatterns,
   };
 
-  const processOne = async (url: string, pageType: PageReport["pageType"], parser: string): Promise<void> => {
+  const processOne = async (url: string, pageType: PageReport["pageType"], parser: string, approved: boolean): Promise<void> => {
     if (fetched.has(url)) return;
     fetched.add(url);
 
     const f = await fetchPage(url, fetchOpts);
-    let itemsIngested = 0;
-    let deduped = false;
-    let note: string | null = null;
-    let parseStatus: PageReport["parseStatus"] = "skipped";
-    let ingested = false;
-    let persistError: string | null = null;
+    const base = {
+      url: f.finalUrl, pageType, approved, fetchOutcome: f.outcome, httpStatus: f.httpStatus,
+      deduped: false, snapshotsCommitted: 0, itemsCommitted: 0, tasksCommitted: 0, itemsIngested: 0,
+      failedStage: null as PageReport["failedStage"], failedSourceRef: null as string | null,
+      persistError: null as string | null,
+    };
 
     if (isContentOutcome(f.outcome) && f.body) {
-      // 1) Parse. A parse failure is NOT a successful ingestion — it is recorded
-      //    with parse_status='failed' and never touches canonical items/tasks.
+      // 1) Parse. A parse failure is NOT a successful ingestion — recorded with
+      //    parse_status='failed' (a distinct historical snapshot) and never ingested.
       let parsed;
       try {
         parsed = parsePage(f.body, f.finalUrl, pageType as never, parser as never, source);
-        parseStatus = "ok";
         parsed.discoveredLinks.forEach((l) => discoveredAll.add(l));
       } catch (e) {
-        parseStatus = "failed";
-        note = `parser_error: ${e instanceof Error ? e.message : String(e)}`;
+        const note = `parser_error: ${e instanceof Error ? e.message : String(e)}`;
+        let persistError: string | null = null;
         try {
-          await recordSnapshot({ userId, source, pageType: pageType as never, fetch: f, extracted: null, parseError: note, parseStatus: "failed" });
+          await recordSnapshotOnly({ userId, source, pageType: pageType as never, fetch: f, parseStatus: "failed", parseError: note });
         } catch (pe) {
-          persistError = `snapshot(parse-failure): ${pe instanceof Error ? pe.message : String(pe)}`;
+          persistError = pe instanceof Error ? pe.message : String(pe);
         }
-        pages.push({ url: f.finalUrl, pageType, fetchOutcome: f.outcome, parseStatus, httpStatus: f.httpStatus, ingested: false, itemsIngested: 0, deduped: false, persistError, note });
+        pages.push({ ...base, parseStatus: "failed", succeeded: false, ingested: false,
+          failedStage: persistError ? "snapshot" : "parse", persistError, note });
         return;
       }
 
-      // 2) Persist snapshot → canonical items → tasks. ANY write failure aborts this
-      //    page's ingestion, is surfaced as persistError, and never claims success.
-      //    Existing data is preserved (upsert-only; nothing is deleted).
+      // 2) Atomic persist (snapshot + items + tasks) via the ingestion RPC. On any
+      //    failure the whole page transaction rolls back — committed counts are 0.
+      const flagged = flagCrossSourceConflicts(buildCanonicalItems(userId, source, pageType as never, f.finalUrl, parsed.items), otherDue, nowIso);
       try {
-        const snap = await recordSnapshot({ userId, source, pageType: pageType as never, fetch: f, extracted: parsed, parseError: null, parseStatus: "ok" });
-        deduped = snap.deduped;
-        const flagged = flagCrossSourceConflicts(buildCanonicalItems(userId, source, pageType as never, f.finalUrl, parsed.items), otherDue, nowIso);
-        await upsertCanonicalItems(flagged, snap.snapshotId);
-        await integrateIntoTasks(flagged);
-        itemsIngested = flagged.length;
-        ingested = true;
+        const r = await ingestPage({ userId, source, pageType: pageType as never, fetch: f, extracted: parsed, items: flagged });
+        pages.push({ ...base, parseStatus: "ok", succeeded: true, ingested: true,
+          deduped: r.deduped, snapshotsCommitted: r.snapshotsInserted, itemsCommitted: r.itemsUpserted,
+          tasksCommitted: r.tasksUpserted, itemsIngested: r.itemsUpserted, note: null });
       } catch (e) {
-        persistError = e instanceof Error ? e.message : String(e);
-        ingested = false;
-        itemsIngested = 0; // never report items ingested when a write failed
+        const pe = e instanceof PersistError ? e : null;
+        pages.push({ ...base, parseStatus: "ok", succeeded: false, ingested: false,
+          failedStage: pe?.stage ?? "ingest", failedSourceRef: pe?.sourceRef ?? null,
+          persistError: e instanceof Error ? e.message : String(e), note: null });
       }
     } else {
       // Non-content outcome (empty/http_error/auth_required/timeout/blocked/...).
       // Record history only; existing canonical items/tasks are preserved untouched.
-      note = f.error || f.outcome;
+      let persistError: string | null = null;
       try {
-        await recordSnapshot({ userId, source, pageType: pageType as never, fetch: f, extracted: null, parseError: null, parseStatus: "skipped" });
+        await recordSnapshotOnly({ userId, source, pageType: pageType as never, fetch: f, parseStatus: "skipped", parseError: null });
       } catch (e) {
-        persistError = `snapshot: ${e instanceof Error ? e.message : String(e)}`;
+        persistError = e instanceof Error ? e.message : String(e);
       }
+      pages.push({ ...base, parseStatus: "skipped", succeeded: false, ingested: false,
+        failedStage: persistError ? "snapshot" : "fetch", persistError, note: f.error || f.outcome });
     }
-
-    pages.push({ url: f.finalUrl, pageType, fetchOutcome: f.outcome, parseStatus, httpStatus: f.httpStatus, ingested, itemsIngested, deduped, persistError, note });
   };
 
   for (const appr of source.approvedUrls) {
-    await processOne(appr.url, appr.pageType, appr.parser);
+    await processOne(appr.url, appr.pageType, appr.parser, /*approved*/ true);
   }
 
   // Same-origin discovery: only allowlisted links, capped, not already fetched.
@@ -134,7 +140,7 @@ async function refreshSource(userId: string, source: CourseWebsiteSource): Promi
     .filter((u) => !fetched.has(u) && !source.approvedUrls.some((a) => a.url === u))
     .slice(0, MAX_DISCOVERED_PER_SOURCE);
   for (const url of toDiscover) {
-    await processOne(url, "reference", "generic");
+    await processOne(url, "reference", "generic", /*approved*/ false);
   }
 
   return { pages, discovered: [...discoveredAll] };
@@ -203,13 +209,23 @@ export const CourseWebsiteTools = {
       }
 
       const results = [];
-      const persistErrors: string[] = [];
-      const parseFailures: string[] = [];
+      const failures: Array<{ course: string; url: string; stage: string; outcome: string; error: string }> = [];
+      const allPages: PageReport[] = [];
       for (const source of sources) {
         const { pages, discovered } = await refreshSource(userId, source);
+        allPages.push(...pages);
         for (const p of pages) {
-          if (p.persistError) persistErrors.push(`${source.courseCode} ${p.url}: ${p.persistError}`);
-          if (p.parseStatus === "failed") parseFailures.push(`${source.courseCode} ${p.url}`);
+          const failedForSemantics =
+            !!p.persistError || p.parseStatus === "failed" || (p.approved && p.fetchOutcome !== "success");
+          if (failedForSemantics) {
+            failures.push({
+              course: source.courseCode,
+              url: p.url,
+              stage: p.failedStage ?? (p.persistError ? "persist" : p.parseStatus === "failed" ? "parse" : "fetch"),
+              outcome: p.fetchOutcome,
+              error: p.persistError ?? p.note ?? p.fetchOutcome,
+            });
+          }
         }
         results.push({
           course: source.courseCode,
@@ -221,14 +237,16 @@ export const CourseWebsiteTools = {
         });
       }
 
-      // success is FALSE if any persistence write failed — never claim success when
-      // internal state could not be durably written. partial flags parse failures
-      // or fetch problems that did not fully ingest while other pages did.
-      const success = persistErrors.length === 0;
-      const partial = !success
-        || parseFailures.length > 0
-        || results.some((r) => r.pages.some((p) => !p.ingested && p.fetchOutcome === "success"))
-        || results.some((r) => r.pages.some((p) => p.fetchOutcome !== "success"));
+      // Result semantics:
+      //   success = no page had a persistence failure, a parse failure, OR a
+      //             non-successful fetch for an APPROVED page.
+      //   partial = at least one page fully succeeded AND at least one page failed.
+      //   fully successful → success:true, partial:false.
+      //   completely failed → success:false, partial:false.
+      const anyFailure = failures.length > 0;
+      const anySuccess = allPages.some((p) => p.succeeded);
+      const success = !anyFailure;
+      const partial = anySuccess && anyFailure;
 
       return JSON.stringify({
         success,
@@ -238,8 +256,7 @@ export const CourseWebsiteTools = {
         // and website-derived tasks). It never writes to Notion, submits coursework,
         // or triggers background Notion sync.
         note: "External website fetches are read-only; this tool mutated Horizon's internal snapshot, canonical-item, and task state. No Notion writes, no submissions, no background sync.",
-        persistErrors,
-        parseFailures,
+        failures, // structured: { course, url, stage, outcome, error }
         courses: results,
       }, null, 2);
     },

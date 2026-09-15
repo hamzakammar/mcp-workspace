@@ -125,62 +125,117 @@ export function normalizeTitle(t: string): string {
   return t.toLowerCase().replace(/\s+/g, " ").replace(/[^a-z0-9 ]/g, "").trim();
 }
 
-/** Decide whether a content fetch should create a new snapshot (append-only + dedup). */
-export function shouldInsertSnapshot(latestHash: string | null, newHash: string | null, outcome: FetchOutcome): boolean {
-  if (!isContentOutcome(outcome)) return true;         // always record non-content events as history
-  if (newHash === null) return true;
-  return latestHash !== newHash;                        // dedup unchanged content
-}
-
 // ── DB layer ────────────────────────────────────────────────────────────────
 
 export type ParseStatus = "ok" | "failed" | "skipped";
 
-interface RecordSnapshotArgs {
+/** A snapshot row as seen by the dedup lookup. */
+export interface SnapshotDedupRow {
+  id: string;
+  content_hash: string | null;
+  parser_version: string;
+  parse_status: ParseStatus | string;
+}
+
+/**
+ * Decide which prior snapshot (if any) a SUCCESSFUL parse may deduplicate against.
+ *
+ * A successful parse may reuse a prior snapshot ONLY when it has the SAME
+ * content_hash AND parser_version AND parse_status='ok'. This guarantees:
+ *   - a previously FAILED parse of identical HTML is never reused as the provenance
+ *     snapshot for successfully parsed canonical items;
+ *   - a parser-version upgrade always produces a fresh snapshot (re-parse of record).
+ * `existing` must already be scoped to (user, course, term, url) and ordered newest-
+ * first; the newest qualifying snapshot is chosen.
+ */
+export function pickDedupSnapshotId(
+  existing: SnapshotDedupRow[],
+  contentHash: string | null,
+  parserVersion: string,
+): string | null {
+  if (!contentHash) return null;
+  for (const s of existing) {
+    if (s.parse_status === "ok" && s.parser_version === parserVersion && s.content_hash === contentHash) {
+      return s.id;
+    }
+  }
+  return null;
+}
+
+/** Build the eligible `tasks` rows (dated assessments) for the canonical read path. */
+export function buildTaskRows(items: CanonicalItem[]): Array<Record<string, unknown>> {
+  const assessmentTypes = new Set<ItemType>(["assignment", "quiz", "exam", "project", "deadline"]);
+  return items
+    .filter((it) => assessmentTypes.has(it.itemType) && it.dueAt)
+    .map((it) => ({
+      user_id: it.userId,
+      source_ref: it.sourceRef,
+      course_id: it.courseCode,
+      title: it.title,
+      description: it.dueText ?? null,
+      due_at: it.dueAt,
+      links: it.url ? [it.url] : [],
+    }));
+}
+
+export interface IngestResult {
+  snapshotId: string | null;
+  deduped: boolean;
+  snapshotsInserted: number;
+  itemsUpserted: number;
+  tasksUpserted: number;
+}
+
+/** Structured persistence error identifying the failed stage + source_ref. */
+export class PersistError extends Error {
+  stage: "snapshot" | "canonical_item" | "task" | "ingest";
+  sourceRef: string | null;
+  constructor(message: string, stage: PersistError["stage"], sourceRef: string | null) {
+    super(message);
+    this.name = "PersistError";
+    this.stage = stage;
+    this.sourceRef = sourceRef;
+  }
+}
+
+interface IngestPageArgs {
   userId: string;
   source: CourseWebsiteSource;
   pageType: PageType;
   fetch: FetchResult;
   extracted: unknown | null;
-  parseError: string | null;
-  /** PARSE result, independent of the fetch outcome. Defaults to 'skipped'. */
-  parseStatus?: ParseStatus;
+  items: CanonicalItem[];
 }
 
 /**
- * Append a snapshot row (deduping unchanged content within the SAME
- * user+course+term+url scope). Throws on a DB write failure so callers can
- * surface persistence errors (never silently swallow).
+ * Atomically persist ONE successfully-parsed page: the snapshot, all canonical
+ * items, and all eligible tasks — in a single PostgreSQL transaction via the
+ * `ingest_course_website_page` RPC (a plpgsql function; any error inside it rolls
+ * back every write). Dedup is decided here (scoped + parser_version + parse_status
+ * 'ok') and passed to the RPC as `dedup_snapshot_id`. On failure this throws a
+ * PersistError and NOTHING is committed for the page (append-only rule preserved:
+ * snapshots are only ever INSERTed).
  */
-export async function recordSnapshot(args: RecordSnapshotArgs): Promise<{ snapshotId: string | null; deduped: boolean; hash: string | null }> {
+export async function ingestPage(args: IngestPageArgs): Promise<IngestResult> {
   const { userId, source, pageType, fetch: f } = args;
-  const parseStatus: ParseStatus = args.parseStatus ?? "skipped";
-  const hash = isContentOutcome(f.outcome) && f.body ? contentHash(f.body) : null;
+  const hash = f.body ? contentHash(f.body) : null;
 
-  // Dedup lookup is scoped to (user, course, term, final URL) so an identical URL
-  // fetched under a different course or term NEVER dedups against or references
-  // another course/term's snapshot.
-  const { data: latest, error: latestErr } = await supabase
+  // Scoped dedup lookup (user + course + term + url), newest first.
+  const { data: existing, error: lookupErr } = await supabase
     .from("course_website_snapshots")
-    .select("id, content_hash")
+    .select("id, content_hash, parser_version, parse_status")
     .eq("user_id", userId)
     .eq("course_code", source.courseCode)
     .eq("term", source.term)
     .eq("url", f.finalUrl)
-    .order("fetched_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (latestErr) {
-    throw new Error(`snapshot lookup failed for ${f.finalUrl}: ${latestErr.message}`);
+    .order("fetched_at", { ascending: false });
+  if (lookupErr) {
+    throw new PersistError(`snapshot dedup lookup failed for ${f.finalUrl}: ${lookupErr.message}`, "snapshot", null);
   }
+  const dedupSnapshotId = pickDedupSnapshotId((existing as SnapshotDedupRow[]) ?? [], hash, PARSER_VERSION);
 
-  const latestHash: string | null = (latest as { content_hash?: string | null } | null)?.content_hash ?? null;
-
-  if (!shouldInsertSnapshot(latestHash, hash, f.outcome)) {
-    return { snapshotId: (latest as { id?: string } | null)?.id ?? null, deduped: true, hash };
-  }
-
-  const row = {
+  const payload = {
+    dedup_snapshot_id: dedupSnapshotId,
     user_id: userId,
     course_code: source.courseCode,
     term: source.term,
@@ -188,53 +243,14 @@ export async function recordSnapshot(args: RecordSnapshotArgs): Promise<{ snapsh
     page_type: pageType,
     http_status: f.httpStatus,
     fetch_outcome: f.outcome,
-    parse_status: parseStatus,
+    parse_status: "ok" as ParseStatus,
     content_hash: hash,
     parser_version: PARSER_VERSION,
     source_updated_at: f.sourceUpdatedAt,
-    fetched_at: new Date().toISOString(),
-    payload: isContentOutcome(f.outcome) ? sanitize(f.body) : null,
+    payload: sanitize(f.body),
     extracted: args.extracted ?? null,
-    error: args.parseError ?? f.error ?? null,
-  };
-  const { data, error } = await supabase
-    .from("course_website_snapshots")
-    .insert(row)
-    .select("id")
-    .maybeSingle();
-  if (error) {
-    throw new Error(`snapshot insert failed for ${f.finalUrl}: ${error.message}`);
-  }
-  return { snapshotId: (data as { id?: string } | null)?.id ?? null, deduped: false, hash };
-}
-
-/**
- * Upsert canonical items. On a changed due date for an existing item, the previous
- * value is preserved in `conflicts` (flagged) rather than silently dropped. Failed/
- * empty fetches must NOT call this — callers skip persistence so old items survive.
- */
-export async function upsertCanonicalItems(items: CanonicalItem[], snapshotId: string | null): Promise<number> {
-  let written = 0;
-  const nowIso = new Date().toISOString();
-  for (const it of items) {
-    const { data: existing, error: readErr } = await supabase
-      .from("course_website_items")
-      .select("id, due_at, conflicts, first_seen_at")
-      .eq("user_id", it.userId)
-      .eq("source", it.source)
-      .eq("source_ref", it.sourceRef)
-      .maybeSingle();
-    if (readErr) {
-      throw new Error(`item lookup failed (${it.sourceRef}): ${readErr.message}`);
-    }
-
-    const ex = existing as { id?: string; due_at?: string | null; conflicts?: ConflictFlag[]; first_seen_at?: string } | null;
-    const conflicts: ConflictFlag[] = [...(ex?.conflicts ?? []), ...it.conflicts];
-    if (ex && ex.due_at && it.dueAt && ex.due_at !== it.dueAt) {
-      conflicts.push({ field: "due_at", kind: "temporal-change", previous: ex.due_at, current: it.dueAt, seenAt: nowIso });
-    }
-
-    const row = {
+    error: null,
+    items: args.items.map((it) => ({
       user_id: it.userId,
       course_code: it.courseCode,
       term: it.term,
@@ -245,51 +261,83 @@ export async function upsertCanonicalItems(items: CanonicalItem[], snapshotId: s
       points: it.points,
       url: it.url,
       status_note: it.statusNote,
-      source: it.source,
       source_ref: it.sourceRef,
-      snapshot_id: snapshotId,
       source_url: it.sourceUrl,
-      conflicts,
-      last_seen_at: nowIso,
-      updated_at: nowIso,
-    };
-    const { error } = await supabase
-      .from("course_website_items")
-      .upsert(row, { onConflict: "user_id,source,source_ref" });
-    if (error) {
-      throw new Error(`item upsert failed (${it.sourceRef}): ${error.message}`);
-    }
-    written++;
+      conflicts: it.conflicts,
+    })),
+    tasks: buildTaskRows(args.items),
+  };
+
+  const { data, error } = await supabase.rpc("ingest_course_website_page", { p_payload: payload });
+  if (error) {
+    // The transaction rolled back — nothing was committed for this page.
+    const parsed = parseStageFromError(error.message);
+    throw new PersistError(`atomic page ingest failed for ${f.finalUrl}: ${error.message}`, parsed.stage, parsed.sourceRef);
   }
-  return written;
+  const r = (data ?? {}) as { snapshot_id?: string; deduped?: boolean; snapshots_inserted?: number; items_upserted?: number; tasks_upserted?: number };
+  return {
+    snapshotId: r.snapshot_id ?? null,
+    deduped: !!r.deduped,
+    snapshotsInserted: r.snapshots_inserted ?? 0,
+    itemsUpserted: r.items_upserted ?? 0,
+    tasksUpserted: r.tasks_upserted ?? 0,
+  };
+}
+
+/** Best-effort extraction of stage/source_ref hints from a PG/RPC error message. */
+function parseStageFromError(message: string): { stage: PersistError["stage"]; sourceRef: string | null } {
+  const stageMatch = message.match(/stage=([a-z_]+)/i);
+  const refMatch = message.match(/source_ref=([^\s]+)/i);
+  const raw = stageMatch?.[1];
+  const stage: PersistError["stage"] =
+    raw === "snapshot" || raw === "canonical_item" || raw === "task" ? raw : "ingest";
+  return { stage, sourceRef: refMatch?.[1] ?? null };
+}
+
+interface RecordSnapshotOnlyArgs {
+  userId: string;
+  source: CourseWebsiteSource;
+  pageType: PageType;
+  fetch: FetchResult;
+  parseStatus: ParseStatus;   // 'failed' (parse error) or 'skipped' (non-content)
+  parseError: string | null;
 }
 
 /**
- * Integrate assessment items with a concrete due time into the canonical `tasks`
- * read path (source='website'), so plan_week / tasks_list surface them. Only ever
- * UPSERTS — never deletes — so a later empty/failed fetch cannot remove a task.
+ * Record a snapshot ONLY (no canonical items / tasks) for a parse failure or a
+ * non-content fetch outcome. A single INSERT is inherently atomic. These are always
+ * appended as distinct historical events — never deduplicated — so a failed parse
+ * stays a distinct record and never becomes provenance for successful items.
  */
-export async function integrateIntoTasks(items: CanonicalItem[]): Promise<number> {
-  const assessmentTypes = new Set<ItemType>(["assignment", "quiz", "exam", "project", "deadline"]);
-  const eligible = items.filter((it) => assessmentTypes.has(it.itemType) && it.dueAt);
-  let written = 0;
-  for (const it of eligible) {
-    const row = {
-      user_id: it.userId,
-      source: "website",
-      source_ref: it.sourceRef,
-      course_id: it.courseCode,
-      title: it.title,
-      description: it.dueText ?? null,
-      due_at: it.dueAt,
-      links: it.url ? [it.url] : [],
-      updated_at: new Date().toISOString(),
-    };
-    const { error } = await supabase.from("tasks").upsert(row, { onConflict: "user_id,source,source_ref" });
-    if (error) { throw new Error(`task upsert failed (${it.sourceRef}): ${error.message}`); }
-    written++;
+export async function recordSnapshotOnly(args: RecordSnapshotOnlyArgs): Promise<{ snapshotId: string | null }> {
+  const { userId, source, pageType, fetch: f } = args;
+  const hash = isContentOutcome(f.outcome) && f.body ? contentHash(f.body) : null;
+  const row = {
+    user_id: userId,
+    course_code: source.courseCode,
+    term: source.term,
+    url: f.finalUrl,
+    page_type: pageType,
+    http_status: f.httpStatus,
+    fetch_outcome: f.outcome,
+    parse_status: args.parseStatus,
+    content_hash: hash,
+    parser_version: PARSER_VERSION,
+    source_updated_at: f.sourceUpdatedAt,
+    fetched_at: new Date().toISOString(),
+    payload: isContentOutcome(f.outcome) ? sanitize(f.body) : null,
+    extracted: null,
+    error: args.parseError ?? f.error ?? null,
+  };
+  const { data, error } = await supabase
+    .from("course_website_snapshots")
+    .insert(row)
+    .select("id")
+    .maybeSingle();
+  if (error) {
+    throw new PersistError(`snapshot insert failed for ${f.finalUrl}: ${error.message}`, "snapshot", null);
   }
-  return written;
+  return { snapshotId: (data as { id?: string } | null)?.id ?? null };
 }
 
 /** Read cached canonical items (no network) for get_course_website_content. */
