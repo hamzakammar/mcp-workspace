@@ -37,6 +37,7 @@ import { NotesTools } from "./study/src/notes.js";
 import { SyncTools } from "./study/src/sync.js";
 import { PiazzaTools } from "./study/src/piazza.js";
 import { OutlineTools } from "./study/src/outline.js";
+import { CourseWebsiteTools } from "./study/src/courseWebsite/tools.js";
 import { getUserId, runWithUserId } from "./utils/userContext.js";
 import { embedText } from "./rag/embeddings.js";
 import { semanticSearch } from "./rag/vectorStore.js";
@@ -707,6 +708,24 @@ function createServer(): McpServer {
     OutlineTools.get_cached_outline.description,
     OutlineTools.get_cached_outline.schema,
     wrapStudyToolHandler("get_cached_outline", OutlineTools.get_cached_outline.handler)
+  );
+
+  // Register course-website ingestion tools.
+  // get_course_website_content is a pure cache read → read-only.
+  registerReadTool(
+    "get_course_website_content",
+    CourseWebsiteTools.get_course_website_content.description,
+    CourseWebsiteTools.get_course_website_content.schema,
+    wrapStudyToolHandler("get_course_website_content", CourseWebsiteTools.get_course_website_content.handler)
+  );
+  // refresh_course_websites persists snapshots + canonical items + writes into the
+  // canonical `tasks` read path, so it is honestly NON-read-only (approval-gated).
+  // It never writes to Notion, submits coursework, or triggers background sync.
+  registerMutatingTool(
+    "refresh_course_websites",
+    CourseWebsiteTools.refresh_course_websites.description,
+    CourseWebsiteTools.refresh_course_websites.schema,
+    wrapStudyToolHandler("refresh_course_websites", CourseWebsiteTools.refresh_course_websites.handler)
   );
 
   // Register quiz tools (Task 2)
