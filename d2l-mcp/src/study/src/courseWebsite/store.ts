@@ -211,31 +211,24 @@ interface IngestPageArgs {
  * Atomically persist ONE successfully-parsed page: the snapshot, all canonical
  * items, and all eligible tasks — in a single PostgreSQL transaction via the
  * `ingest_course_website_page` RPC (a plpgsql function; any error inside it rolls
- * back every write). Dedup is decided here (scoped + parser_version + parse_status
- * 'ok') and passed to the RPC as `dedup_snapshot_id`. On failure this throws a
- * PersistError and NOTHING is committed for the page (append-only rule preserved:
- * snapshots are only ever INSERTed).
+ * back every write). Dedup is NOT decided here: the RPC authoritatively enforces,
+ * inside the transaction, that a successful parse reuses a prior snapshot only when
+ * it matches the exact identity (user, course, term, url, content_hash,
+ * parser_version) AND parse_status='ok'. On failure this throws a PersistError
+ * (whose stage + source_ref come from the RPC's tagged error) and NOTHING is
+ * committed for the page (append-only rule preserved: snapshots are only INSERTed).
  */
 export async function ingestPage(args: IngestPageArgs): Promise<IngestResult> {
   const { userId, source, pageType, fetch: f } = args;
   const hash = f.body ? contentHash(f.body) : null;
 
-  // Scoped dedup lookup (user + course + term + url), newest first.
-  const { data: existing, error: lookupErr } = await supabase
-    .from("course_website_snapshots")
-    .select("id, content_hash, parser_version, parse_status")
-    .eq("user_id", userId)
-    .eq("course_code", source.courseCode)
-    .eq("term", source.term)
-    .eq("url", f.finalUrl)
-    .order("fetched_at", { ascending: false });
-  if (lookupErr) {
-    throw new PersistError(`snapshot dedup lookup failed for ${f.finalUrl}: ${lookupErr.message}`, "snapshot", null);
-  }
-  const dedupSnapshotId = pickDedupSnapshotId((existing as SnapshotDedupRow[]) ?? [], hash, PARSER_VERSION);
-
+  // NOTE: deduplication is NOT decided here. The dedup invariant (reuse a prior
+  // snapshot only when it matches the exact identity — user, course, term, url,
+  // content_hash, parser_version — AND parse_status='ok') is enforced
+  // AUTHORITATIVELY inside the ingest_course_website_page transaction, so no
+  // app-chosen snapshot id is trusted as provenance. `pickDedupSnapshotId` is the
+  // pure, unit-tested specification of that same rule (see store tests).
   const payload = {
-    dedup_snapshot_id: dedupSnapshotId,
     user_id: userId,
     course_code: source.courseCode,
     term: source.term,

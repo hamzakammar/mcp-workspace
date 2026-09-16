@@ -73,19 +73,30 @@ vi.mock("../../src/utils/supabase.js", () => {
     db.rpcCalls.push({ name, payload: params?.p_payload });
     if (name === "ingest_course_website_page") {
       if (db.rpcFail) {
-        // Atomic function raised → whole page transaction rolls back (nothing committed).
-        return dbErr(`stage=${db.rpcFail.stage} source_ref=${db.rpcFail.sourceRef ?? ""} boom`);
+        // Atomic function raised → whole page transaction rolls back (nothing
+        // committed). The message mirrors the RPC's real `raise` format so the
+        // store's stage/source_ref parsing is exercised against production wording.
+        return dbErr(`stage=${db.rpcFail.stage} source_ref=${db.rpcFail.sourceRef ?? ""} : boom`);
       }
       const p = params.p_payload;
-      const dedup = p.dedup_snapshot_id;
-      let snapshotId = dedup;
+      // Authoritative dedup, mirroring the SQL: reuse only a prior snapshot with the
+      // exact identity AND parse_status='ok'. No app-supplied id is trusted.
+      let snapshotId: string | null = null;
+      let deduped = false;
+      if (p.content_hash && p.parse_status === "ok") {
+        const match = [...db.snapshots].reverse().find((s) =>
+          s.user_id === p.user_id && s.course_code === p.course_code && s.term === p.term &&
+          s.url === p.url && s.content_hash === p.content_hash &&
+          s.parser_version === p.parser_version && s.parse_status === "ok");
+        if (match) { snapshotId = match.id; deduped = true; }
+      }
       let inserted = 0;
-      if (!dedup) {
+      if (!deduped) {
         const id = `snap-${++db.seq}`;
         db.snapshots.push({ id, user_id: p.user_id, course_code: p.course_code, term: p.term, url: p.url, content_hash: p.content_hash ?? null, parser_version: p.parser_version, parse_status: p.parse_status });
         snapshotId = id; inserted = 1;
       }
-      return { data: { snapshot_id: snapshotId, deduped: !!dedup, snapshots_inserted: inserted, items_upserted: (p.items || []).length, tasks_upserted: (p.tasks || []).length }, error: null };
+      return { data: { snapshot_id: snapshotId, deduped, snapshots_inserted: inserted, items_upserted: (p.items || []).length, tasks_upserted: (p.tasks || []).length }, error: null };
     }
     return { data: null, error: null };
   }
@@ -316,20 +327,20 @@ describe("ingestPage dedup is scoped and never reuses a failed snapshot as prove
     const r5 = await ingestPage({ userId: "u1", source: CS241_FALL_2026, pageType: "assignments", fetch: mkFetch(URL, body), extracted: {}, items: [] });
     expect(r5.deduped).toBe(true);
     expect(r5.snapshotId).toBe(r1.snapshotId);
-    // the dedup lookup was scoped by user_id + course_code + term + url
-    const lookups = db.recorded.filter((r) => r.table === "course_website_snapshots" && r.op === "select");
-    expect(lookups.every((r) => ["user_id", "course_code", "term", "url"].every((k) => k in (r.filters || {})))).toBe(true);
+    // Dedup is decided authoritatively in the RPC, so the ingest payload must carry
+    // the full identity the transaction keys on — and no trusted dedup id.
+    const calls = db.rpcCalls.filter((c) => c.name === "ingest_course_website_page");
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((c) => ["user_id", "course_code", "term", "url", "content_hash", "parser_version"].every((k) => k in c.payload))).toBe(true);
+    expect(calls.every((c) => !("dedup_snapshot_id" in c.payload))).toBe(true);
   });
 
   it("a prior FAILED parse of identical content does not become provenance; a fresh snapshot is inserted", async () => {
-    // record a failed-parse snapshot of the content
+    // record a failed-parse snapshot of the content (parse_status='failed')
     await recordSnapshotOnly({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch(URL, body), parseStatus: "failed", parseError: "boom" });
     const r = await ingestPage({ userId: "u1", source: SE212_FALL_2026, pageType: "assignments", fetch: mkFetch(URL, body), extracted: {}, items: [] });
-    expect(r.deduped).toBe(false);               // did NOT reuse the failed snapshot
-    expect(r.snapshotId).not.toBe("snap-1");      // links items to a new ok snapshot
-    // ingest was called with dedup_snapshot_id null
-    const call = db.rpcCalls.find((c) => c.name === "ingest_course_website_page")!;
-    expect(call.payload.dedup_snapshot_id).toBeNull();
+    expect(r.deduped).toBe(false);               // the failed snapshot is never reused
+    expect(r.snapshotId).not.toBe("snap-1");      // items link to a new parse_status='ok' snapshot
   });
 });
 

@@ -122,9 +122,17 @@ alter table public.course_website_items disable row level security;
 -- the page (no partial canonical-item or task rows remain). The append-only rule is
 -- preserved — this function only INSERTs snapshots (never updates/deletes them).
 --
--- Dedup is decided by the application and passed as p_payload->>'dedup_snapshot_id':
--- when present the existing (parse_status='ok', same parser_version + content_hash)
--- snapshot is reused as provenance; when null a fresh snapshot is inserted.
+-- Dedup is AUTHORITATIVE and lives inside this transaction: a successful parse
+-- reuses an existing snapshot ONLY when it matches the same user_id, course_code,
+-- term, url, content_hash, parser_version AND parse_status='ok'. No app-provided
+-- snapshot id is trusted. A previously FAILED parse (parse_status<>'ok') therefore
+-- can never become the provenance snapshot for successfully parsed items, and a
+-- parser-version change always re-parses of record.
+--
+-- Each stage is wrapped so that a failure RAISEs a message tagged with
+-- 'stage=<snapshot|canonical_item|task> source_ref=<ref>'. The re-raise propagates
+-- out of the function, rolling the whole transaction back, while giving the caller
+-- an accurate failed stage + source_ref (parsed by the application).
 create or replace function public.ingest_course_website_page(p_payload jsonb)
 returns jsonb
 language plpgsql
@@ -137,71 +145,96 @@ declare
   v_tasks_up int := 0;
   v_item jsonb;
   v_task jsonb;
-  v_dedup uuid := nullif(p_payload->>'dedup_snapshot_id', '')::uuid;
   v_old_due timestamptz;
   v_old_conf jsonb;
   v_conf jsonb;
   v_new_due timestamptz;
 begin
-  if v_dedup is not null then
-    v_snapshot_id := v_dedup;
-    v_deduped := true;
-  else
-    insert into public.course_website_snapshots(
-      user_id, course_code, term, url, page_type, http_status, fetch_outcome,
-      parse_status, content_hash, parser_version, source_updated_at, fetched_at,
-      payload, extracted, error)
-    values (
-      p_payload->>'user_id', p_payload->>'course_code', p_payload->>'term',
-      p_payload->>'url', p_payload->>'page_type', nullif(p_payload->>'http_status','')::int,
-      p_payload->>'fetch_outcome', coalesce(p_payload->>'parse_status','ok'),
-      p_payload->>'content_hash', p_payload->>'parser_version',
-      nullif(p_payload->>'source_updated_at','')::timestamptz, now(),
-      p_payload->>'payload', p_payload->'extracted', p_payload->>'error')
-    returning id into v_snapshot_id;
-    v_snap_ins := 1;
-  end if;
-
-  -- Canonical items (upsert; preserve + flag conflicting due dates over time).
-  for v_item in select * from jsonb_array_elements(coalesce(p_payload->'items', '[]'::jsonb)) loop
-    v_new_due := nullif(v_item->>'due_at','')::timestamptz;
-    select due_at, conflicts into v_old_due, v_old_conf
-      from public.course_website_items
-     where user_id = v_item->>'user_id' and source = 'website' and source_ref = v_item->>'source_ref';
-    v_conf := coalesce(v_old_conf, '[]'::jsonb) || coalesce(v_item->'conflicts', '[]'::jsonb);
-    if v_old_due is not null and v_new_due is not null and v_old_due <> v_new_due then
-      v_conf := v_conf || jsonb_build_array(jsonb_build_object(
-        'field','due_at','kind','temporal-change',
-        'previous', to_jsonb(v_old_due), 'current', to_jsonb(v_new_due), 'seenAt', to_jsonb(now())));
+  -- SNAPSHOT stage: authoritative dedup lookup, then reuse-or-insert.
+  begin
+    if p_payload->>'content_hash' is not null and coalesce(p_payload->>'parse_status','ok') = 'ok' then
+      select id into v_snapshot_id
+        from public.course_website_snapshots
+       where user_id = p_payload->>'user_id'
+         and course_code = p_payload->>'course_code'
+         and term = p_payload->>'term'
+         and url = p_payload->>'url'
+         and content_hash = p_payload->>'content_hash'
+         and parser_version = p_payload->>'parser_version'
+         and parse_status = 'ok'
+       order by fetched_at desc
+       limit 1;
     end if;
-    insert into public.course_website_items(
-      user_id, course_code, term, item_type, title, due_at, due_text, points, url,
-      status_note, source, source_ref, snapshot_id, source_url, conflicts, last_seen_at, updated_at)
-    values(
-      v_item->>'user_id', v_item->>'course_code', v_item->>'term', v_item->>'item_type',
-      v_item->>'title', v_new_due, v_item->>'due_text', v_item->>'points', v_item->>'url',
-      v_item->>'status_note', 'website', v_item->>'source_ref', v_snapshot_id,
-      v_item->>'source_url', v_conf, now(), now())
-    on conflict (user_id, source, source_ref) do update set
-      course_code = excluded.course_code, term = excluded.term, item_type = excluded.item_type,
-      title = excluded.title, due_at = excluded.due_at, due_text = excluded.due_text,
-      points = excluded.points, url = excluded.url, status_note = excluded.status_note,
-      snapshot_id = excluded.snapshot_id, source_url = excluded.source_url,
-      conflicts = excluded.conflicts, last_seen_at = excluded.last_seen_at, updated_at = excluded.updated_at;
-    v_items_up := v_items_up + 1;
+
+    if v_snapshot_id is not null then
+      v_deduped := true;
+    else
+      insert into public.course_website_snapshots(
+        user_id, course_code, term, url, page_type, http_status, fetch_outcome,
+        parse_status, content_hash, parser_version, source_updated_at, fetched_at,
+        payload, extracted, error)
+      values (
+        p_payload->>'user_id', p_payload->>'course_code', p_payload->>'term',
+        p_payload->>'url', p_payload->>'page_type', nullif(p_payload->>'http_status','')::int,
+        p_payload->>'fetch_outcome', coalesce(p_payload->>'parse_status','ok'),
+        p_payload->>'content_hash', p_payload->>'parser_version',
+        nullif(p_payload->>'source_updated_at','')::timestamptz, now(),
+        p_payload->>'payload', p_payload->'extracted', p_payload->>'error')
+      returning id into v_snapshot_id;
+      v_snap_ins := 1;
+    end if;
+  exception when others then
+    raise exception 'stage=snapshot source_ref= : %', sqlerrm;
+  end;
+
+  -- CANONICAL ITEM stage (upsert; preserve + flag conflicting due dates over time).
+  for v_item in select * from jsonb_array_elements(coalesce(p_payload->'items', '[]'::jsonb)) loop
+    begin
+      v_new_due := nullif(v_item->>'due_at','')::timestamptz;
+      select due_at, conflicts into v_old_due, v_old_conf
+        from public.course_website_items
+       where user_id = v_item->>'user_id' and source = 'website' and source_ref = v_item->>'source_ref';
+      v_conf := coalesce(v_old_conf, '[]'::jsonb) || coalesce(v_item->'conflicts', '[]'::jsonb);
+      if v_old_due is not null and v_new_due is not null and v_old_due <> v_new_due then
+        v_conf := v_conf || jsonb_build_array(jsonb_build_object(
+          'field','due_at','kind','temporal-change',
+          'previous', to_jsonb(v_old_due), 'current', to_jsonb(v_new_due), 'seenAt', to_jsonb(now())));
+      end if;
+      insert into public.course_website_items(
+        user_id, course_code, term, item_type, title, due_at, due_text, points, url,
+        status_note, source, source_ref, snapshot_id, source_url, conflicts, last_seen_at, updated_at)
+      values(
+        v_item->>'user_id', v_item->>'course_code', v_item->>'term', v_item->>'item_type',
+        v_item->>'title', v_new_due, v_item->>'due_text', v_item->>'points', v_item->>'url',
+        v_item->>'status_note', 'website', v_item->>'source_ref', v_snapshot_id,
+        v_item->>'source_url', v_conf, now(), now())
+      on conflict (user_id, source, source_ref) do update set
+        course_code = excluded.course_code, term = excluded.term, item_type = excluded.item_type,
+        title = excluded.title, due_at = excluded.due_at, due_text = excluded.due_text,
+        points = excluded.points, url = excluded.url, status_note = excluded.status_note,
+        snapshot_id = excluded.snapshot_id, source_url = excluded.source_url,
+        conflicts = excluded.conflicts, last_seen_at = excluded.last_seen_at, updated_at = excluded.updated_at;
+      v_items_up := v_items_up + 1;
+    exception when others then
+      raise exception 'stage=canonical_item source_ref=% : %', coalesce(v_item->>'source_ref',''), sqlerrm;
+    end;
   end loop;
 
-  -- Eligible website tasks (upsert into the canonical read path).
+  -- TASK stage (upsert into the canonical read path).
   for v_task in select * from jsonb_array_elements(coalesce(p_payload->'tasks', '[]'::jsonb)) loop
-    insert into public.tasks(user_id, source, source_ref, course_id, title, description, due_at, links, updated_at)
-    values(
-      v_task->>'user_id', 'website', v_task->>'source_ref', v_task->>'course_id',
-      v_task->>'title', v_task->>'description', nullif(v_task->>'due_at','')::timestamptz,
-      coalesce(v_task->'links', '[]'::jsonb), now())
-    on conflict (user_id, source, source_ref) do update set
-      course_id = excluded.course_id, title = excluded.title, description = excluded.description,
-      due_at = excluded.due_at, links = excluded.links, updated_at = excluded.updated_at;
-    v_tasks_up := v_tasks_up + 1;
+    begin
+      insert into public.tasks(user_id, source, source_ref, course_id, title, description, due_at, links, updated_at)
+      values(
+        v_task->>'user_id', 'website', v_task->>'source_ref', v_task->>'course_id',
+        v_task->>'title', v_task->>'description', nullif(v_task->>'due_at','')::timestamptz,
+        coalesce(v_task->'links', '[]'::jsonb), now())
+      on conflict (user_id, source, source_ref) do update set
+        course_id = excluded.course_id, title = excluded.title, description = excluded.description,
+        due_at = excluded.due_at, links = excluded.links, updated_at = excluded.updated_at;
+      v_tasks_up := v_tasks_up + 1;
+    exception when others then
+      raise exception 'stage=task source_ref=% : %', coalesce(v_task->>'source_ref',''), sqlerrm;
+    end;
   end loop;
 
   return jsonb_build_object(
