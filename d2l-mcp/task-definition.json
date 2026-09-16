@@ -34,6 +34,10 @@
         {
           "name": "PORT",
           "value": "8080"
+        },
+        {
+          "name": "PUBLIC_BASE_URL",
+          "value": "https://horizon.hamzaammar.ca"
         }
       ],
       "secrets": [
@@ -95,6 +99,10 @@
           "value": "horizon.hamzaammar.ca"
         },
         {
+          "name": "PUBLIC_BASE_URL",
+          "value": "https://horizon.hamzaammar.ca"
+        },
+        {
           "name": "KMS_KEY_ARN",
           "value": "arn:aws:kms:us-east-1:051140201449:key/ac8eef26-77b4-4e16-b99f-f61d277c5346"
         }
@@ -143,6 +151,10 @@
         {
           "name": "STUDY_MCP_TOKEN",
           "valueFrom": "arn:aws:secretsmanager:us-east-1:051140201449:secret:study-mcp/mcp-token-Q6YSS2"
+        },
+        {
+          "name": "OAUTH_SESSION_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:051140201449:secret:horizon-mcp/oauth-session-secret-NNxDoY"
         }
       ],
       "logConfiguration": {

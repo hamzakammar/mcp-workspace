@@ -58,6 +58,7 @@ const expectedReadOnlyTools = [
   'get_crowdmark_feedback',
   'get_connection_guide',
   'get_horizon_status',
+  'get_course_website_content',
 ] as const;
 
 const expectedMutatingTools = [
@@ -76,6 +77,7 @@ const expectedMutatingTools = [
   'connect_notion',
   'sync_to_notion',
   'delete_my_data',
+  'refresh_course_websites',
 ] as const;
 
 describe('MCP tool annotations', () => {

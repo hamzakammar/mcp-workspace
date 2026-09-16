@@ -43,15 +43,109 @@ func isPublicRoute(path string) bool {
 	if strings.HasPrefix(path, "/auth/d2l/status/") {
 		return true
 	}
-	// OAuth 2.0 discovery + dynamic client registration used by mcp-remote.
-	// These must be reachable without a token so the client can learn how to auth.
+	// OAuth 2.1 discovery, dynamic client registration, and the authorization
+	// server endpoints. These must be reachable without a token so a client can
+	// discover the flow, register, log in, and exchange codes for tokens.
 	if strings.HasPrefix(path, "/.well-known/") {
 		return true
 	}
-	if path == "/register" {
+	switch path {
+	case "/register", "/authorize", "/token", "/revoke":
 		return true
 	}
 	return false
+}
+
+// getPublicBaseURL returns the externally-visible base URL of this deployment,
+// used to build the WWW-Authenticate resource_metadata pointer.
+func getPublicBaseURL() string {
+	if u := os.Getenv("PUBLIC_BASE_URL"); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	if h := os.Getenv("API_HOST"); h != "" {
+		return "https://" + h
+	}
+	return "https://horizon.hamzaammar.ca"
+}
+
+// unauthorized writes a 401. For the protected MCP resource it also emits a
+// spec-compliant WWW-Authenticate header pointing at the protected-resource
+// metadata so an MCP client can auto-discover the OAuth flow (MCP auth spec).
+func unauthorized(w http.ResponseWriter, r *http.Request, wwwErr, body string) {
+	if r.URL.Path == "/mcp" {
+		meta := getPublicBaseURL() + "/.well-known/oauth-protected-resource"
+		val := fmt.Sprintf(`Bearer resource_metadata="%s"`, meta)
+		if wwwErr != "" {
+			val = fmt.Sprintf(`Bearer error="%s", resource_metadata="%s"`, wwwErr, meta)
+		}
+		w.Header().Set("WWW-Authenticate", val)
+	}
+	http.Error(w, body, http.StatusUnauthorized)
+}
+
+// resolveOAuthToken hashes an OAuth access token (hzn_at_...) and resolves it to
+// a Horizon user_id via the oauth_access_tokens table, rejecting revoked or
+// expired tokens. Mirrors resolveAPIKey but with expiry/revocation checks.
+func resolveOAuthToken(accessToken string) (string, error) {
+	hash := sha256.Sum256([]byte(accessToken))
+	tokenHash := hex.EncodeToString(hash[:])
+
+	sbURL := getSupabaseURL()
+	sbKey := os.Getenv("SUPABASE_SERVICE_ROLE_KEY")
+	if sbKey == "" {
+		sbKey = getAnonKey()
+	}
+	if sbURL == "" || sbKey == "" {
+		return "", fmt.Errorf("missing Supabase config for OAuth token validation")
+	}
+
+	restURL := fmt.Sprintf(
+		"%s/rest/v1/oauth_access_tokens?token_hash=eq.%s&select=user_id,expires_at,revoked&limit=1",
+		sbURL, tokenHash)
+	req, err := http.NewRequest("GET", restURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("apikey", sbKey)
+	req.Header.Set("Authorization", "Bearer "+sbKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("oauth token lookup failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("oauth token lookup returned %d", resp.StatusCode)
+	}
+
+	var rows []struct {
+		UserID    string `json:"user_id"`
+		ExpiresAt string `json:"expires_at"`
+		Revoked   bool   `json:"revoked"`
+	}
+	if err := json.Unmarshal(body, &rows); err != nil || len(rows) == 0 {
+		return "", fmt.Errorf("oauth token not found")
+	}
+	row := rows[0]
+	if row.Revoked {
+		return "", fmt.Errorf("oauth token revoked")
+	}
+	exp, err := time.Parse(time.RFC3339, row.ExpiresAt)
+	if err != nil {
+		// Postgres may return a space-separated timestamp without timezone 'T'.
+		exp, err = time.Parse("2006-01-02 15:04:05.999999-07", row.ExpiresAt)
+		if err != nil {
+			return "", fmt.Errorf("oauth token has unparseable expiry")
+		}
+	}
+	if time.Now().After(exp) {
+		return "", fmt.Errorf("oauth token expired")
+	}
+	if row.UserID == "" {
+		return "", fmt.Errorf("oauth token missing user_id")
+	}
+	return row.UserID, nil
 }
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
@@ -274,9 +368,33 @@ func Auth(_ string) func(http.Handler) http.Handler {
 				return
 			}
 
-			// Check for API key auth (x-api-key header or Bearer hzn_ prefix)
 			apiKey := r.Header.Get("x-api-key")
 			authHeader := r.Header.Get("Authorization")
+
+			// ── OAuth 2.1 bearer access token (SECONDARY auth method) ──────────
+			// Resolve OAuth access tokens (hzn_at_...) to a Horizon user. Checked
+			// BEFORE the API-key branch because hzn_at_ is a subset of the hzn_
+			// prefix. The existing API-key path below is left byte-for-byte intact.
+			oauthTok := ""
+			if authHeader != "" && strings.HasPrefix(authHeader, "Bearer hzn_at_") {
+				oauthTok = strings.TrimPrefix(authHeader, "Bearer ")
+			} else if strings.HasPrefix(apiKey, "hzn_at_") {
+				oauthTok = apiKey
+			}
+			if oauthTok != "" {
+				uid, oauthErr := resolveOAuthToken(oauthTok)
+				if oauthErr != nil {
+					fmt.Printf("[AUTH] OAuth token validation failed: %v\n", oauthErr)
+					unauthorized(w, r, "invalid_token", `{"error":"invalid_token"}`)
+					return
+				}
+				fmt.Printf("[AUTH] OAuth token auth OK, userId=%s\n", uid)
+				ctx := context.WithValue(r.Context(), UserIDKey, uid)
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+
+			// Check for API key auth (x-api-key header or Bearer hzn_ prefix)
 			if apiKey == "" && authHeader != "" && strings.HasPrefix(authHeader, "Bearer hzn_") {
 				apiKey = strings.TrimPrefix(authHeader, "Bearer ")
 			}
@@ -295,7 +413,7 @@ func Auth(_ string) func(http.Handler) http.Handler {
 			}
 
 			if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-				http.Error(w, `{"error":"missing or invalid Authorization header"}`, http.StatusUnauthorized)
+				unauthorized(w, r, "", `{"error":"missing or invalid Authorization header"}`)
 				return
 			}
 			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
@@ -325,7 +443,7 @@ func Auth(_ string) func(http.Handler) http.Handler {
 				session, refreshErr := exchangeRefreshToken(tokenStr)
 				if refreshErr != nil {
 					fmt.Printf("[AUTH] Refresh token exchange failed: %v\n", refreshErr)
-					http.Error(w, `{"error":"invalid or expired token"}`, http.StatusUnauthorized)
+					unauthorized(w, r, "invalid_token", `{"error":"invalid or expired token"}`)
 					return
 				}
 				cacheTokenExchange(tokenStr, session)
@@ -342,7 +460,7 @@ func Auth(_ string) func(http.Handler) http.Handler {
 				userID, err = verifyAccessToken(tokenStr)
 				if err != nil {
 					fmt.Printf("[AUTH] Access token validation failed: %v\n", err)
-					http.Error(w, `{"error":"invalid or expired token"}`, http.StatusUnauthorized)
+					unauthorized(w, r, "invalid_token", `{"error":"invalid or expired token"}`)
 					return
 				}
 			}

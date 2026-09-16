@@ -37,6 +37,7 @@ import { NotesTools } from "./study/src/notes.js";
 import { SyncTools } from "./study/src/sync.js";
 import { PiazzaTools } from "./study/src/piazza.js";
 import { OutlineTools } from "./study/src/outline.js";
+import { CourseWebsiteTools } from "./study/src/courseWebsite/tools.js";
 import { getUserId, runWithUserId } from "./utils/userContext.js";
 import { embedText } from "./rag/embeddings.js";
 import { semanticSearch } from "./rag/vectorStore.js";
@@ -45,8 +46,24 @@ import { isDuoRequired } from "./auth.js";
 import apiRoutes from "./api/routes.js";
 import d2lAuthRoutes from "./api/d2lAuthRoutes.js";
 import publicAuthRoutes from "./api/publicAuthRoutes.js";
+import oauthRoutes from "./api/oauth/index.js";
 import { BrowserSessionManager } from "./browser/BrowserSessionManager.js";
 import { fileURLToPath } from "url";
+
+/**
+ * Redact credential-bearing headers before logging. Prevents access tokens,
+ * API keys, cookies, and D2L session data from ever reaching CloudWatch.
+ * Matches a fixed sensitive set plus a heuristic for anything that looks like
+ * an auth/token/secret/cookie/key header.
+ */
+const SENSITIVE_HEADER_RE = /(authorization|cookie|set-cookie|x-api-key|api-key|apikey|token|secret|password|session|proxy-authorization|x-supabase|x-new-refresh-token)/i;
+function redactHeaders(headers: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(headers || {})) {
+    out[k] = SENSITIVE_HEADER_RE.test(k) ? "[REDACTED]" : v;
+  }
+  return out;
+}
 
 // ---- Urgency surfacing cache (Task 6) ----
 // Caches upcoming-deadline check results per user+course for 15 minutes.
@@ -693,6 +710,24 @@ function createServer(): McpServer {
     wrapStudyToolHandler("get_cached_outline", OutlineTools.get_cached_outline.handler)
   );
 
+  // Register course-website ingestion tools.
+  // get_course_website_content is a pure cache read → read-only.
+  registerReadTool(
+    "get_course_website_content",
+    CourseWebsiteTools.get_course_website_content.description,
+    CourseWebsiteTools.get_course_website_content.schema,
+    wrapStudyToolHandler("get_course_website_content", CourseWebsiteTools.get_course_website_content.handler)
+  );
+  // refresh_course_websites persists snapshots + canonical items + writes into the
+  // canonical `tasks` read path, so it is honestly NON-read-only (approval-gated).
+  // It never writes to Notion, submits coursework, or triggers background sync.
+  registerMutatingTool(
+    "refresh_course_websites",
+    CourseWebsiteTools.refresh_course_websites.description,
+    CourseWebsiteTools.refresh_course_websites.schema,
+    wrapStudyToolHandler("refresh_course_websites", CourseWebsiteTools.refresh_course_websites.handler)
+  );
+
   // Register quiz tools (Task 2)
   registerReadTool(
     "get_quizzes",
@@ -988,6 +1023,12 @@ async function main() {
       });
     });
 
+    // OAuth 2.1 authorization server (discovery, DCR, authorize, token, revoke).
+    // Public — these endpoints are how MCP clients discover and complete the
+    // OAuth flow. Mounted at root so the standard .well-known and endpoint paths
+    // resolve. This is a SECONDARY auth method; the API-key path is unchanged.
+    app.use("/", oauthRoutes);
+
     // Public auth routes (signup/signin for onboarding — no JWT required)
     app.use("/auth", publicAuthRoutes);
 
@@ -1062,7 +1103,7 @@ async function main() {
       console.error(`[MCP] Method: ${requestMethod}`);
       console.error(`[MCP] Request ID: ${requestId}`);
       console.error(`[MCP] Active sessions: ${Object.keys(transports).join(', ') || 'none'}`);
-      console.error(`[MCP] Headers:`, JSON.stringify(req.headers, null, 2));
+      console.error(`[MCP] Headers:`, JSON.stringify(redactHeaders(req.headers), null, 2));
       if (requestMethod === "tools/call") {
         console.error(
           `[MCP] Tool: ${requestParams.name || "unknown"}, Args:`,
