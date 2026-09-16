@@ -15,6 +15,17 @@
 --     idempotently on (user, course, term, source_ref). Conflicting values across
 --     sources are preserved in `conflicts` and flagged rather than silently chosen.
 
+-- ── updated_at trigger helper (self-contained) ───────────────────────────────
+-- Defined here (idempotently) so this migration does not depend on schema.sql
+-- having been run: some environments were provisioned without public.set_updated_at().
+create or replace function public.set_updated_at()
+returns trigger as $$
+begin
+  new.updated_at = now();
+  return new;
+end;
+$$ language plpgsql;
+
 -- ── Append-only raw snapshot ledger ──────────────────────────────────────────
 create table if not exists public.course_website_snapshots (
   id uuid primary key default gen_random_uuid(),
