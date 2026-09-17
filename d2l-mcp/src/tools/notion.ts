@@ -147,14 +147,49 @@ function parseCalendarEventDate(event: {
   return null;
 }
 
+// Calendar-derived titles carry noise the outline/dropbox names don't ("… due at 9pm
+// via MarkUs"). Used to prefer the cleaner label and to know when a due date came from
+// the (unreliable) D2L calendar and may be corrected by a cleaner source.
+const ASSIGNMENT_NAME_NOISE = /(due at\b|via markus|via crowdmark)/i;
+
+/**
+ * Canonical key for de-duplicating the SAME assessment across sources that name it
+ * differently. D2L calendar events surface as "SE212 Asn#1 due at 9pm via MarkUs" while
+ * the outline calls it "A01" and a course website might say "Assignment 1" — all the
+ * same item. We collapse the well-known UW numbered patterns to a stable key
+ * (a01 / p01 / midterm1 / quiz01); everything else falls back to the cleaned name, so
+ * genuinely distinct items never collide.
+ */
+export function canonicalAssignmentKey(name: string): string {
+  const s = name.toLowerCase().trim();
+  let m: RegExpMatchArray | null;
+  if ((m = s.match(/\b(?:asn|assignment)s?\s*#?\s*(\d{1,2})\b/)) || (m = s.match(/\ba0*(\d{1,2})\b/))) {
+    return `a${m[1].padStart(2, '0')}`;
+  }
+  if ((m = s.match(/\bprojects?\s*[#(]?\s*(\d{1,2})\b/)) || (m = s.match(/\bp0*(\d{1,2})\b/))) {
+    return `p${m[1].padStart(2, '0')}`;
+  }
+  if ((m = s.match(/\bmidterm(?:\s*exam)?\s*(\d+)\b/))) return `midterm${m[1]}`;
+  if ((m = s.match(/\bquiz\s*#?\s*(\d{1,2})\b/))) return `quiz${m[1].padStart(2, '0')}`;
+  return s.replace(/\s+/g, ' ').trim();
+}
+
 function mergeAssignments(assignments: AssignmentInfo[], incoming: AssignmentInfo): void {
-  const key = incoming.name.trim().toLowerCase();
-  const existing = assignments.find((a) => a.name.trim().toLowerCase() === key);
+  const key = canonicalAssignmentKey(incoming.name);
+  const existing = assignments.find((a) => canonicalAssignmentKey(a.name) === key);
   if (!existing) {
     assignments.push(incoming);
     return;
   }
-  if (!existing.dueDate && incoming.dueDate) existing.dueDate = incoming.dueDate;
+  const existingNoisy = ASSIGNMENT_NAME_NOISE.test(existing.name);
+  const incomingNoisy = ASSIGNMENT_NAME_NOISE.test(incoming.name);
+  // Adopt the cleaner display label: drop calendar noise first, then prefer the shorter
+  // (e.g. outline "A01" over calendar "SE212 Asn#1 due at 9pm via MarkUs").
+  const adoptName = (existingNoisy && !incomingNoisy) ||
+    (existingNoisy === incomingNoisy && incoming.name.trim().length < existing.name.trim().length);
+  // Due date: fill when missing; also let a clean source correct a noisy-calendar date.
+  if (incoming.dueDate && (!existing.dueDate || existingNoisy)) existing.dueDate = incoming.dueDate;
+  if (adoptName) existing.name = incoming.name;
   if (existing.maxPoints === null && incoming.maxPoints !== null) existing.maxPoints = incoming.maxPoints;
   if ((!existing.grade || existing.grade.length === 0) && incoming.grade) existing.grade = incoming.grade;
   if (!existing.url && incoming.url) existing.url = incoming.url;
@@ -529,8 +564,8 @@ export async function enrichWithCourseWebsite(courses: CourseData[], userId: str
     for (const it of items) {
       const name = it.name.trim();
       if (!name || WEBSITE_NAME_DATE_TOKEN.test(name)) continue;
-      const key = name.toLowerCase();
-      const existing = course.assignments.find((a) => a.name.trim().toLowerCase() === key);
+      const key = canonicalAssignmentKey(name);
+      const existing = course.assignments.find((a) => canonicalAssignmentKey(a.name) === key);
       if (existing) {
         // Website date is authoritative for a matched item; status is never touched here.
         if (it.dueAt) existing.dueDate = it.dueAt;
