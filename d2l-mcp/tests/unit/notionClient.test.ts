@@ -595,6 +595,10 @@ describe('course-page safety updates', () => {
     const body = JSON.parse((spy.mock.calls[0] as [string, RequestInit])[1].body as string);
     expect(body.children[0].type).toBe('callout');
     expect(body.children[0].callout.rich_text[0].text.content).toMatch(/live sync/i);
+    // Managed body MUST nest under callout.children, never as a sibling `children`
+    // key (Notion rejects the sibling shape with a 400).
+    expect(Array.isArray(body.children[0].callout.children)).toBe(true);
+    expect(body.children[0].children).toBeUndefined();
   });
 
   it('replaces only the managed callout and never deletes manual blocks', async () => {
@@ -687,7 +691,10 @@ describe('course-page safety updates', () => {
     await updateCoursePage(TOKEN, 'page-1', course);
 
     const appended = r.appendCalls()[0]?.body?.children?.[0];
-    const bullets: any[] = (appended?.children || []).filter((b: any) => b.type === 'bulleted_list_item');
+    // Managed content MUST be nested inside callout.children (a sibling `children` key
+    // is rejected by Notion with a 400) — so read the children from callout.children.
+    expect(appended?.children).toBeUndefined();
+    const bullets: any[] = (appended?.callout?.children || []).filter((b: any) => b.type === 'bulleted_list_item');
     const a1 = bullets.find((b) => bulletText(b).includes('Assignment 1'));
     expect(a1).toBeDefined();
     // Rendered with the Submitted emoji, not reset to ⬜ Not Started.

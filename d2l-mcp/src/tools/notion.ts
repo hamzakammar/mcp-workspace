@@ -545,6 +545,33 @@ export async function enrichWithCourseWebsite(courses: CourseData[], userId: str
 }
 
 /**
+ * Recompute the assignment-preservation decision AFTER all sources (D2L + outline +
+ * course website) have been merged.
+ *
+ * fetchCourseData sets preserveExistingAssignments from the D2L-only assignment count,
+ * which runs BEFORE outline/website enrichment. Without this pass, a course whose
+ * assignments come solely from the outline or the course website (e.g. CS 241, which
+ * has no D2L dropbox folders) would be flagged "preserve" and its managed body would
+ * never be written — the website/outline items would silently never reach Notion.
+ *
+ * We only RELAX the flag: if the final merged set is non-empty AND no D2L source hard-
+ * failed (threw), we clear preserve so the body is written. An empty final set still
+ * preserves (nothing new to show), and a genuine source failure still preserves (a
+ * failed D2L fetch could drop previously-synced items on a full rewrite).
+ */
+export function finalizeAssignmentPreservation(courses: CourseData[]): void {
+  for (const course of courses) {
+    const failures = course.syncMetadata?.assignmentSourceFailures ?? 0;
+    const empty = course.assignments.length === 0;
+    if (empty || failures > 0) {
+      course.syncMetadata = { preserveExistingAssignments: empty, assignmentSourceFailures: failures };
+    } else {
+      delete course.syncMetadata; // confident, non-empty merged set — allow body rewrite
+    }
+  }
+}
+
+/**
  * Mark past-due assignments as Overdue (if not already submitted/graded).
  * Should run AFTER all data sources (D2L + outline) have been merged.
  */
@@ -788,6 +815,7 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
       await enrichWithOutline(courses, userId);
       await enrichWithCourseWebsite(courses, userId);
       markOverdueAssignments(courses);
+      finalizeAssignmentPreservation(courses);
 
       // Sync course pages
       await syncCourses(notionToken, databaseId, courses);
@@ -885,6 +913,7 @@ export const notionTools = {
         await enrichWithCourseWebsite(courses, userId);
       }
       markOverdueAssignments(courses);
+      finalizeAssignmentPreservation(courses);
 
       // 4. Sync to Notion
       try {

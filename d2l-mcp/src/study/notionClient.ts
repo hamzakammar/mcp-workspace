@@ -292,6 +292,28 @@ function buildCourseBody(course: CourseData): unknown[] {
 
 const MANAGED_LIVE_SYNC_MARKER = '🔄 Horizon Live Sync (auto-managed)';
 
+/**
+ * Build the single marked callout that wraps all Horizon-managed body content.
+ *
+ * IMPORTANT: the child blocks MUST live inside the `callout` object, not as a sibling
+ * `children` key on the block. Notion's block API rejects `{type:'callout', callout,
+ * children}` with a generic "body.children[0].<type> should be defined" 400 — the
+ * children must be `callout.children`. Getting this wrong silently breaks EVERY
+ * full-body sync (the append 400s and the page keeps its stale/legacy body).
+ */
+export function buildManagedCallout(children: unknown[]): Record<string, unknown> {
+  return {
+    object: 'block',
+    type: 'callout',
+    callout: {
+      rich_text: [{ text: { content: MANAGED_LIVE_SYNC_MARKER } }],
+      icon: { emoji: '🔄' },
+      color: 'blue_background',
+      children,
+    },
+  };
+}
+
 interface NotionBlock {
   id: string;
   type: string;
@@ -436,16 +458,7 @@ export async function createCoursePage(
   const body = {
     parent: { database_id: databaseId },
     properties: buildCourseProperties(course),
-    children: [{
-      object: 'block',
-      type: 'callout',
-      callout: {
-        rich_text: [{ text: { content: MANAGED_LIVE_SYNC_MARKER } }],
-        icon: { emoji: '🔄' },
-        color: 'blue_background',
-      },
-      children: managedBody,
-    }],
+    children: [buildManagedCallout(managedBody)],
   };
 
   const resp = await fetch(`${NOTION_BASE}/pages`, {
@@ -578,16 +591,7 @@ export async function updateCoursePage(
   const oldManagedIds = children.filter(isManagedCallout).map(b => b.id);
 
   // Append fresh managed content inside a single marked callout — FIRST.
-  const newBlocks = [{
-    object: 'block',
-    type: 'callout',
-    callout: {
-      rich_text: [{ text: { content: MANAGED_LIVE_SYNC_MARKER } }],
-      icon: { emoji: '🔄' },
-      color: 'blue_background',
-    },
-    children: buildCourseBody(course).slice(0, 99),
-  }];
+  const newBlocks = [buildManagedCallout(buildCourseBody(course).slice(0, 99))];
   const appendResp = await fetch(`${NOTION_BASE}/blocks/${pageId}/children`, {
     method: 'PATCH',
     headers: notionHeaders(token),
