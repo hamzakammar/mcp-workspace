@@ -12,6 +12,9 @@ import { getNotionToken } from '../study/notionAuth.js';
 import { syncCourses, queryAllPages, type CourseData, type AssignmentInfo, type GradeInfo, type AnnouncementInfo } from '../study/notionClient.js';
 import { fetchCourseOutline, getCurrentTerm, type Assessment } from '../study/outlineClient.js';
 import { getOrRefreshOutlineCookies } from '../study/outlineAuth.js';
+import { loadWebsiteAssessmentsForCourse } from '../study/src/courseWebsite/store.js';
+import { getSourceConfig } from '../study/src/courseWebsite/sources.js';
+import { zonedWallTimeToUtcIso } from '../study/src/courseWebsite/timezone.js';
 
 // ─── D2L raw types ────────────────────────────────────────────────────────────
 
@@ -347,6 +350,59 @@ function cleanOutlineText(text: string): string {
     .trim();
 }
 
+const OUTLINE_MONTHS: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+
+/**
+ * Parse a day-first outline date like "Tue 22 Sep at 9pm" or "Tue 6 Oct 6:00 PM"
+ * into a UTC ISO instant (America/Toronto wall clock). Returns null if no time.
+ */
+export function parseOutlineSegmentDate(text: string, year: number): string | null {
+  const md = text.match(/\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i);
+  if (!md) return null;
+  const day = Number(md[1]);
+  const mon = OUTLINE_MONTHS[md[2].slice(0, 3).toLowerCase()];
+  const mt = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b/i);
+  if (!mt) return null;
+  let h = Number(mt[1]);
+  const mi = mt[2] ? Number(mt[2]) : 0;
+  const ap = mt[3].toLowerCase();
+  if (ap === 'pm' && h < 12) h += 12;
+  if (ap === 'am' && h === 12) h = 0;
+  if (!mon || day < 1 || day > 31 || h > 23) return null;
+  return zonedWallTimeToUtcIso({ year, month: mon, day, hour: h, minute: mi }, 'America/Toronto');
+}
+
+interface OutlineAssessmentLike { name: string; date?: string; weight?: string }
+
+/**
+ * Expand a combined outline assessment row into discrete items. UW outlines often
+ * pack several assignments into one row whose date field is
+ * "A01: Tue 22 Sep at 9pm A02: Tue 29 Sep at 9pm …"; we split those into A01, A02, …
+ * (and P01, … for projects) so each appears discretely with its own date. Also
+ * normalizes "Asn#0"/"Assignment 0"-style names to A00. Rows without the pattern are
+ * returned unchanged.
+ */
+export function expandOutlineAssessments(assessments: OutlineAssessmentLike[]): OutlineAssessmentLike[] {
+  const out: OutlineAssessmentLike[] = [];
+  for (const a of assessments) {
+    const date = a.date || '';
+    const segs = [...date.matchAll(/\b([AP])(\d{1,2})\s*:\s*([\s\S]*?)(?=\b[AP]\d{1,2}\s*:|$)/g)];
+    if (segs.length >= 2) {
+      for (const s of segs) {
+        const letter = s[1].toUpperCase();
+        const num = String(parseInt(s[2], 10)).padStart(2, '0');
+        out.push({ name: `${letter === 'P' ? 'P' : 'A'}${num}`, date: s[3].trim(), weight: a.weight });
+      }
+      continue;
+    }
+    const asn = a.name.match(/\bAsn\s*#?\s*(\d+)/i) || a.name.match(/\bassignment\s+(\d+)\b/i);
+    out.push(asn ? { ...a, name: `A${String(parseInt(asn[1], 10)).padStart(2, '0')}` } : a);
+  }
+  return out;
+}
+
 /**
  * Enrich course data with outline assessments (weights, due dates from syllabus).
  * Merges outline assessments into existing assignments or adds new ones.
@@ -392,8 +448,9 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
           });
         }
 
-        for (const assessment of outline.assessments) {
-          const parsedDate = parseOutlineDate(assessment.date);
+        const outlineYear = 2000 + Number(term.slice(1, 3));
+        for (const assessment of expandOutlineAssessments(outline.assessments)) {
+          const parsedDate = parseOutlineDate(assessment.date) ?? parseOutlineSegmentDate(assessment.date || '', outlineYear);
           const weightText = assessment.weight ? `Weight: ${assessment.weight}` : undefined;
 
           const existing = findExisting(assessment.name);
@@ -436,6 +493,53 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
       }
     } catch {
       // Outline not available for this course, skip
+    }
+  }
+}
+
+// A cleaned assessment name that still embeds a date token (e.g. "Project … 17 Nov")
+// is a malformed parse we refuse to surface — the outline provides the authoritative
+// row (P01) and we must not duplicate it under a garbled title.
+const WEBSITE_NAME_DATE_TOKEN = /\b\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i;
+
+/**
+ * Enrich course data with assessments parsed from the course website (course_website_items),
+ * so both D2L/outline AND the public course site act as sources of truth. Website-derived
+ * due dates are authoritative for a matched assessment, but this NEVER downgrades an
+ * authoritative submitted/graded/overdue status (we cannot observe submission from a public
+ * site). Runs after enrichWithOutline so outline-only items (e.g. SE 212 A00/A01) are present
+ * for matching, and website-only items (e.g. CS 241 A1–A8) get added.
+ */
+export async function enrichWithCourseWebsite(courses: CourseData[], userId: string): Promise<void> {
+  const term = getCurrentTerm();
+  for (const course of courses) {
+    const courseCode = normalizeCourseCodeExact(course.code) ?? normalizeCourseCodeExact(course.name);
+    if (!courseCode) continue;
+    if (!getSourceConfig(courseCode, term)) continue; // only courses with a configured website source
+    let items: Awaited<ReturnType<typeof loadWebsiteAssessmentsForCourse>>;
+    try {
+      items = await loadWebsiteAssessmentsForCourse(userId, courseCode, term);
+    } catch {
+      continue; // website data unavailable for this course, skip silently
+    }
+    for (const it of items) {
+      const name = it.name.trim();
+      if (!name || WEBSITE_NAME_DATE_TOKEN.test(name)) continue;
+      const key = name.toLowerCase();
+      const existing = course.assignments.find((a) => a.name.trim().toLowerCase() === key);
+      if (existing) {
+        // Website date is authoritative for a matched item; status is never touched here.
+        if (it.dueAt) existing.dueDate = it.dueAt;
+        if (!existing.url && it.url) existing.url = it.url;
+      } else {
+        mergeAssignments(course.assignments, {
+          name,
+          dueDate: it.dueAt,
+          maxPoints: null,
+          status: 'Not Started',
+          url: it.url ?? undefined,
+        });
+      }
     }
   }
 }
@@ -680,8 +784,9 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
         activeCourses.map(e => fetchCourseData(e.OrgUnit.Id, e.OrgUnit.Name, e.OrgUnit.Code || ''))
       );
 
-      // Enrich with outline data
+      // Enrich with outline data, then course-website data (both are sources of truth)
       await enrichWithOutline(courses, userId);
+      await enrichWithCourseWebsite(courses, userId);
       markOverdueAssignments(courses);
 
       // Sync course pages
@@ -774,9 +879,10 @@ export const notionTools = {
         activeCourses.map(e => fetchCourseData(e.OrgUnit.Id, e.OrgUnit.Name, e.OrgUnit.Code || ''))
       );
 
-      // 3b. Enrich with outline data (assessments, weights, instructors)
+      // 3b. Enrich with outline data (assessments, weights, instructors) + course website
       if (userId) {
         await enrichWithOutline(courses, userId);
+        await enrichWithCourseWebsite(courses, userId);
       }
       markOverdueAssignments(courses);
 
