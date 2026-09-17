@@ -325,7 +325,7 @@ export const priorityGlobalTools = {
               name: t.title,
               dueIn: formatDueIn(t.dueAt),
               weight: null,
-              reason: `From course website, due in ${formatDueIn(t.dueAt)}`,
+              reason: `From course website/outline, due in ${formatDueIn(t.dueAt)}`,
               urgencyScore: urgencyScore(dueMs, null, true),
             });
           }
