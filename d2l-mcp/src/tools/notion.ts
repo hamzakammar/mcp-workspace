@@ -388,7 +388,11 @@ export function expandOutlineAssessments(assessments: OutlineAssessmentLike[]): 
   const out: OutlineAssessmentLike[] = [];
   for (const a of assessments) {
     const date = a.date || '';
-    const segs = [...date.matchAll(/\b([AP])(\d{1,2})\s*:\s*([\s\S]*?)(?=\b[AP]\d{1,2}\s*:|$)/g)];
+    // UW packs segments with NO separator: "A01: Tue 22 Sep at 9pmA02: Tue 29 Sep …".
+    // We must NOT require a word boundary before each "A0N:"/"P0N:" (there is none
+    // between "9pm" and "A02"). Matching uppercase [AP] only is what keeps this from
+    // falsely splitting on the lowercase "pm"/"am" inside the times.
+    const segs = [...date.matchAll(/([AP])(\d{1,2})\s*:\s*([\s\S]*?)(?=[AP]\d{1,2}\s*:|$)/g)];
     if (segs.length >= 2) {
       for (const s of segs) {
         const letter = s[1].toUpperCase();
