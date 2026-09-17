@@ -391,3 +391,32 @@ function sanitize(body: string | null): string | null {
     .replace(/bearer\s+[a-z0-9._-]+/gi, "[redacted]")
     .slice(0, 1_000_000);
 }
+
+/**
+ * Load website-derived ASSESSMENT items (with a due date) for a course+term, for the
+ * Notion sync to merge as an additional source of truth. Read-only; returns cleaned
+ * display names (trailing parenthetical stripped) so they dedupe cleanly against D2L/
+ * outline items. Best-effort: returns [] on error (never blocks/erases the sync).
+ */
+export async function loadWebsiteAssessmentsForCourse(
+  userId: string, courseCode: string, term: string,
+): Promise<Array<{ name: string; dueAt: string | null; url: string | null; points: string | null; sourceRef: string }>> {
+  const assessmentTypes = ["assignment", "quiz", "exam", "project", "deadline"];
+  const { data, error } = await supabase
+    .from("course_website_items")
+    .select("item_type, title, due_at, url, points, source_ref")
+    .eq("user_id", userId)
+    .eq("course_code", courseCode)
+    .eq("term", term)
+    .in("item_type", assessmentTypes);
+  if (error || !data) return [];
+  return (data as Array<{ item_type: string; title: string; due_at: string | null; url: string | null; points: string | null; source_ref: string }>)
+    .filter((r) => r.due_at) // only dated assessments are meaningful in the sync
+    .map((r) => ({
+      name: r.title.replace(/\s*\(.*$/s, "").trim() || r.title.trim(),
+      dueAt: r.due_at,
+      url: r.url,
+      points: r.points,
+      sourceRef: r.source_ref,
+    }));
+}
