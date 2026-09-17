@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { client } from '../client.js';
 import { getUserId } from '../utils/userContext.js';
-import { loadUpcomingWebsiteTasks } from '../study/src/courseWebsite/store.js';
+import { loadUpcomingConnectorTasks } from '../study/src/courseWebsite/store.js';
 
 // Short course code ("CS 241 …" / "CS241_1269" → "CS241") for matching a live-D2L
 // course to a website task's normalized course_id.
@@ -302,7 +302,7 @@ export const priorityGlobalTools = {
         const userId = getUserId();
         if (userId && userId !== 'legacy') {
           const pastCutoff = now.getTime() - 7 * 24 * 60 * 60 * 1000;
-          const websiteTasks = await loadUpcomingWebsiteTasks(
+          const websiteTasks = await loadUpcomingConnectorTasks(
             userId,
             new Date(pastCutoff).toISOString(),
             new Date(cutoff).toISOString(),
