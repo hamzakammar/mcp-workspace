@@ -529,11 +529,17 @@ function stubNotionFetch(opts: {
   dueSoonRows?: string[];
   allPagesRows?: Array<{ id: string; code: string; name: string }>;
   archiveStatusById?: Record<string, number>;
+  typePropertyExists?: boolean;
 }) {
   const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body });
   const spy = vi.fn(async (url: string, init?: RequestInit) => {
     const method = (init?.method || 'GET').toUpperCase();
     const body = init?.body ? String(init.body) : '';
+    // GET on a database — report whether the "Type" select property already exists so
+    // the reconciliation can skip a redundant (index-invalidating) schema PATCH.
+    if (/\/databases\/[^/]+$/.test(String(url)) && method === 'GET') {
+      return ok({ properties: opts.typePropertyExists ? { Type: { type: 'select' } } : {} });
+    }
     if (String(url).endsWith('/query') && method === 'POST') {
       if (body.includes('Due Soon')) {
         return ok({ results: (opts.dueSoonRows || []).map((id) => ({ id })), has_more: false });
@@ -568,7 +574,12 @@ function stubNotionFetch(opts: {
     String(c[0]).endsWith('/query') && String((c[1] as RequestInit)?.body || '').includes('Due Soon'));
   const stalePageQueried = () => spy.mock.calls.some((c) =>
     String(c[0]).endsWith('/query') && !String((c[1] as RequestInit)?.body || '').includes('Due Soon'));
-  return { spy, archivedIds, dueSoonQueried, stalePageQueried };
+  // A schema PATCH = PATCH on /databases/{id} carrying a "Type" property definition.
+  const schemaPatched = () => spy.mock.calls.some((c) =>
+    /\/databases\/[^/]+$/.test(String(c[0]))
+    && String((c[1] as RequestInit)?.method || '').toUpperCase() === 'PATCH'
+    && String((c[1] as RequestInit)?.body || '').includes('"Type"'));
+  return { spy, archivedIds, dueSoonQueried, stalePageQueried, schemaPatched };
 }
 
 describe('sync_to_notion — cleanup + Due Soon reconciliation safety', () => {
@@ -652,6 +663,49 @@ describe('sync_to_notion — cleanup + Due Soon reconciliation safety', () => {
     // The reconciliation ran and archived the stale reminder.
     expect(s.dueSoonQueried()).toBe(true);
     expect(s.archivedIds()).toContain('duesoon-stale');
+  });
+
+  it('does NOT re-PATCH the DB schema when the "Type" property already exists', async () => {
+    // A redundant schema PATCH invalidates Notion's query index, so the very next
+    // archive query misses existing Due Soon rows and duplicates pile up each sync.
+    // When the property already exists we must skip the PATCH so archiving stays idempotent.
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 123, Name: 'Intro to CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    dropboxMock.mockResolvedValue([{
+      Id: 11, Name: 'Assignment 1', DueDate: '2026-09-20T23:59:00Z', Assessment: { ScoreDenominator: 20 },
+    }] as any);
+    const s = stubNotionFetch({
+      dueSoonRows: ['duesoon-existing'],
+      allPagesRows: [],
+      typePropertyExists: true, // schema already has "Type"
+    });
+
+    const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
+    expect(result.success).toBe(true);
+    // No schema PATCH issued, and the pre-existing Due Soon row was still archived.
+    expect(s.schemaPatched()).toBe(false);
+    expect(s.archivedIds()).toContain('duesoon-existing');
+  });
+
+  it('DOES create the "Type" property when it is missing (first sync)', async () => {
+    enrollmentsMock.mockResolvedValue({
+      Items: [{
+        OrgUnit: { Id: 123, Name: 'Intro to CS', Code: 'CS135', Type: { Code: 'Course Offering' } },
+        Access: { IsActive: true, CanAccess: true, StartDate: null, EndDate: null },
+      }],
+    } as any);
+    dropboxMock.mockResolvedValue([{
+      Id: 11, Name: 'Assignment 1', DueDate: '2026-09-20T23:59:00Z', Assessment: { ScoreDenominator: 20 },
+    }] as any);
+    const s = stubNotionFetch({ dueSoonRows: [], allPagesRows: [], typePropertyExists: false });
+
+    const result = JSON.parse(await TOOL.handler({ databaseId: 'db-1' }));
+    expect(result.success).toBe(true);
+    expect(s.schemaPatched()).toBe(true);
   });
 
   it('surfaces a non-2xx Due Soon mutation without crashing the sync', async () => {
