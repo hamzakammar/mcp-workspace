@@ -32,6 +32,24 @@ describe("parseOutlineSegmentDate (day-first, America/Toronto)", () => {
 });
 
 describe("expandOutlineAssessments (split packed rows / normalize names)", () => {
+  it("splits the REAL SE 212 packed row with NO separators between segments", () => {
+    // Verbatim from outline.uwaterloo.ca (SE212, term 1269): note "9pmA02" — the
+    // segments run together with no space/word-boundary between them.
+    const out = expandOutlineAssessments([
+      {
+        name: "Assignments #1-5",
+        date: "A01: Tue 22 Sep at 9pmA02: Tue 29 Sep at 9pmA03: Tue 27 Oct at 9pmA04: Tue 10 Nov at 9pmA05: Tue 1 Dec at 9pm",
+        weight: "8 (remote)",
+      },
+    ]);
+    expect(out.map((a) => a.name)).toEqual(["A01", "A02", "A03", "A04", "A05"]);
+    // A01 must carry the Sep 22 date (the key Horizon2 assertion).
+    expect(parseOutlineSegmentDate(out[0].date || "", 2026)).toBe("2026-09-23T01:00:00.000Z");
+    expect(parseOutlineSegmentDate(out[1].date || "", 2026)).toBe("2026-09-30T01:00:00.000Z");
+    // Times must NOT bleed across segments (no "9pmA02" contamination).
+    expect(out[0].date).toBe("Tue 22 Sep at 9pm");
+  });
+
   it("splits a combined 'A01: … A02: … A03: …' date field into discrete items", () => {
     const out = expandOutlineAssessments([
       {
