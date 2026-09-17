@@ -420,3 +420,34 @@ export async function loadWebsiteAssessmentsForCourse(
       sourceRef: r.source_ref,
     }));
 }
+
+/**
+ * Load upcoming website-derived tasks across ALL courses, for the global priority list
+ * ("what should I work on"). Reads the `tasks` table (source='website', still open) with
+ * a due date in [sinceIso, untilIso]. course_id is the normalized course code (e.g.
+ * "CS241"); title is cleaned of any trailing parenthetical. Best-effort: [] on error.
+ */
+export async function loadUpcomingWebsiteTasks(
+  userId: string, sinceIso: string, untilIso: string,
+): Promise<Array<{ courseCode: string; title: string; dueAt: string; url: string | null }>> {
+  const { data, error } = await supabase
+    .from("tasks")
+    .select("course_id, title, due_at, links, status")
+    .eq("user_id", userId)
+    .eq("source", "website")
+    .not("due_at", "is", null)
+    .gte("due_at", sinceIso)
+    .lte("due_at", untilIso);
+  if (error || !data) return [];
+  return (data as Array<{ course_id: string; title: string; due_at: string; links: unknown; status: string | null }>)
+    .filter((r) => {
+      const s = (r.status ?? "open").toLowerCase();
+      return s !== "done" && s !== "completed" && s !== "submitted";
+    })
+    .map((r) => ({
+      courseCode: r.course_id,
+      title: (r.title || "").replace(/\s*\(.*$/s, "").trim() || (r.title || "").trim(),
+      dueAt: r.due_at,
+      url: Array.isArray(r.links) && r.links.length ? String(r.links[0]) : null,
+    }));
+}

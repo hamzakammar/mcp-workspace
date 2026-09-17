@@ -1,5 +1,25 @@
 import { z } from 'zod';
 import { client } from '../client.js';
+import { getUserId } from '../utils/userContext.js';
+import { loadUpcomingWebsiteTasks } from '../study/src/courseWebsite/store.js';
+
+// Short course code ("CS 241 …" / "CS241_1269" → "CS241") for matching a live-D2L
+// course to a website task's normalized course_id.
+export function shortCode(input: string): string {
+  // NB: delimiters are stripped, so we can't safely keep a course-letter suffix (it would
+  // grab the "F" from "…241 Fall"). The base SUBJECT+NUMBER is enough to match a website
+  // task's normalized course_id ("CS241") to a live-D2L course for dedup purposes.
+  const compact = (input || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return compact.match(/[A-Z]{2,6}\d{2,3}/)?.[0] ?? compact;
+}
+
+// Dedup key for the same assessment across sources: course + assignment number when
+// present (so website "Assignment 1" collapses with D2L "A1"), else course + name.
+export function assessmentDedupKey(courseCode: string, name: string): string {
+  const code = shortCode(courseCode);
+  const num = (name.toLowerCase().match(/\b(?:asn|assignment|a|quiz|project|p)\s*#?\s*(\d{1,2})\b/) || [])[1];
+  return num ? `${code}#${num}` : `${code}:${name.toLowerCase().replace(/\s+/g, ' ').trim()}`;
+}
 
 // ---- Raw D2L types ----
 
@@ -272,6 +292,48 @@ export const priorityGlobalTools = {
 
       // 3. Flatten, sort by urgency, check submissions for top candidates, take top 10
       const all: GlobalRecommendation[] = perCourseResults.flat();
+
+      // 3a. Merge website/outline-derived assignments. The course-website connector
+      // writes these to the `tasks` table (source='website'); live D2L (dropbox/quizzes)
+      // does not surface them. D2L is authoritative for live submission status, so a
+      // website task matching an existing D2L item (same course + assignment number) is
+      // dropped to avoid duplicates. Best-effort — never breaks the D2L-only result.
+      try {
+        const userId = getUserId();
+        if (userId && userId !== 'legacy') {
+          const pastCutoff = now.getTime() - 7 * 24 * 60 * 60 * 1000;
+          const websiteTasks = await loadUpcomingWebsiteTasks(
+            userId,
+            new Date(pastCutoff).toISOString(),
+            new Date(cutoff).toISOString(),
+          );
+          const seenKeys = new Set(all.map((r) => assessmentDedupKey(r.courseCode, r.name)));
+          const codeToName = new Map<string, string>();
+          for (const e of activeCourses) {
+            codeToName.set(shortCode(e.OrgUnit.Code || e.OrgUnit.Name), e.OrgUnit.Name);
+          }
+          for (const t of websiteTasks) {
+            const key = assessmentDedupKey(t.courseCode, t.title);
+            if (seenKeys.has(key)) continue; // D2L (or another website row) already covers it
+            seenKeys.add(key);
+            const dueMs = new Date(t.dueAt).getTime();
+            if (isNaN(dueMs)) continue;
+            all.push({
+              type: 'assignment',
+              courseName: codeToName.get(shortCode(t.courseCode)) ?? t.courseCode,
+              courseCode: t.courseCode,
+              name: t.title,
+              dueIn: formatDueIn(t.dueAt),
+              weight: null,
+              reason: `From course website, due in ${formatDueIn(t.dueAt)}`,
+              urgencyScore: urgencyScore(dueMs, null, true),
+            });
+          }
+        }
+      } catch {
+        // website tasks unavailable — fall back to D2L-only recommendations
+      }
+
       all.sort((a, b) => b.urgencyScore - a.urgencyScore);
       const candidates = all.slice(0, 20); // check submissions for top 20 candidates
 
