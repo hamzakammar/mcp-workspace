@@ -23,7 +23,7 @@ vi.mock("../../src/study/src/courseWebsite/sources.js", () => ({
   getSourceConfig: (...a: unknown[]) => getSourceConfig(...a),
 }));
 
-import { enrichWithCourseWebsite } from "../../src/tools/notion.js";
+import { enrichWithCourseWebsite, finalizeAssignmentPreservation } from "../../src/tools/notion.js";
 
 type Course = Parameters<typeof enrichWithCourseWebsite>[0][number];
 
@@ -106,5 +106,35 @@ describe("enrichWithCourseWebsite", () => {
     });
     await expect(enrichWithCourseWebsite([c], "u1")).resolves.toBeUndefined();
     expect(c.assignments).toHaveLength(1);
+  });
+});
+
+describe("finalizeAssignmentPreservation (recompute preserve AFTER enrichment)", () => {
+  it("clears a D2L-empty course's preserve flag once website/outline added items", () => {
+    // fetchCourseData flagged this (no D2L dropbox), then enrichWithCourseWebsite added A1.
+    const c = course({
+      code: "CS241",
+      assignments: [{ name: "A1", dueDate: "2026-09-25T21:00:00.000Z", maxPoints: null, status: "Not Started" }],
+    });
+    (c as any).syncMetadata = { preserveExistingAssignments: true, assignmentSourceFailures: 0 };
+    finalizeAssignmentPreservation([c]);
+    expect(c.syncMetadata).toBeUndefined(); // body will now be (re)written
+  });
+
+  it("keeps preserve when the final merged set is still empty", () => {
+    const c = course({ code: "PHYS121", assignments: [] });
+    (c as any).syncMetadata = { preserveExistingAssignments: true, assignmentSourceFailures: 0 };
+    finalizeAssignmentPreservation([c]);
+    expect(c.syncMetadata?.preserveExistingAssignments).toBe(true);
+  });
+
+  it("keeps preserve when a D2L source hard-failed, even with merged items (avoids dropping items)", () => {
+    const c = course({
+      code: "ECE222",
+      assignments: [{ name: "Lab 1", dueDate: null, maxPoints: null, status: "Not Started" }],
+    });
+    (c as any).syncMetadata = { preserveExistingAssignments: false, assignmentSourceFailures: 1 };
+    finalizeAssignmentPreservation([c]);
+    expect(c.syncMetadata?.assignmentSourceFailures).toBe(1);
   });
 });
