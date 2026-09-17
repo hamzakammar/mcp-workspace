@@ -696,13 +696,25 @@ async function syncUpcomingTasks(
 ): Promise<number> {
   const headers = { 'Authorization': `Bearer ${notionToken}`, 'Notion-Version': '2022-06-28', 'Content-Type': 'application/json' };
 
-  // First, ensure the database has a "Type" property. Check the response.
-  const ensureResp = await fetch(`https://api.notion.com/v1/databases/${databaseId}`, {
-    method: 'PATCH', headers,
-    body: JSON.stringify({ properties: { 'Type': { select: {} } } }),
-  });
-  if (!ensureResp.ok) {
-    throw new Error(`Notion ensure Due Soon "Type" property failed (${ensureResp.status})`);
+  // Ensure the database has a "Type" select property — but ONLY PATCH the schema when
+  // it is actually missing. A database schema PATCH invalidates Notion's query index;
+  // doing it on every sync (immediately before the archive query below) makes that
+  // query miss the existing Due Soon rows, so they never get archived and duplicates
+  // accumulate on every sync. Reading first and skipping the redundant PATCH keeps the
+  // query index consistent, which is what makes the archive-then-recreate idempotent.
+  const dbResp = await fetch(`https://api.notion.com/v1/databases/${databaseId}`, { headers });
+  if (!dbResp.ok) {
+    throw new Error(`Notion get database failed (${dbResp.status})`);
+  }
+  const db = await dbResp.json() as { properties?: Record<string, { type?: string }> };
+  if (!db.properties?.Type) {
+    const ensureResp = await fetch(`https://api.notion.com/v1/databases/${databaseId}`, {
+      method: 'PATCH', headers,
+      body: JSON.stringify({ properties: { 'Type': { select: {} } } }),
+    });
+    if (!ensureResp.ok) {
+      throw new Error(`Notion ensure Due Soon "Type" property failed (${ensureResp.status})`);
+    }
   }
 
   // Remove existing "Due Soon" tagged rows. Every mutation response is checked and
