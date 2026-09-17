@@ -633,9 +633,14 @@ const userDatabaseIds: Map<string, string> = new Map();
 const weeklyDbIds: Map<string, string> = new Map();
 // Lock to prevent concurrent syncs for the same user
 const syncInProgress: Set<string> = new Set();
-// Throttle: track last sync time per user (max once per hour)
+// Throttle: track last sync time per user (default max once per hour). Configurable via
+// NOTION_SYNC_THROTTLE_MS so a deployment can verify a background cycle promptly without
+// waiting a full hour; unset/invalid falls back to the safe 1-hour default.
 const lastSyncTime: Map<string, number> = new Map();
-const SYNC_THROTTLE_MS = 60 * 60 * 1000; // 1 hour
+const SYNC_THROTTLE_MS = (() => {
+  const raw = Number(process.env.NOTION_SYNC_THROTTLE_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60 * 60 * 1000;
+})();
 
 /**
  * Non-academic course patterns to exclude from Notion sync.
