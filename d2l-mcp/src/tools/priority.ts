@@ -1,5 +1,8 @@
 import { z } from 'zod';
 import { client } from '../client.js';
+import { getUserId } from '../utils/userContext.js';
+import { loadUpcomingConnectorTasks } from '../study/src/courseWebsite/store.js';
+import { shortCode, assessmentDedupKey } from './priorityGlobal.js';
 
 // ---- Raw D2L types ----
 
@@ -240,6 +243,44 @@ export const priorityTools = {
         );
       } catch {
         // Quizzes unavailable — skip
+      }
+
+      // ---- Website / outline connector tasks for this course ----
+      // Live D2L (dropbox/quizzes) doesn't surface course-website or outline-derived
+      // assessments; the connectors persist those to the `tasks` table. Merge them,
+      // deduped against the D2L items by assignment number. Best-effort.
+      try {
+        const userId = getUserId();
+        if (userId && userId !== 'legacy') {
+          const enrollmentsRaw = (await client.getMyEnrollments()) as
+            | { Items: Array<{ OrgUnit: { Id: number; Code: string; Name: string } }> };
+          const match = (enrollmentsRaw.Items || []).find((e) => e.OrgUnit?.Id === orgUnitId);
+          const code = match ? shortCode(match.OrgUnit.Code || match.OrgUnit.Name) : '';
+          if (code) {
+            const pastCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+            const tasks = await loadUpcomingConnectorTasks(
+              userId, new Date(pastCutoff).toISOString(), new Date(cutoff).toISOString(), code,
+            );
+            const seen = new Set(recommendations.map((r) => assessmentDedupKey(code, r.name)));
+            for (const t of tasks) {
+              const key = assessmentDedupKey(code, t.title);
+              if (seen.has(key)) continue;
+              seen.add(key);
+              const dueMs = new Date(t.dueAt).getTime();
+              if (isNaN(dueMs)) continue;
+              recommendations.push({
+                type: 'assignment',
+                name: t.title,
+                dueIn: formatDueIn(t.dueAt),
+                weight: null,
+                reason: `From course website/outline, due in ${formatDueIn(t.dueAt)}`,
+                urgencyScore: urgencyScore(dueMs, null, true),
+              });
+            }
+          }
+        }
+      } catch {
+        // connector tasks unavailable — fall back to D2L-only recommendations
       }
 
       // Sort by urgency score descending, take top candidates

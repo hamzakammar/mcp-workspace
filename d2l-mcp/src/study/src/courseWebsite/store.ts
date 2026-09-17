@@ -422,22 +422,25 @@ export async function loadWebsiteAssessmentsForCourse(
 }
 
 /**
- * Load upcoming website-derived tasks across ALL courses, for the global priority list
- * ("what should I work on"). Reads the `tasks` table (source='website', still open) with
- * a due date in [sinceIso, untilIso]. course_id is the normalized course code (e.g.
- * "CS241"); title is cleaned of any trailing parenthetical. Best-effort: [] on error.
+ * Load upcoming connector-derived tasks (course website + outline) for the priority
+ * tools ("what should I work on"). Reads the `tasks` table for source in
+ * ('website','outline'), still open, with a due date in [sinceIso, untilIso]. Optionally
+ * scope to a single normalized course code. course_id is the normalized course code
+ * (e.g. "CS241"); title is cleaned of any trailing parenthetical. Best-effort: [] on error.
  */
-export async function loadUpcomingWebsiteTasks(
-  userId: string, sinceIso: string, untilIso: string,
+export async function loadUpcomingConnectorTasks(
+  userId: string, sinceIso: string, untilIso: string, courseCode?: string,
 ): Promise<Array<{ courseCode: string; title: string; dueAt: string; url: string | null }>> {
-  const { data, error } = await supabase
+  let query = supabase
     .from("tasks")
     .select("course_id, title, due_at, links, status")
     .eq("user_id", userId)
-    .eq("source", "website")
+    .in("source", ["website", "outline"])
     .not("due_at", "is", null)
     .gte("due_at", sinceIso)
     .lte("due_at", untilIso);
+  if (courseCode) query = query.eq("course_id", courseCode);
+  const { data, error } = await query;
   if (error || !data) return [];
   return (data as Array<{ course_id: string; title: string; due_at: string; links: unknown; status: string | null }>)
     .filter((r) => {
@@ -450,4 +453,36 @@ export async function loadUpcomingWebsiteTasks(
       dueAt: r.due_at,
       url: Array.isArray(r.links) && r.links.length ? String(r.links[0]) : null,
     }));
+}
+
+/**
+ * Persist outline-derived dated assessments to the `tasks` table (source='outline') so
+ * the priority tools can surface them. UPDATE-then-INSERT keyed by a stable source_ref
+ * (matches the constraint-free task-write pattern used elsewhere), preserving a row's
+ * identity — and therefore any user-set status — across refreshes. Best-effort per row.
+ */
+export async function upsertOutlineTasks(
+  userId: string,
+  rows: Array<{ courseCode: string; name: string; dueAt: string }>,
+): Promise<void> {
+  const nowIso = new Date().toISOString();
+  for (const r of rows) {
+    const sourceRef = `outline|${r.courseCode}|${slug(r.name)}`;
+    const { data: existing, error: selErr } = await supabase
+      .from("tasks")
+      .select("id")
+      .eq("user_id", userId).eq("source", "outline").eq("source_ref", sourceRef)
+      .limit(1);
+    if (selErr) continue;
+    if (existing && existing.length > 0) {
+      await supabase.from("tasks").update({
+        course_id: r.courseCode, title: r.name, due_at: r.dueAt, updated_at: nowIso,
+      }).eq("user_id", userId).eq("source", "outline").eq("source_ref", sourceRef);
+    } else {
+      await supabase.from("tasks").insert({
+        user_id: userId, source: "outline", source_ref: sourceRef, course_id: r.courseCode,
+        title: r.name, description: null, due_at: r.dueAt, links: [], status: "open", updated_at: nowIso,
+      });
+    }
+  }
 }

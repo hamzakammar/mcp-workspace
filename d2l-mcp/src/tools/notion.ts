@@ -12,7 +12,7 @@ import { getNotionToken } from '../study/notionAuth.js';
 import { syncCourses, queryAllPages, type CourseData, type AssignmentInfo, type GradeInfo, type AnnouncementInfo } from '../study/notionClient.js';
 import { fetchCourseOutline, getCurrentTerm, type Assessment } from '../study/outlineClient.js';
 import { getOrRefreshOutlineCookies } from '../study/outlineAuth.js';
-import { loadWebsiteAssessmentsForCourse } from '../study/src/courseWebsite/store.js';
+import { loadWebsiteAssessmentsForCourse, upsertOutlineTasks } from '../study/src/courseWebsite/store.js';
 import { getSourceConfig } from '../study/src/courseWebsite/sources.js';
 import { zonedWallTimeToUtcIso } from '../study/src/courseWebsite/timezone.js';
 
@@ -446,7 +446,13 @@ export function expandOutlineAssessments(assessments: OutlineAssessmentLike[]): 
  * Enrich course data with outline assessments (weights, due dates from syllabus).
  * Merges outline assessments into existing assignments or adds new ones.
  */
-async function enrichWithOutline(courses: CourseData[], userId: string): Promise<void> {
+export interface OutlineTaskRow { courseCode: string; name: string; dueAt: string }
+
+async function enrichWithOutline(
+  courses: CourseData[],
+  userId: string,
+  collect?: OutlineTaskRow[],
+): Promise<void> {
   let cookieHeader: string;
   try {
     cookieHeader = await getOrRefreshOutlineCookies(userId);
@@ -491,6 +497,13 @@ async function enrichWithOutline(courses: CourseData[], userId: string): Promise
         for (const assessment of expandOutlineAssessments(outline.assessments)) {
           const parsedDate = parseOutlineDate(assessment.date) ?? parseOutlineSegmentDate(assessment.date || '', outlineYear);
           const weightText = assessment.weight ? `Weight: ${assessment.weight}` : undefined;
+
+          // Collect dated outline assessments so the caller can persist them to the
+          // `tasks` table (source='outline'), making them available to the priority
+          // tools — which read `tasks`, not the live outline.
+          if (collect && parsedDate) {
+            collect.push({ courseCode, name: cleanOutlineText(assessment.name), dueAt: parsedDate });
+          }
 
           const existing = findExisting(assessment.name);
           if (existing) {
@@ -868,10 +881,14 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
       );
 
       // Enrich with outline data, then course-website data (both are sources of truth)
-      await enrichWithOutline(courses, userId);
+      const outlineTaskRows: OutlineTaskRow[] = [];
+      await enrichWithOutline(courses, userId, outlineTaskRows);
       await enrichWithCourseWebsite(courses, userId);
       markOverdueAssignments(courses);
       finalizeAssignmentPreservation(courses);
+      if (outlineTaskRows.length) {
+        try { await upsertOutlineTasks(userId, outlineTaskRows); } catch { /* non-critical */ }
+      }
 
       // Sync course pages
       await syncCourses(notionToken, databaseId, courses);
@@ -964,12 +981,18 @@ export const notionTools = {
       );
 
       // 3b. Enrich with outline data (assessments, weights, instructors) + course website
+      const outlineTaskRows: OutlineTaskRow[] = [];
       if (userId) {
-        await enrichWithOutline(courses, userId);
+        await enrichWithOutline(courses, userId, outlineTaskRows);
         await enrichWithCourseWebsite(courses, userId);
       }
       markOverdueAssignments(courses);
       finalizeAssignmentPreservation(courses);
+      // Persist outline-derived assessments to `tasks` (source='outline') so the priority
+      // tools surface them. Best-effort — never blocks the Notion sync.
+      if (userId && outlineTaskRows.length) {
+        try { await upsertOutlineTasks(userId, outlineTaskRows); } catch { /* non-critical */ }
+      }
 
       // 4. Sync to Notion
       try {
