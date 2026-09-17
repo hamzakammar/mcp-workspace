@@ -79,6 +79,10 @@
       ],
       "environment": [
         {
+          "name": "BACKGROUND_NOTION_SYNC_ENABLED",
+          "value": "true"
+        },
+        {
           "name": "MCP_TRANSPORT",
           "value": "http"
         },
