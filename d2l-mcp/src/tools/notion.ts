@@ -15,6 +15,7 @@ import { getOrRefreshOutlineCookies } from '../study/outlineAuth.js';
 import { loadWebsiteAssessmentsForCourse, upsertOutlineTasks } from '../study/src/courseWebsite/store.js';
 import { getSourceConfig } from '../study/src/courseWebsite/sources.js';
 import { zonedWallTimeToUtcIso } from '../study/src/courseWebsite/timezone.js';
+import { hasDropboxSubmission } from './priorityGlobal.js';
 
 // ─── D2L raw types ────────────────────────────────────────────────────────────
 
@@ -213,12 +214,21 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
   try {
     const raw = (await client.getDropboxFolders(orgUnitId)) as RawAssignment[];
     const folders: RawAssignment[] = Array.isArray(raw) ? raw : [];
-    for (const folder of folders) {
+    // Live submission status per folder, so submitted-but-ungraded work isn't later
+    // marked Overdue or listed as Due Soon. Best-effort: a failed lookup stays 'Not Started'.
+    const submitted = await Promise.all(folders.map(async (folder) => {
+      try {
+        return hasDropboxSubmission(await client.getMySubmissions(orgUnitId, folder.Id));
+      } catch {
+        return false;
+      }
+    }));
+    for (const [i, folder] of folders.entries()) {
       mergeAssignments(courseData.assignments, {
         name: folder.Name,
         dueDate: folder.DueDate,
         maxPoints: folder.Assessment?.ScoreDenominator ?? null,
-        status: 'Not Started',
+        status: submitted[i] ? 'Submitted' : 'Not Started',
         url: `https://${d2lHost}/d2l/lms/dropbox/user/folder_submit_files.d2l?db=${folder.Id}&grpid=0&isprv=0&bp=0&ou=${orgUnitId}`,
       });
     }
@@ -346,7 +356,7 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
  *   "Opens: Wednesday, June 3, 2026 at 6:55 AM Closes: Friday, June 5, 2026 at 6:55 AM"
  * For "Opens/Closes" format, returns the Closes date (deadline).
  */
-function parseOutlineDate(dateStr: string | undefined): string | null {
+export function parseOutlineDate(dateStr: string | undefined): string | null {
   if (!dateStr || dateStr === 'n/a') return null;
 
   // If it has "Closes:", extract that date (it's the deadline)
@@ -360,19 +370,41 @@ function parseOutlineDate(dateStr: string | undefined): string | null {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // Outline dates are in Eastern Time — append timezone before parsing
-  const withTz = cleaned.replace(/\s*(AM|PM)\s*$/i, ' $1 EDT');
-  const parsed = new Date(withTz);
-  if (!isNaN(parsed.getTime()) && parsed.getFullYear() > 2020) {
+  // ISO date-only ("2026-05-15"): JS would parse this as UTC midnight — treat it as
+  // an end-of-day deadline in Toronto instead.
+  const isoDay = cleaned.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoDay) {
+    const year = Number(isoDay[1]);
+    if (year <= 2020) return null;
+    return zonedWallTimeToUtcIso(
+      { year, month: Number(isoDay[2]), day: Number(isoDay[3]), hour: 23, minute: 59 },
+      'America/Toronto',
+    );
+  }
+
+  const parsed = new Date(cleaned);
+  if (isNaN(parsed.getTime()) || parsed.getFullYear() <= 2020) return null;
+
+  // An explicit zone/offset in the text is authoritative.
+  if (/\b(?:[ECMP][SD]T|GMT|UTC)\b|Z$|[+-]\d{2}:?\d{2}$/i.test(cleaned)) {
     return parsed.toISOString();
   }
-  // Fallback: try without timezone hint
-  const fallback = new Date(cleaned);
-  if (!isNaN(fallback.getTime()) && fallback.getFullYear() > 2020) {
-    // Assume Eastern: add 4h (EDT offset) to treat as UTC
-    return new Date(fallback.getTime() + 4 * 60 * 60 * 1000).toISOString();
-  }
-  return null;
+
+  // Otherwise the text is an America/Toronto wall-clock time. A zone-less string is
+  // parsed in the process's local zone, so the local getters recover the wall clock
+  // exactly as written; re-anchor it in Toronto (DST-aware — not a fixed EDT offset).
+  const hasTime = /\d{1,2}:\d{2}|\d\s*[ap]\.?m\.?(?![a-z])/i.test(cleaned);
+  return zonedWallTimeToUtcIso(
+    {
+      year: parsed.getFullYear(),
+      month: parsed.getMonth() + 1,
+      day: parsed.getDate(),
+      // Date-only → end of that day locally, not midnight (the previous evening in UTC).
+      hour: hasTime ? parsed.getHours() : 23,
+      minute: hasTime ? parsed.getMinutes() : 59,
+    },
+    'America/Toronto',
+  );
 }
 
 /**
@@ -398,7 +430,9 @@ export function parseOutlineSegmentDate(text: string, year: number): string | nu
   if (!md) return null;
   const day = Number(md[1]);
   const mon = OUTLINE_MONTHS[md[2].slice(0, 3).toLowerCase()];
-  const mt = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b/i);
+  // (?![a-z]) rather than \b: outline text is often run together ("9pmRequired").
+  // Case-sensitive on purpose so the lookahead only rejects a lowercase continuation.
+  const mt = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*([aApP][mM])(?![a-z])/);
   if (!mt) return null;
   let h = Number(mt[1]);
   const mi = mt[2] ? Number(mt[2]) : 0;
@@ -767,6 +801,8 @@ async function syncUpcomingTasks(
     const courseName = course.name.replace(/ Online - .*$/, '');
     for (const a of course.assignments) {
       if (!a.dueDate) continue;
+      // Already handed in — nothing left to do, so it isn't "due soon".
+      if (a.status === 'Submitted' || a.status === 'Graded') continue;
       const due = new Date(a.dueDate);
       if (due < now || due > tenDays) continue;
 
@@ -777,7 +813,7 @@ async function syncUpcomingTasks(
           properties: {
             'Name': { title: [{ text: { content: `${a.name} (${courseName})` } }] },
             'Course Code': { rich_text: [{ text: { content: course.code } }] },
-            'Status': { select: { name: a.status === 'Submitted' ? 'Active' : 'Active' } },
+            'Status': { select: { name: 'Active' } },
             'Next Due': { date: { start: a.dueDate } },
             'Grade': { rich_text: [{ text: { content: a.grade || '' } }] },
             'Type': { select: { name: '📌 Due Soon' } },

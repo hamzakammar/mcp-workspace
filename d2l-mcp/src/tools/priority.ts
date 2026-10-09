@@ -2,7 +2,14 @@ import { z } from 'zod';
 import { client } from '../client.js';
 import { getUserId } from '../utils/userContext.js';
 import { loadUpcomingConnectorTasks } from '../study/src/courseWebsite/store.js';
-import { shortCode, assessmentDedupKey } from './priorityGlobal.js';
+import {
+  shortCode,
+  assessmentDedupKey,
+  assessmentKind,
+  dueClause,
+  connectorTasksToRecommendations,
+  type AssessmentKind,
+} from './priorityGlobal.js';
 
 // ---- Raw D2L types ----
 
@@ -36,7 +43,7 @@ interface RawAttempt {
 // ---- Output types ----
 
 interface Recommendation {
-  type: 'assignment' | 'quiz' | 'review';
+  type: AssessmentKind | 'review';
   name: string;
   dueIn: string;
   weight: number | null;
@@ -95,13 +102,15 @@ export function matchGradeWeight(
   });
   if (match) return match.Weight ?? null;
 
-  // Tier 2: number-extraction fallback — if both names share the same integer,
-  // treat as a match (handles "A1" vs "Assignment 1", "Quiz2" vs "Quiz 2", etc.)
+  // Tier 2: number-extraction fallback — if both names share the same integer AND the
+  // same assessment type, treat as a match (handles "A1" vs "Assignment 1", "Quiz2" vs
+  // "Quiz 2", but not "Assignment 1" vs "Midterm 1").
   const nameNums = lower.match(/\d+/g);
   if (nameNums) {
+    const kind = assessmentKind(name);
     match = gradeObjects.find((g) => {
       const gNums = g.Name.toLowerCase().match(/\d+/g);
-      return gNums && nameNums.some(n => gNums.includes(n));
+      return gNums && nameNums.some(n => gNums.includes(n)) && assessmentKind(g.Name) === kind;
     });
   }
   return match?.Weight ?? null;
@@ -169,10 +178,10 @@ export const priorityTools = {
             weight: displayWeight,
             reason:
               gradeWeight != null
-                ? `Worth ${gradeWeight}% of final grade, due in ${formatDueIn(folder.DueDate)}`
+                ? `Worth ${gradeWeight}% of final grade, ${dueClause(folder.DueDate)}`
                 : displayWeight != null
-                ? `Worth ${displayWeight} points, due in ${formatDueIn(folder.DueDate)}`
-                : `Due in ${formatDueIn(folder.DueDate)}`,
+                ? `Worth ${displayWeight} points, ${dueClause(folder.DueDate)}`
+                : dueClause(folder.DueDate, true),
             urgencyScore: score,
             _folderId: folder.Id,
           });
@@ -236,7 +245,7 @@ export const priorityTools = {
               name: quiz.Name,
               dueIn: formatDueIn(quiz.DueDate),
               weight: null,
-              reason: `${attemptsDesc}, due in ${formatDueIn(quiz.DueDate)}`,
+              reason: `${attemptsDesc}, ${dueClause(quiz.DueDate)}`,
               urgencyScore: score,
             });
           })
@@ -262,20 +271,8 @@ export const priorityTools = {
               userId, new Date(pastCutoff).toISOString(), new Date(cutoff).toISOString(), code,
             );
             const seen = new Set(recommendations.map((r) => assessmentDedupKey(code, r.name)));
-            for (const t of tasks) {
-              const key = assessmentDedupKey(code, t.title);
-              if (seen.has(key)) continue;
-              seen.add(key);
-              const dueMs = new Date(t.dueAt).getTime();
-              if (isNaN(dueMs)) continue;
-              recommendations.push({
-                type: 'assignment',
-                name: t.title,
-                dueIn: formatDueIn(t.dueAt),
-                weight: null,
-                reason: `From course website/outline, due in ${formatDueIn(t.dueAt)}`,
-                urgencyScore: urgencyScore(dueMs, null, true),
-              });
+            for (const { courseCode: _c, ...rec } of connectorTasksToRecommendations(tasks, seen, () => code)) {
+              recommendations.push(rec);
             }
           }
         }

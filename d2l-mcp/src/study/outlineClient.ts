@@ -352,6 +352,28 @@ async function searchOutlineAPI(cookieHeader: string, query: string): Promise<Se
 }
 
 /**
+ * Pick the search result for exactly this course AND term. The outline search is
+ * fuzzy, so falling back to "first result" could cache a different term's (or a
+ * different course's) outline as the current one — return undefined instead.
+ */
+export function selectOutlineMatch<T extends { term: string; courses?: string }>(
+  results: T[],
+  courseCode: string,
+  term: string,
+): T | undefined {
+  const code = courseCode.replace(/\s+/g, '').toUpperCase();
+  return results.find((r) => {
+    if (r.term !== term) return false;
+    // "CS 135, MATH 135" / "CS 135 MATH 135" → ["CS135", "MATH135"]
+    const codes = (r.courses || '')
+      .toUpperCase()
+      .replace(/\b([A-Z]{2,8})\s+(\d{2,3}[A-Z]?)\b/g, '$1$2')
+      .match(/\b[A-Z]{2,8}\d{2,3}[A-Z]?\b/g) ?? ([] as string[]);
+    return codes.includes(code);
+  });
+}
+
+/**
  * Fetch and parse a specific course outline.
  * courseCode: e.g. "CS135" or "MATH135"
  * term: e.g. "1251" (required — used to filter API results)
@@ -367,8 +389,8 @@ export async function fetchCourseOutline(
 
   const results = await searchOutlineAPI(cookieHeader, searchQuery);
 
-  // Find the matching term
-  const match = results.find(r => r.term === term) || results[0];
+  // Find the result for this exact course + term (no "first result" fallback)
+  const match = selectOutlineMatch(results, courseCode, term);
   if (!match) {
     throw new Error(`No outline found for ${courseCode} term ${term}`);
   }

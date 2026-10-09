@@ -2,6 +2,43 @@ import { z } from "zod";
 import { supabase } from "../../utils/supabase.js";
 import { NotesTools } from "./notes.js";
 
+/** How far back plan_week looks for still-open, already-past-due tasks. */
+export const OVERDUE_LOOKBACK_DAYS = 14;
+
+export interface PlanTask { id: string; title: string; dueDate: string; courseId: string }
+
+/** Bucket open tasks into overdue / due within 72h / later in the window. */
+export function bucketPlanTasks(
+    tasks: Array<{ id: string; title: string; due_at: string; course_id: string }>,
+    now: Date,
+    windowDays: number,
+): { overdue: PlanTask[]; due_soon: PlanTask[]; this_week: PlanTask[] } {
+    const in72h = new Date(now.getTime() + 72 * 60 * 60 * 1000);
+    const endWindow = new Date(now.getTime() + windowDays * 24 * 60 * 60 * 1000);
+    const overdue: PlanTask[] = [];
+    const due_soon: PlanTask[] = [];
+    const this_week: PlanTask[] = [];
+
+    for (const task of tasks) {
+        const dueDate = new Date(task.due_at);
+        const taskObj = {
+            id: task.id,
+            title: task.title,
+            dueDate: task.due_at,
+            courseId: task.course_id,
+        };
+
+        if (dueDate < now) {
+            overdue.push(taskObj);
+        } else if (dueDate <= in72h) {
+            due_soon.push(taskObj);
+        } else if (dueDate <= endWindow) {
+            this_week.push(taskObj);
+        }
+    }
+    return { overdue, due_soon, this_week };
+}
+
 export const PlanningTools = {
     tasks_list: {
         description: `Retrieve a list of tasks for a specified course. Returns task title, due date, status (completed/pending), and priority. Use to answer: "What tasks do I have for this course?", "What are my upcoming deadlines?", "Which tasks are high priority?"`,
@@ -145,12 +182,14 @@ export const PlanningTools = {
             const userId = args.userId;
 
             try {
+                const now = new Date();
+                // Include recently-missed open tasks so the overdue bucket can populate.
                 let query = supabase
                     .from('tasks')
                     .select('*')
                     .eq('user_id', userId)
-                    .gte('due_at', new Date().toISOString())
-                    .lte('due_at', new Date(Date.now() + windowDays * 24 * 60 * 60 * 1000).toISOString())
+                    .gte('due_at', new Date(now.getTime() - OVERDUE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000).toISOString())
+                    .lte('due_at', new Date(now.getTime() + windowDays * 24 * 60 * 60 * 1000).toISOString())
                     .eq('status', 'open');
 
                 if (courseId) {
@@ -168,32 +207,7 @@ export const PlanningTools = {
                     return JSON.stringify({ overdue: [], due_soon: [], this_week: [] }, null, 2);
                 }
 
-                const now = new Date();
-                const in72h = new Date(now.getTime() + 72 * 60 * 60 * 1000);
-                const endWindow = new Date(now.getTime() + windowDays * 24 * 60 * 60 * 1000);
-
-                // Bucket tasks by time
-                const overdue: any[] = [];
-                const due_soon: any[] = [];
-                const this_week: any[] = [];
-
-                for (const task of tasks) {
-                    const dueDate = new Date(task.due_at);
-                    const taskObj = {
-                        id: task.id,
-                        title: task.title,
-                        dueDate: task.due_at,
-                        courseId: task.course_id,
-                    };
-
-                    if (dueDate < now) {
-                        overdue.push(taskObj);
-                    } else if (dueDate <= in72h) {
-                        due_soon.push(taskObj);
-                    } else if (dueDate <= endWindow) {
-                        this_week.push(taskObj);
-                    }
-                }
+                const { overdue, due_soon, this_week } = bucketPlanTasks(tasks, now, windowDays);
 
                 // Enrich due_soon tasks with notes if requested
                 if (includeNotes && due_soon.length > 0) {
