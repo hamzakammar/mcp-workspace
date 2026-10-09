@@ -480,7 +480,7 @@ function createServer(): McpServer {
   // Register file tools
   registerMutatingTool(
     "download_file",
-    "Download a file from D2L Brightspace. Provide a D2L content URL (e.g., https://learn.ul.ie/content/enforced/68929-CS4444.../file.docx or /content/enforced/...). The file will be saved to your Downloads folder by default, or to a custom path if specified. Returns the local file path, filename, size, and content type. Use this to download lecture slides, assignment files, course materials, or any file linked in course content.",
+    "Download a file from D2L Brightspace. Provide a D2L content URL (e.g., https://learn.ul.ie/content/enforced/68929-CS4444.../file.docx or /content/enforced/...). Only URLs on your own D2L host are accepted. The file is saved to your private Horizon downloads folder (optionally a sub-folder or filename within it). Returns the local file path, filename, size, and content type. Use this to download lecture slides, assignment files, course materials, or any file linked in course content.",
     {
       url: z
         .string()
@@ -491,7 +491,7 @@ function createServer(): McpServer {
         .string()
         .optional()
         .describe(
-          "Optional: Custom path to save the file (directory or full file path). Defaults to ~/Downloads"
+          "Optional: sub-folder or filename within your Horizon downloads folder. Paths outside it are rejected."
         ),
     },
     wrapToolHandler("download_file", async (args) => {
@@ -509,12 +509,12 @@ function createServer(): McpServer {
 
   registerReadTool(
     "read_file",
-    "Read a file and extract its text content. Supports PDF, DOCX, TXT, MD, and other formats. Accepts: a note ID (UUID from uploaded notes), an S3 key (users/.../file.pdf), a filename (searched in Downloads), or a full path. Use this to read uploaded PDFs/notes or downloaded D2L files.",
+    "Read a file and extract its text content. Supports PDF, DOCX, TXT, MD, and other formats. Accepts: a note ID (UUID from uploaded notes), an S3 key (users/.../file.pdf), or a filename/path inside your Horizon downloads folder. Use this to read uploaded PDFs/notes or downloaded D2L files.",
     {
       filePath: z
         .string()
         .describe(
-          "The file to read. Can be: a note ID (UUID), an S3 path (users/.../*.pdf), a filename (searched in Downloads), or a full filesystem path."
+          "The file to read. Can be: a note ID (UUID), an S3 path (users/.../*.pdf), or a filename/path inside your Horizon downloads folder (files saved by download_file)."
         ),
     },
     wrapToolHandler("read_file", async (args) => {
@@ -534,12 +534,12 @@ function createServer(): McpServer {
 
   registerMutatingTool(
     "delete_file",
-    "Delete a file from disk. Uses the same path resolution as read_file: you can pass a full path or just a filename (it will search your Downloads folder). Use this to clean up downloaded files after you are done reading them.",
+    "Delete a file from disk. Uses the same path resolution as read_file: pass a filename or path inside your Horizon downloads folder. Use this to clean up downloaded files after you are done reading them.",
     {
       filePath: z
         .string()
         .describe(
-          "The file path or filename to delete. Can be a full path (e.g., /Users/username/Downloads/file.pdf) or just a filename (e.g., file.pdf) which will be searched in the Downloads folder."
+          "The file path or filename to delete. Usually just the filename returned by download_file (e.g., file.pdf); it must be inside your Horizon downloads folder."
         ),
     },
     wrapToolHandler("delete_file", async (args) => {
@@ -1380,7 +1380,8 @@ async function main() {
       const match = req.url?.match(/^\/vnc\/([^/]+)\/websockify/);
       if (match) {
         const sessionId = match[1];
-        const session = BrowserSessionManager.getSession(sessionId);
+        // Live sessions only: a closed session's port may already belong to another user.
+        const session = BrowserSessionManager.getLiveSession(sessionId);
         if (session) {
           const wsProxy = createProxyMiddleware({
             target: `http://localhost:${session.wsPort}`,

@@ -3,6 +3,7 @@ package middleware
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -82,6 +83,13 @@ func (rl *RateLimiter) Allow(key string) bool {
 func RateLimit(limiter *RateLimiter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The noVNC client is ~70 static modules per page load; counting them
+			// would exhaust a shared campus NAT IP's budget and break VNC.
+			if strings.HasPrefix(r.URL.Path, "/vnc/assets/") {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			// Identify the requester
 			key := ""
 			if uid, ok := r.Context().Value(UserIDKey).(string); ok && uid != "" {

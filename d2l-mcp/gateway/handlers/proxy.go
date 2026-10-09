@@ -8,7 +8,9 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/hamzakammar/horizon-gateway/middleware"
 )
@@ -50,6 +52,10 @@ func NewProxy() http.HandlerFunc {
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Never trust a client-supplied identity header — the backend treats it
+		// as authenticated. It is re-set below only after gateway auth succeeds.
+		r.Header.Del("X-User-Id")
+
 		// Forward the original host so the Node app can build correct URLs.
 		r.Header.Set("X-Forwarded-Host", r.Host)
 		r.Header.Set("X-Forwarded-Proto", "https")
@@ -61,6 +67,14 @@ func NewProxy() http.HandlerFunc {
 
 		proxy.ServeHTTP(w, r)
 	}
+}
+
+// vncWebSocketPath is the only WebSocket endpoint the backend serves.
+var vncWebSocketPath = regexp.MustCompile(`^/vnc/[0-9a-fA-F-]{36}/websockify/?$`)
+
+// IsVNCWebSocket reports whether r is a noVNC stream upgrade.
+func IsVNCWebSocket(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && vncWebSocketPath.MatchString(r.URL.Path)
 }
 
 // ProxyWebSocket tunnels a WebSocket upgrade request directly to the Node worker.
@@ -77,7 +91,7 @@ func ProxyWebSocket(nodeWorkerURL string, w http.ResponseWriter, r *http.Request
 	if !strings.Contains(host, ":") {
 		host += ":80"
 	}
-	backendConn, err := net.Dial("tcp", host)
+	backendConn, err := net.DialTimeout("tcp", host, 5*time.Second)
 	if err != nil {
 		fmt.Printf("[WS PROXY] failed to connect to backend: %v\n", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
@@ -91,27 +105,33 @@ func ProxyWebSocket(nodeWorkerURL string, w http.ResponseWriter, r *http.Request
 		http.Error(w, "websocket not supported", http.StatusInternalServerError)
 		return
 	}
-	clientConn, _, err := hijacker.Hijack()
+	clientConn, clientBuf, err := hijacker.Hijack()
 	if err != nil {
 		fmt.Printf("[WS PROXY] hijack failed: %v\n", err)
 		return
 	}
 	defer clientConn.Close()
 
+	// A hijacked conn keeps the http.Server's Read/WriteTimeout deadlines
+	// (60s/120s), which killed every VNC stream after a minute. The tunnel is
+	// long-lived, so clear them.
+	_ = clientConn.SetDeadline(time.Time{})
+
 	// Forward the original HTTP upgrade request to backend
 	r.Host = target.Host
+	r.Header.Del("X-User-Id")
 	r.Header.Set("X-Forwarded-Proto", "https")
 	if err := r.Write(backendConn); err != nil {
 		fmt.Printf("[WS PROXY] failed to write request: %v\n", err)
 		return
 	}
 
-	// Bidirectional pipe
+	// Bidirectional pipe. Read client bytes through the hijack buffer so
+	// anything already read past the request headers isn't dropped.
 	done := make(chan struct{}, 2)
-	go func() { io.Copy(backendConn, clientConn); done <- struct{}{} }()
+	go func() { io.Copy(backendConn, clientBuf.Reader); done <- struct{}{} }()
 	go func() { io.Copy(clientConn, backendConn); done <- struct{}{} }()
 	<-done
 
 	fmt.Printf("[WS PROXY] websocket session ended: %s\n", r.URL.Path)
 }
-
