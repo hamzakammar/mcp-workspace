@@ -354,7 +354,10 @@ func isLikelyRefreshToken(token string) bool {
 func Auth(_ string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if isPublicRoute(r.URL.Path) {
+			// The landing page is public, but only for GET/HEAD: an MCP client pointed at
+			// the bare origin must still get the 401 + WWW-Authenticate discovery hint.
+			isLanding := r.URL.Path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead)
+			if isLanding || isPublicRoute(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
 			}
