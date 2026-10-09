@@ -160,7 +160,7 @@ router.get("/notion/callback", async (req: Request, res: Response) => {
   const { code, state, error: oauthError } = req.query as Record<string, string>;
 
   if (oauthError) {
-    res.status(400).send(`Notion OAuth error: ${oauthError}`);
+    res.status(400).type("text/plain").send(`Notion OAuth error: ${oauthError}`);
     return;
   }
 
@@ -221,7 +221,7 @@ router.get("/notion/callback", async (req: Request, res: Response) => {
     res.redirect(`${onboardBase}?notion=connected`);
   } catch (e: any) {
     console.error("[NOTION_CALLBACK] Error:", e);
-    res.status(500).send(`Internal error: ${e.message}`);
+    res.status(500).type("text/plain").send("Internal error while connecting Notion. Please try again.");
   }
 });
 

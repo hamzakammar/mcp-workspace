@@ -63,7 +63,7 @@ async function markDuoRequired(userId: string): Promise<void> {
 
   try {
     await fetch(
-      `${sbUrl}/rest/v1/user_credentials?user_id=eq.${encodeURIComponent(userId)}`,
+      `${sbUrl}/rest/v1/user_credentials?user_id=eq.${encodeURIComponent(userId)}&service=eq.d2l`,
       {
         method: "PATCH",
         headers: {
@@ -73,8 +73,8 @@ async function markDuoRequired(userId: string): Promise<void> {
           Prefer: "return=minimal",
         },
         body: JSON.stringify({
+          // Don't bump updated_at — it's the token age getToken() relies on.
           duo_required_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
         }),
       }
     );

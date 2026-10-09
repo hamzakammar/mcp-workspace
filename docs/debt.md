@@ -33,6 +33,22 @@ Severity guide:
 
 <!-- Add new entries below this line, newest first. -->
 
+### [DEBT-014] Account deletion / logout leave data and access behind
+- **Severity:** medium
+- **Area:** `d2l-mcp/src/utils/deleteUserData.ts`, `src/api/push.ts`, `/auth/logout`
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** `delete_my_data` only removes `user_credentials` + `api_keys`: OAuth tokens stay valid, and notes/PDFs, sections, Piazza posts, tasks, bookmarks, outline/crowdmark S3 state remain. Device tokens are keyed `(user_id, device_token)`, so a shared device keeps receiving the previous user's pushes; logout doesn't remove them. (FKs now cascade on auth-user delete — migration 20261009000000.)
+- **Fix:** Revoke `oauth_*` rows, delete remaining tables + S3 objects, `clearTokenCache`; make `device_token` unique alone and delete on logout.
+
+### [DEBT-013] Smaller backend correctness items
+- **Severity:** low
+- **Area:** `d2l-mcp/src/api/oauth/token.ts`, `src/utils/s3Storage.ts`, `src/index.ts`, `src/api/routes.ts`
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** OAuth refresh rotation is read-then-revoke (two concurrent refreshes both succeed); decrypted browser state is written to a fixed `tmpdir/browser-state-<uid>.json` shared across services and not always unlinked; `_upcomingDeadlines` sorts "5h"/"2d" with parseInt; duplicate `/outline/status` + `/outline/connect` routes (second never runs); `get_quizzes` attempts 404 surfaced as an error; outbound fetches mostly lack timeouts.
+- **Fix:** Atomic `update ... where revoked=false returning`; per-service random temp names + unlink; sort by epoch; delete dead routes; treat 404 as no attempts; `AbortSignal.timeout`.
+
 ### [DEBT-012] Password-reset emails depend on Supabase default SMTP
 - **Severity:** high
 - **Area:** Supabase Auth (prod `qialmumlcezeqvyyhjlu`)

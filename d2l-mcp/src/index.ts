@@ -1040,6 +1040,23 @@ async function main() {
 
     // Map to store transports by session ID
     const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+    // Clients rarely send DELETE, so transports (each with a full McpServer) were
+    // never released — hundreds accumulated per week. Evict idle ones; a client
+    // that comes back is transparently restored by the "silently restoring" path.
+    const transportLastSeen = new Map<string, number>();
+    const TRANSPORT_IDLE_MS = 2 * 60 * 60 * 1000;
+    setInterval(() => {
+      const cutoff = Date.now() - TRANSPORT_IDLE_MS;
+      for (const [sid, transport] of Object.entries(transports)) {
+        if ((transportLastSeen.get(sid) ?? 0) >= cutoff) continue;
+        delete transports[sid];
+        transportLastSeen.delete(sid);
+        transport.close().catch(() => {});
+      }
+      for (const sid of transportLastSeen.keys()) if (!transports[sid]) transportLastSeen.delete(sid);
+      console.error(`[MCP] Idle sweep — ${Object.keys(transports).length} live transport(s)`);
+    }, 10 * 60 * 1000).unref();
     
     // Session persistence
     const SESSION_FILE = path.join(process.cwd(), '.mcp-sessions.json');
@@ -1102,7 +1119,7 @@ async function main() {
       );
       console.error(`[MCP] Method: ${requestMethod}`);
       console.error(`[MCP] Request ID: ${requestId}`);
-      console.error(`[MCP] Active sessions: ${Object.keys(transports).join(', ') || 'none'}`);
+      console.error(`[MCP] Active sessions: ${Object.keys(transports).length}`);
       console.error(`[MCP] Headers:`, JSON.stringify(redactHeaders(req.headers), null, 2));
       if (requestMethod === "tools/call") {
         console.error(
@@ -1113,6 +1130,7 @@ async function main() {
 
       try {
         let transport: StreamableHTTPServerTransport;
+        if (sessionId) transportLastSeen.set(sessionId, Date.now());
 
         if (sessionId && transports[sessionId]) {
           // Reuse existing transport
@@ -1180,6 +1198,7 @@ async function main() {
                 `[MCP] Session initialized with ID: ${sessionId} (${initTime}ms)`
               );
               transports[sessionId] = transport;
+              transportLastSeen.set(sessionId, Date.now());
               validSessionIds.add(sessionId);
               void saveSessions();
             },
@@ -1425,6 +1444,13 @@ async function main() {
     process.exit(1);
   }
 }
+
+// Express 4 doesn't catch rejected async handlers; without this a single
+// failed await (e.g. a Supabase blip in /token) would take the whole process —
+// every MCP transport and VNC session — down with it.
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL-unhandled] Unhandled promise rejection:", reason);
+});
 
 main().catch((error) => {
   console.error("Fatal error:", error);
