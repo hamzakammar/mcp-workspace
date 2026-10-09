@@ -1,6 +1,7 @@
 # Architecture
 
-> Last updated: 2026-03-19  
+> Last updated: 2026-10-09  
+> ⚠️ Production no longer runs on EC2/PM2 — see "Production (current)" below. Older sections are kept for local/dev context.
 > Status: living document — update whenever the system shape changes.
 
 ---
@@ -28,6 +29,22 @@ mcp-workspace is a monorepo for personal MCP (Model Context Protocol) servers. E
 │  OpenAI Embeddings API                   │
 └──────────────────────────────────────────┘
 ```
+
+---
+
+## Production (current, 2026-10)
+
+- **Host:** AWS ECS Fargate, cluster `study-mcp-cluster`, service `study-mcp-backend`, one task (1 vCPU / 2 GB), us-east-1. Deployed with `d2l-mcp/scripts/deploy-to-ecs.sh` (`task-definition.json`).
+- **Containers in the task:** `gateway` (Go, :8080 — auth, rate limit, CORS, metrics, reverse proxy) → `backend` (Node, 127.0.0.1:3000 — MCP + REST + VNC login sessions).
+- **Ingress:** `study-mcp-alb` :443 → gateway :8080 (`https://horizon.hamzaammar.ca`). ALB idle timeout is 60s; long-lived VNC WebSockets rely on `websockify --heartbeat`.
+- **Supabase:** prod project `qialmumlcezeqvyyhjlu` (auth + Postgres/pgvector). The other "StudyMCP" project (`ibtfezssuddmfwowiutv`) is what the local `.env` points at — it is not prod. Migrations: `supabase/migrations/` (recorded via `supabase migration list`); `d2l-mcp/src/study/db/migrations/` are historical, hand-applied files.
+- **Auth email redirects:** Supabase Auth → URL Configuration must have Site URL `https://horizon.hamzaammar.ca/onboard` and `https://horizon.hamzaammar.ca/**` in Redirect URLs, or password-reset links fall back to the Site URL.
+
+### VNC login flow (D2L / Outline / Crowdmark)
+`POST /auth/{d2l,outline,crowdmark}/start` → `BrowserSessionManager` starts Xvfb + Chromium + x11vnc (localhost) + websockify on pooled display/ports and returns
+`/vnc/assets/vnc.html?...&path=vnc/<sessionId>/websockify`. The noVNC client is served statically by Express from `/usr/share/novnc`; the gateway tunnels only
+`/vnc/<uuid>/websockify` upgrades to Node, which proxies live sessions to their websockify port. Status is polled at `/auth/*/status/<sessionId>` (public; the UUID is the secret).
+Ports/displays return to the pool only after the processes exit, and closed sessions are never proxied.
 
 ---
 

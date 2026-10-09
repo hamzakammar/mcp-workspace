@@ -106,3 +106,30 @@ export function verifyAuthRequest(blob: string): AuthRequest | null {
     return null;
   }
 }
+
+/** HMAC-signed state for the Notion OAuth round trip. The callback is public,
+ * so an unsigned `{userId}` state would let anyone attach their Notion token to
+ * another user's account. Format: `<base64url payload>.<base64url sig>`. */
+export function signNotionState(userId: string): string {
+  const payload = Buffer.from(
+    JSON.stringify({ userId, ts: Date.now(), n: randomBytes(8).toString("hex") })
+  ).toString("base64url");
+  const sig = createHmac("sha256", getSessionSecret()).update(`notion-state:${payload}`).digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+/** Returns the userId for a valid, unexpired state; null otherwise. */
+export function verifyNotionState(state: string, maxAgeMs = 10 * 60 * 1000): string | null {
+  const [payload, sig] = String(state || "").split(".");
+  if (!payload || !sig) return null;
+  const expected = createHmac("sha256", getSessionSecret()).update(`notion-state:${payload}`).digest("base64url");
+  if (!safeEqual(sig, expected)) return null;
+  try {
+    const { userId, ts } = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (typeof userId !== "string" || !userId) return null;
+    if (typeof ts !== "number" || Date.now() - ts > maxAgeMs || ts > Date.now() + 60_000) return null;
+    return userId;
+  } catch {
+    return null;
+  }
+}
