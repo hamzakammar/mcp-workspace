@@ -10,8 +10,17 @@
 --   - Users must regenerate their API key; new keys are shown once at creation, never stored
 --   - Gateway auth continues to work via the key_hash (SHA-256) column
 
--- Invalidate all existing keys (they were plaintext-stored and must be rotated)
-DELETE FROM api_keys;
+-- Invalidate all existing keys (they were plaintext-stored and must be rotated).
+-- Guarded (2026-10-09): this migration was applied by hand and isn't recorded in
+-- schema_migrations, so a later `supabase db push` would re-run it and wipe every
+-- live (hash-only) key. Only delete while the plaintext column still exists.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'api_keys' AND column_name = 'key_value') THEN
+    DELETE FROM api_keys;
+  END IF;
+END $$;
 
 -- Drop the plaintext key column
 ALTER TABLE api_keys DROP COLUMN IF EXISTS key_value;

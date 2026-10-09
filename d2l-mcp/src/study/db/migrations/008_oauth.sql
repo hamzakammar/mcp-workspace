@@ -86,7 +86,7 @@ create index if not exists idx_oauth_refresh_user on public.oauth_refresh_tokens
 -- Service-role key is used by both the Go gateway (REST) and the Node worker
 -- (supabase-js), which bypass RLS. Disable RLS to match the other tables in
 -- this schema and avoid accidental anon access.
-alter table public.oauth_clients               disable row level security;
-alter table public.oauth_authorization_codes   disable row level security;
-alter table public.oauth_access_tokens         disable row level security;
-alter table public.oauth_refresh_tokens        disable row level security;
+alter table public.oauth_clients               enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
+alter table public.oauth_authorization_codes   enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
+alter table public.oauth_access_tokens         enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
+alter table public.oauth_refresh_tokens        enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it

@@ -61,7 +61,7 @@ create index if not exists idx_cws_course on public.course_website_snapshots(cou
 create index if not exists idx_cws_url on public.course_website_snapshots(url);
 create index if not exists idx_cws_fetched on public.course_website_snapshots(fetched_at);
 
-alter table public.course_website_snapshots disable row level security;
+alter table public.course_website_snapshots enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
 
 -- APPEND-ONLY enforcement at the DATABASE layer.
 -- Horizon connects with the Supabase service role, which BYPASSES row-level
@@ -124,7 +124,7 @@ create trigger set_course_website_items_updated_at
 before update on public.course_website_items
 for each row execute function public.set_updated_at();
 
-alter table public.course_website_items disable row level security;
+alter table public.course_website_items enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
 
 -- ── Atomic per-page ingestion (single transaction) ───────────────────────────
 -- Persists, for ONE successfully-parsed page, the snapshot + all canonical items +
