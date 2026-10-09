@@ -3,12 +3,12 @@
  *
  * POST /auth/d2l/start         — Start a VNC browser session, returns vncUrl
  * GET  /auth/d2l/status        — Check session status (waiting/authenticated/failed)
- * GET  /vnc/:sessionId/*       — Proxy noVNC static files + WebSocket
+ * GET  /vnc/assets/*           — noVNC client (static, cacheable, shared by all sessions)
+ * WS   /vnc/:sessionId/websockify — VNC stream (upgrade handled in index.ts)
  */
 
-import { Router, Request, Response } from "express";
-import { createProxyMiddleware } from "http-proxy-middleware";
-import { BrowserSessionManager } from "../browser/BrowserSessionManager.js";
+import express, { Router, Request, Response } from "express";
+import { BrowserSessionManager, NOVNC_ASSET_PATH } from "../browser/BrowserSessionManager.js";
 import { authMiddleware } from "./auth.js";
 
 const router = Router();
@@ -168,55 +168,27 @@ router.get("/auth/crowdmark/status/:sessionId", async (req: Request, res: Respon
 });
 
 /**
- * Dynamic noVNC WebSocket proxy.
- * Route: /vnc/:sessionId/websockify
- * Proxies to the user's websockify port.
+ * noVNC client files. Served straight from disk instead of through each
+ * session's websockify (which forked a Python process per file and made the
+ * ~70-module client crawl). Identical for every session, so let browsers cache.
  */
-router.use("/vnc/:sessionId/websockify", (req: Request, res: Response, next) => {
-  const { sessionId } = req.params;
-  const session = BrowserSessionManager.getSession(sessionId);
-
-  if (!session) {
-    res.status(404).json({ error: "Session not found or expired" });
-    return;
-  }
-
-  const proxy = createProxyMiddleware({
-    target: `http://localhost:${session.wsPort}`,
-    ws: true,
-    changeOrigin: true,
-    pathRewrite: { [`^/vnc/${sessionId}/websockify`]: "/" },
-    on: {
-      error: (err) => console.error("[VNC proxy error]", err),
-    },
-  });
-
-  proxy(req, res, next);
-});
+router.use(
+  NOVNC_ASSET_PATH,
+  express.static(process.env.NOVNC_DIR || "/usr/share/novnc", { maxAge: "1d", index: false }),
+);
 
 /**
- * Serve noVNC static files for a session.
- * Route: /vnc/:sessionId/*
+ * Legacy per-session URLs (/vnc/:sessionId/vnc.html?...) from links issued
+ * before the asset path moved — redirect to the shared client.
  */
-router.use("/vnc/:sessionId", (req: Request, res: Response, next) => {
+router.get("/vnc/:sessionId/vnc.html", (req: Request, res: Response) => {
   const { sessionId } = req.params;
-  const session = BrowserSessionManager.getSession(sessionId);
-
-  if (!session) {
-    res.status(404).send("Session not found or expired");
+  if (!BrowserSessionManager.getLiveSession(sessionId)) {
+    res.status(404).send("Session not found or expired. Start a new login from the Horizon dashboard.");
     return;
   }
-
-  const proxy = createProxyMiddleware({
-    target: `http://localhost:${session.wsPort}`,
-    changeOrigin: true,
-    pathRewrite: (path) => path.replace(`/vnc/${sessionId}`, ""),
-    on: {
-      error: (err) => console.error("[VNC static proxy error]", err),
-    },
-  });
-
-  proxy(req, res, next);
+  const qs = req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?")) : "";
+  res.redirect(302, `${NOVNC_ASSET_PATH}/vnc.html${qs}`);
 });
 
 export default router;

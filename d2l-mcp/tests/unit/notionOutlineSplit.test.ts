@@ -8,7 +8,7 @@
  *   - A0/A00 is a discrete row (so its submitted state can be preserved/deprioritized).
  */
 import { describe, it, expect } from "vitest";
-import { expandOutlineAssessments, parseOutlineSegmentDate } from "../../src/tools/notion.js";
+import { expandOutlineAssessments, parseOutlineSegmentDate, parseOutlineDate } from "../../src/tools/notion.js";
 
 describe("parseOutlineSegmentDate (day-first, America/Toronto)", () => {
   it("parses 'Tue 22 Sep at 9pm' to 2026-09-22 21:00 EDT (01:00Z next day)", () => {
@@ -93,5 +93,37 @@ describe("expandOutlineAssessments (split packed rows / normalize names)", () =>
     const out = expandOutlineAssessments([{ name: "Quiz", date: "A01: Tue 22 Sep at 9pm" }]);
     expect(out).toHaveLength(1);
     expect(out[0].name).toBe("Quiz");
+  });
+});
+
+describe("parseOutlineSegmentDate — run-together text", () => {
+  it("parses a time glued to the next word ('9pmRequired')", () => {
+    expect(parseOutlineSegmentDate("Tue 22 Sep at 9pmRequired submission", 2026)).toBe("2026-09-23T01:00:00.000Z");
+  });
+});
+
+describe("parseOutlineDate (America/Toronto, DST-aware)", () => {
+  it("parses an EDT (summer) date-time", () => {
+    expect(parseOutlineDate("Friday, May 15, 2026 at 11:55 PM")).toBe("2026-05-16T03:55:00.000Z");
+  });
+
+  it("parses an EST (winter) date-time with the winter offset, not hard-coded EDT", () => {
+    expect(parseOutlineDate("Friday, January 16, 2026 at 11:55 PM")).toBe("2026-01-17T04:55:00.000Z");
+  });
+
+  it("uses the Closes: date for Opens/Closes ranges", () => {
+    expect(parseOutlineDate("Opens: Wednesday, June 3, 2026 at 6:55 AM Closes: Friday, June 5, 2026 at 6:55 AM"))
+      .toBe("2026-06-05T10:55:00.000Z");
+  });
+
+  it("treats a date-only value as 23:59 local that day (not the previous evening)", () => {
+    expect(parseOutlineDate("Friday, May 15, 2026")).toBe("2026-05-16T03:59:00.000Z");
+    expect(parseOutlineDate("2026-01-16")).toBe("2026-01-17T04:59:00.000Z");
+  });
+
+  it("returns null for n/a and unparseable values", () => {
+    expect(parseOutlineDate("n/a")).toBeNull();
+    expect(parseOutlineDate(undefined)).toBeNull();
+    expect(parseOutlineDate("weekly")).toBeNull();
   });
 });

@@ -33,6 +33,101 @@ Severity guide:
 
 <!-- Add new entries below this line, newest first. -->
 
+### [DEBT-014] Account deletion / logout leave data and access behind
+- **Severity:** medium
+- **Area:** `d2l-mcp/src/utils/deleteUserData.ts`, `src/api/push.ts`, `/auth/logout`
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** `delete_my_data` only removes `user_credentials` + `api_keys`: OAuth tokens stay valid, and notes/PDFs, sections, Piazza posts, tasks, bookmarks, outline/crowdmark S3 state remain. Device tokens are keyed `(user_id, device_token)`, so a shared device keeps receiving the previous user's pushes; logout doesn't remove them. (FKs now cascade on auth-user delete — migration 20261009000000.)
+- **Fix:** Revoke `oauth_*` rows, delete remaining tables + S3 objects, `clearTokenCache`; make `device_token` unique alone and delete on logout.
+
+### [DEBT-013] Smaller backend correctness items
+- **Severity:** low
+- **Area:** `d2l-mcp/src/api/oauth/token.ts`, `src/utils/s3Storage.ts`, `src/index.ts`, `src/api/routes.ts`
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** OAuth refresh rotation is read-then-revoke (two concurrent refreshes both succeed); decrypted browser state is written to a fixed `tmpdir/browser-state-<uid>.json` shared across services and not always unlinked; `_upcomingDeadlines` sorts "5h"/"2d" with parseInt; duplicate `/outline/status` + `/outline/connect` routes (second never runs); `get_quizzes` attempts 404 surfaced as an error; outbound fetches mostly lack timeouts.
+- **Fix:** Atomic `update ... where revoked=false returning`; per-service random temp names + unlink; sort by epoch; delete dead routes; treat 404 as no attempts; `AbortSignal.timeout`.
+
+### [DEBT-012] Password-reset emails depend on Supabase default SMTP
+- **Severity:** high
+- **Area:** Supabase Auth (prod `qialmumlcezeqvyyhjlu`)
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** No custom SMTP is configured, so auth email uses Supabase's built-in sender (rate limit 2 emails/hour project-wide, intended for team members only). The redirect allowlist was also empty with Site URL `http://localhost:3000`, which sent every reset link to localhost (fix: dashboard URL Configuration — see architecture.md).
+- **Impact:** Reset emails may not arrive for real users, or stop after 2/hour.
+- **Fix:** Configure custom SMTP (e.g. Resend) in Auth → SMTP; raise the email rate limit.
+
+### [DEBT-011] Gateway verifies every JWT with a round-trip to Supabase
+- **Severity:** medium
+- **Area:** `d2l-mcp/gateway/middleware/auth.go` (`Auth`, `verifyAccessToken`)
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** `Auth(_ string)` ignores the JWKS URL and calls `GET /auth/v1/user` on every request.
+- **Impact:** Added latency on every call; a Supabase Auth blip 401s all JWT traffic.
+- **Fix:** Verify locally against cached JWKS; fall back to introspection on key miss.
+
+### [DEBT-010] D2L client: no pagination, no timeouts, server-wide host
+- **Severity:** medium
+- **Area:** `d2l-mcp/src/client.ts`
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** `myenrollments` (Bookmark) and calendar/quiz lists (Next) are not paged; `fetch` has no AbortSignal; the per-request client uses `D2L_HOST` rather than the user's stored host.
+- **Impact:** Items past page 1 silently missing; a hung D2L call hangs the tool; non-UWaterloo users unsupported.
+- **Fix:** Loop on paging tokens, `AbortSignal.timeout(15000)`, resolve host from the user's credential row.
+
+### [DEBT-009] Piazza/notes sync use static server-wide course maps
+- **Severity:** medium
+- **Area:** `d2l-mcp/src/study/src/piazza.ts`, `notes.ts`, `db/piazza_map.json`, `db/notes_map.json`
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** Sync targets come from JSON maps baked into the build (last term's Piazza classes; empty notes map), shared by every user.
+- **Impact:** Current-term Piazza never syncs; other users would sync the owner's classes.
+- **Fix:** Derive classes per user from Piazza `network.get_user_classes` / user settings.
+
+### [DEBT-008] `sync_all` only inserts tasks
+- **Severity:** low
+- **Area:** `d2l-mcp/src/study/src/sync.ts`
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** Due-date changes and submissions are never applied; `course_id` is the orgUnitId rather than a course code.
+- **Impact:** Stale "open" tasks from past terms in `tasks_list`/`plan_week`.
+- **Fix:** Upsert `due_at`/status and store the short course code; close tasks for ended terms.
+
+### [DEBT-007] Credential hygiene in `user_credentials`
+- **Severity:** medium
+- **Area:** Supabase `public.user_credentials`, `d2l-mcp/src/study/outlineAuth.ts`
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** One D2L row still holds a non-KMS password; session tokens (D2L cookies, Outline sessionid, Crowdmark cookies, Notion token) and the outline S3 storage state are stored unencrypted.
+- **Impact:** A DB or bucket leak exposes live sessions.
+- **Fix:** Run `scripts/migrate-encrypt-passwords.ts`; KMS-envelope the token column and outline state like D2L state.
+
+### [DEBT-006] Backend image / deploy safety
+- **Severity:** low
+- **Area:** `d2l-mcp/Dockerfile`, ECS service, ALB, security group
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** Image runs as root, ships both system and Playwright Chromium (`playwright install ... || true` masks failure; Playwright's glibc build can't run on Alpine anyway), ~790 MB. No container healthCheck, deployment circuit breaker off, mutable `:latest` tags. SG allows tcp/3000 from 0.0.0.0/0 (backend binds 127.0.0.1, so not reachable). ALB TLS policy `ELBSecurityPolicy-2016-08`.
+- **Impact:** Bad deploys don't auto-roll-back; larger attack surface.
+- **Fix:** Non-root user, single Chromium, healthCheck + circuit breaker, git-SHA tags, drop the :3000 rule, TLS 1.2+ policy.
+
+### [DEBT-005] Expired OAuth tokens / access logs never purged
+- **Severity:** low
+- **Area:** Supabase `oauth_*` tables, `credential_access_log`
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** ~650 expired OAuth access/refresh tokens and 11k access-log rows with no retention.
+- **Fix:** pg_cron job deleting expired tokens daily and log rows older than 90 days.
+
+### [DEBT-004] Mobile app dependencies far behind
+- **Severity:** low
+- **Area:** `study-mcp-app/`
+- **Logged:** 2026-10-09
+- **Author:** agent
+- **Description:** Expo 52 (latest 57), RN 0.76, React Navigation 6; `npm audit` reports 80 issues (mostly build tooling). Unused axios, dead components (`UploadNote.tsx` posts to a non-existent route), push registration never called.
+- **Fix:** Expo SDK upgrade pass; remove dead code; wire `services/push.ts`.
+
 ### [DEBT-001] Token validation only on first process-session use, not on every restart-recovery
 - **Severity:** low
 - **Area:** `d2l-mcp/src/auth.ts` — `getToken()`

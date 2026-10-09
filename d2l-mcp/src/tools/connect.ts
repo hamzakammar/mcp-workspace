@@ -13,6 +13,7 @@ import { getUserId } from '../utils/userContext.js';
 import { supabase } from '../utils/supabase.js';
 import { encryptPassword } from '../utils/kms.js';
 import { logCredentialAccess } from '../utils/auditLog.js';
+import { signNotionState } from '../api/oauth/crypto.js';
 
 const DASHBOARD_URL = process.env.API_HOST
   ? `https://${process.env.API_HOST}/onboard`
@@ -156,7 +157,7 @@ export const connectTools = {
         });
       }
 
-      const state = Buffer.from(JSON.stringify({ userId, ts: Date.now() })).toString('base64url');
+      const state = signNotionState(userId);
       const authUrl = `https://api.notion.com/v1/oauth/authorize?client_id=${encodeURIComponent(clientId)}&response_type=code&owner=user&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
 
       return JSON.stringify({

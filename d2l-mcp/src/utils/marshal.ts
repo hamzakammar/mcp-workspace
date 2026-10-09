@@ -23,11 +23,14 @@ export function stripHtml(html: string | null | undefined): string {
     .trim();
 }
 
-// Format date to readable string
+// Format date to readable string, in the students' local (Toronto/Waterloo)
+// time — the server container runs in UTC, so an explicit zone is required.
 export function formatDate(isoDate: string | null | undefined): string | null {
   if (!isoDate) return null;
   const date = new Date(isoDate);
   return date.toLocaleDateString('en-US', {
+    timeZone: 'America/Toronto',
+    timeZoneName: 'short',
     weekday: 'short',
     month: 'short',
     day: 'numeric',

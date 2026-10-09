@@ -153,6 +153,16 @@ describe('matchGradeWeight', () => {
     expect(matchGradeWeight('A1', grades)).toBeNull();
   });
 
+  it('tier-2: no cross-type match — "Assignment 1" does not take "Midterm 1" weight', () => {
+    const grades = makeGrades([['Midterm 1', 25]]);
+    expect(matchGradeWeight('Assignment 1', grades)).toBeNull();
+  });
+
+  it('tier-2: picks the same-type object when several share the number', () => {
+    const grades = makeGrades([['Quiz 1', 5], ['Assignment 1', 10]]);
+    expect(matchGradeWeight('A1', grades)).toBe(10);
+  });
+
   it('tier-1 takes priority over tier-2 (uses first match found)', () => {
     // "Assignment 1" exact-matches grade object 1, not grade object 11
     const grades = makeGrades([['Assignment 1', 10], ['Assignment 11', 20]]);

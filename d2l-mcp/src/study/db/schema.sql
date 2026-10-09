@@ -56,7 +56,7 @@ create trigger set_tasks_updated_at
 before update on public.tasks
 for each row execute function public.set_updated_at();
 
-alter table public.tasks disable row level security;
+alter table public.tasks enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
 
 
 -- =========================================================
@@ -78,7 +78,7 @@ create index if not exists idx_sync_state_user on public.sync_state(user_id);
 create index if not exists idx_sync_state_source on public.sync_state(source);
 create index if not exists idx_sync_state_course on public.sync_state(course_id);
 
-alter table public.sync_state disable row level security;
+alter table public.sync_state enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
 
 
 -- =========================================================
@@ -105,7 +105,7 @@ create trigger set_notes_updated_at
 before update on public.notes
 for each row execute function public.set_updated_at();
 
-alter table public.notes disable row level security;
+alter table public.notes enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
 
 
 -- =========================================================
@@ -162,7 +162,7 @@ create trigger set_note_sections_updated_at
 before update on public.note_sections
 for each row execute function public.set_updated_at();
 
-alter table public.note_sections disable row level security;
+alter table public.note_sections enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
 
 
 -- Semantic search RPC for note_sections (user_filter = Cognito sub or MCP_USER_ID)
@@ -229,7 +229,7 @@ create trigger set_office_hours_updated_at
 before update on public.office_hours
 for each row execute function public.set_updated_at();
 
-alter table public.office_hours disable row level security;
+alter table public.office_hours enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
 
 
 -- =========================================================
@@ -262,7 +262,7 @@ create index if not exists idx_piazza_posts_created on public.piazza_posts(creat
 create index if not exists idx_piazza_posts_embedding_hnsw
   on public.piazza_posts using hnsw (embedding vector_cosine_ops);
 
-alter table public.piazza_posts disable row level security;
+alter table public.piazza_posts enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
 
 
 -- Semantic search RPC for piazza_posts (user_filter = Cognito sub or MCP_USER_ID)
@@ -320,7 +320,7 @@ create trigger set_device_tokens_updated_at
 before update on public.device_tokens
 for each row execute function public.set_updated_at();
 
-alter table public.device_tokens disable row level security;
+alter table public.device_tokens enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
 
 -- =========================================================
 -- End

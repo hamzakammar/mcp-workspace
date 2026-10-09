@@ -19,6 +19,8 @@ export default function PiazzaWebViewScreen() {
   const [loading, setLoading] = useState(true);
   const [capturedCookies, setCapturedCookies] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // Guards against double submits: navigation events fire repeatedly and `submitting` state is stale in closures
+  const submittedRef = useRef(false);
 
   const piazzaUrl = 'https://piazza.com/';
 
@@ -67,8 +69,9 @@ export default function PiazzaWebViewScreen() {
           setCapturedCookies(cookieString);
           
           // Automatically connect and navigate back
-          if (!submitting) {
-            setTimeout(() => handleSubmit(cookieString), 500);
+          if (!submittedRef.current) {
+            submittedRef.current = true;
+            setTimeout(() => handleSubmit(cookieString, true), 500);
           }
         } else {
           if (__DEV__) console.log('[Piazza WebView] Missing session_id cookie. Available cookies:', Object.keys(cookies));
@@ -80,14 +83,19 @@ export default function PiazzaWebViewScreen() {
     }
   };
 
-  const handleSubmit = async (cookieString?: string) => {
+  const handleSubmit = async (cookieString?: string, alreadyClaimed = false) => {
     const cookiesToUse = cookieString || capturedCookies;
     
     if (!cookiesToUse) {
+      if (alreadyClaimed) submittedRef.current = false;
       Alert.alert('No Credentials', 'Please log in first.');
       return;
     }
 
+    if (!alreadyClaimed) {
+      if (submittedRef.current) return;
+      submittedRef.current = true;
+    }
     setSubmitting(true);
     try {
       await piazzaService.connectWithCookies({ cookies: cookiesToUse });
@@ -99,6 +107,7 @@ export default function PiazzaWebViewScreen() {
       navigation.goBack();
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to connect');
+      submittedRef.current = false;
       setSubmitting(false);
     }
   };

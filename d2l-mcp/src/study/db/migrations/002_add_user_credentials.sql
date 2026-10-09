@@ -33,4 +33,4 @@ before update on public.user_credentials
 for each row execute function public.set_updated_at();
 
 -- Disable RLS for now (enable and add policies in production)
-alter table public.user_credentials disable row level security;
+alter table public.user_credentials enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it

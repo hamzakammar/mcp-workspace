@@ -40,7 +40,10 @@ func isPublicRoute(path string) bool {
 	if strings.HasPrefix(path, "/vnc/") || path == "/websockify" {
 		return true
 	}
-	if strings.HasPrefix(path, "/auth/d2l/status/") {
+	// Per-session status polling — the unguessable session UUID is the secret.
+	if strings.HasPrefix(path, "/auth/d2l/status/") ||
+		strings.HasPrefix(path, "/auth/outline/status/") ||
+		strings.HasPrefix(path, "/auth/crowdmark/status/") {
 		return true
 	}
 	// OAuth 2.1 discovery, dynamic client registration, and the authorization
@@ -311,7 +314,7 @@ func resolveAPIKey(apiKey string) (string, error) {
 	}
 
 	// Query api_keys table
-	restURL := fmt.Sprintf("%s/rest/v1/api_keys?key_hash=eq.%s&select=user_id&limit=1", sbURL, keyHash)
+	restURL := fmt.Sprintf("%s/rest/v1/api_keys?key_hash=eq.%s&revoked=eq.false&select=user_id&limit=1", sbURL, keyHash)
 	req, err := http.NewRequest("GET", restURL, nil)
 	if err != nil {
 		return "", err

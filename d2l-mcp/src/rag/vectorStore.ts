@@ -66,7 +66,9 @@ export async function semanticSearch(
     match_user_id: userId,
     match_course_id: courseId ?? null,
     match_count: limit,
-    match_threshold: 0.7,
+    // text-embedding-3-small cosine similarities for genuinely relevant chunks sit
+    // around 0.25–0.4, so 0.7 filtered out essentially everything.
+    match_threshold: 0.3,
   });
 
   if (error) {

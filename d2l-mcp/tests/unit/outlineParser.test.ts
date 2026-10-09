@@ -194,7 +194,7 @@ describe('fetchCourseOutline — assessment parsing', () => {
 
   it('parses Evaluation/Worth/Due columns (alternative headers)', async () => {
     mockFetch(200, ASSESSMENT_TABLE_ALT_HEADERS);
-    const result = await fetchCourseOutline('sessionid=valid', 'ECE222', '1265');
+    const result = await fetchCourseOutline('sessionid=valid', 'CS138', '1265');
     expect(result.assessments).toHaveLength(3);
     expect(result.assessments[0]).toMatchObject({ name: 'Lab 1', weight: '10%' });
     expect(result.assessments[2]).toMatchObject({ name: 'Final', weight: '50%' });
@@ -247,7 +247,7 @@ describe('fetchCourseOutline — instructor parsing', () => {
 
   it('parses instructor from table (table-based fallback)', async () => {
     mockFetch(200, INSTRUCTOR_TABLE);
-    const result = await fetchCourseOutline('sessionid=valid', 'MATH137', '1265');
+    const result = await fetchCourseOutline('sessionid=valid', 'CS138', '1265');
     expect(result.instructors.length).toBeGreaterThanOrEqual(1);
     expect(result.instructors[0].name).toContain('Bob Nguyen');
     expect(result.instructors[0].email).toContain('uwaterloo.ca');

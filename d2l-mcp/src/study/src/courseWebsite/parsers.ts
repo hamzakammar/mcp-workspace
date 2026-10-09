@@ -146,10 +146,11 @@ function classifyAssessment(text: string): ItemType | null {
   return null;
 }
 
-function deriveTitle(text: string): string {
+export function deriveTitle(text: string): string {
   const cleaned = text.replace(/\s+/g, " ").trim();
-  // Prefer the segment before "due" for a concise title.
-  const beforeDue = cleaned.split(/\bdue\b/i)[0].trim();
+  // Prefer the segment before "due" for a concise title, minus any dangling
+  // separator left behind ("Assignment 1 (due …)" → "Assignment 1").
+  const beforeDue = cleaned.split(/\bdue\b/i)[0].replace(/[\s(\-–—:,]+$/, "").trim();
   const title = (beforeDue || cleaned).slice(0, 120).trim();
   return title || cleaned.slice(0, 120);
 }

@@ -13,12 +13,83 @@ export function shortCode(input: string): string {
   return compact.match(/[A-Z]{2,6}\d{2,3}/)?.[0] ?? compact;
 }
 
-// Dedup key for the same assessment across sources: course + assignment number when
-// present (so website "Assignment 1" collapses with D2L "A1"), else course + name.
+// Dedup key for the same assessment across sources: course + assessment type + number
+// when present (so website "Assignment 1" collapses with D2L "A1", but "Quiz 1" stays
+// distinct from "Assignment 1"), else course + name.
 export function assessmentDedupKey(courseCode: string, name: string): string {
   const code = shortCode(courseCode);
-  const num = (name.toLowerCase().match(/\b(?:asn|assignment|a|quiz|project|p)\s*#?\s*(\d{1,2})\b/) || [])[1];
-  return num ? `${code}#${num}` : `${code}:${name.toLowerCase().replace(/\s+/g, ' ').trim()}`;
+  const m = name.toLowerCase().match(/\b(asn|assignment|a|quiz|project|p)\s*#?\s*(\d{1,2})\b/);
+  if (m) {
+    const kind = m[1] === 'quiz' ? 'q' : m[1] === 'project' || m[1] === 'p' ? 'p' : 'a';
+    return `${code}#${kind}${m[2]}`;
+  }
+  return `${code}:${name.toLowerCase().replace(/\s+/g, ' ').trim()}`;
+}
+
+export type AssessmentKind =
+  | 'assignment' | 'quiz' | 'midterm' | 'exam' | 'project' | 'lab' | 'tutorial';
+
+// Coarse assessment type from a name ("A1" → assignment, "Midterm 1" → midterm,
+// "Quiz2" → quiz). null when the name carries no recognizable type word.
+export function assessmentKind(name: string): AssessmentKind | null {
+  const s = (name || '').toLowerCase();
+  if (/\bmid-?\s?terms?(?![a-z])/.test(s)) return 'midterm';
+  if (/\bquiz|\bq\s*\d/.test(s)) return 'quiz';
+  if (/\blab(?:oratory|oratories|s)?(?![a-z])/.test(s)) return 'lab';
+  if (/\bproj(?:ect)?s?(?![a-z])|\bp\s*\d/.test(s)) return 'project';
+  if (/\b(?:final|exams?|examination)(?![a-z])/.test(s)) return 'exam';
+  if (/\b(?:assignments?|asn|assn|hw|homework|problem\s*sets?)(?![a-z])|\ba\s*\d/.test(s)) return 'assignment';
+  if (/\btut(?:orial)?s?(?![a-z])/.test(s)) return 'tutorial';
+  return null;
+}
+
+// "due in 3 days" / "overdue" — avoids the nonsensical "due in overdue".
+export function dueClause(isoDate: string, capitalize = false): string {
+  const dueIn = formatDueIn(isoDate);
+  const text = dueIn === 'overdue' ? 'overdue' : `due in ${dueIn}`;
+  return capitalize ? text.charAt(0).toUpperCase() + text.slice(1) : text;
+}
+
+/**
+ * Convert website/outline connector tasks into recommendations. These come from the
+ * `tasks` table with no live submission status, so anything already past due is
+ * excluded (we can't tell whether it was submitted — ranking it as "overdue, not
+ * started" would float already-done work to the top). Items matching `seenKeys`
+ * (already covered by D2L or an earlier connector row) are skipped; `seenKeys` is
+ * updated in place.
+ */
+export function connectorTasksToRecommendations(
+  tasks: Array<{ courseCode: string; title: string; dueAt: string }>,
+  seenKeys: Set<string>,
+  keyCourseCode: (t: { courseCode: string }) => string,
+  nowMs: number = Date.now(),
+): Array<{ type: AssessmentKind; courseCode: string; name: string; dueIn: string; weight: null; reason: string; urgencyScore: number }> {
+  const out: Array<{ type: AssessmentKind; courseCode: string; name: string; dueIn: string; weight: null; reason: string; urgencyScore: number }> = [];
+  for (const t of tasks) {
+    const dueMs = new Date(t.dueAt).getTime();
+    if (isNaN(dueMs) || dueMs <= nowMs) continue; // past due — not actionable / status unknown
+    const key = assessmentDedupKey(keyCourseCode(t), t.title);
+    if (seenKeys.has(key)) continue; // D2L (or another website row) already covers it
+    seenKeys.add(key);
+    out.push({
+      type: assessmentKind(t.title) ?? 'assignment',
+      courseCode: t.courseCode,
+      name: t.title,
+      dueIn: formatDueIn(t.dueAt),
+      weight: null,
+      reason: `From course website/outline, ${dueClause(t.dueAt)}`,
+      urgencyScore: urgencyScore(dueMs, null, true),
+    });
+  }
+  return out;
+}
+
+// True when a D2L dropbox `mysubmissions` response shows at least one submission.
+export function hasDropboxSubmission(raw: unknown): boolean {
+  if (Array.isArray(raw)) return raw.length > 0;
+  if (!raw || typeof raw !== 'object') return false;
+  const r = raw as { HasSubmission?: boolean; Submissions?: unknown[] };
+  return !!(r.HasSubmission || (Array.isArray(r.Submissions) && r.Submissions.length > 0));
 }
 
 // ---- Raw D2L types ----
@@ -58,7 +129,7 @@ export interface RawGradeObject {
 // ---- Output types ----
 
 interface GlobalRecommendation {
-  type: 'assignment' | 'quiz';
+  type: AssessmentKind;
   courseName: string;
   courseCode: string;
   name: string;
@@ -109,13 +180,15 @@ export function matchGradeWeight(name: string, gradeObjects: RawGradeObject[]): 
   });
   if (match) return match.Weight ?? null;
 
-  // Tier 2: number-extraction fallback — if both names share the same integer,
-  // treat as a match (handles "A1" vs "Assignment 1", "Quiz2" vs "Quiz 2", etc.)
+  // Tier 2: number-extraction fallback — if both names share the same integer AND the
+  // same assessment type, treat as a match (handles "A1" vs "Assignment 1", "Quiz2" vs
+  // "Quiz 2", but not "Assignment 1" vs "Midterm 1").
   const nameNums = lower.match(/\d+/g);
   if (nameNums) {
+    const kind = assessmentKind(name);
     match = gradeObjects.find((g) => {
       const gNums = g.Name.toLowerCase().match(/\d+/g);
-      return gNums && nameNums.some(n => gNums.includes(n));
+      return gNums && nameNums.some(n => gNums.includes(n)) && assessmentKind(g.Name) === kind;
     });
   }
   return match?.Weight ?? null;
@@ -163,10 +236,10 @@ async function getCourseRecommendations(
         dueIn: formatDueIn(folder.DueDate),
         weight: displayWeight,
         reason: gradeWeight != null
-          ? `Worth ${gradeWeight}% of final grade, due in ${formatDueIn(folder.DueDate)}`
+          ? `Worth ${gradeWeight}% of final grade, ${dueClause(folder.DueDate)}`
           : displayWeight != null
-          ? `Worth ${displayWeight} points, due in ${formatDueIn(folder.DueDate)}`
-          : `Due in ${formatDueIn(folder.DueDate)}`,
+          ? `Worth ${displayWeight} points, ${dueClause(folder.DueDate)}`
+          : dueClause(folder.DueDate, true),
         urgencyScore: urgencyScore(dueMs, gradeWeight, true),
         _orgUnitId: orgUnitId,
         _folderId: folder.Id,
@@ -218,7 +291,7 @@ async function getCourseRecommendations(
         name: quiz.Name,
         dueIn: formatDueIn(quiz.DueDate),
         weight: null,
-        reason: `${attemptsDesc}, due in ${formatDueIn(quiz.DueDate)}`,
+        reason: `${attemptsDesc}, ${dueClause(quiz.DueDate)}`,
         urgencyScore: urgencyScore(dueMs, null, notStarted),
       });
     }));
@@ -312,21 +385,10 @@ export const priorityGlobalTools = {
           for (const e of activeCourses) {
             codeToName.set(shortCode(e.OrgUnit.Code || e.OrgUnit.Name), e.OrgUnit.Name);
           }
-          for (const t of websiteTasks) {
-            const key = assessmentDedupKey(t.courseCode, t.title);
-            if (seenKeys.has(key)) continue; // D2L (or another website row) already covers it
-            seenKeys.add(key);
-            const dueMs = new Date(t.dueAt).getTime();
-            if (isNaN(dueMs)) continue;
+          for (const rec of connectorTasksToRecommendations(websiteTasks, seenKeys, (t) => t.courseCode)) {
             all.push({
-              type: 'assignment',
-              courseName: codeToName.get(shortCode(t.courseCode)) ?? t.courseCode,
-              courseCode: t.courseCode,
-              name: t.title,
-              dueIn: formatDueIn(t.dueAt),
-              weight: null,
-              reason: `From course website/outline, due in ${formatDueIn(t.dueAt)}`,
-              urgencyScore: urgencyScore(dueMs, null, true),
+              ...rec,
+              courseName: codeToName.get(shortCode(rec.courseCode)) ?? rec.courseCode,
             });
           }
         }
@@ -343,12 +405,8 @@ export const priorityGlobalTools = {
           .filter((r) => r.type === 'assignment' && r._orgUnitId != null && r._folderId != null)
           .map(async (r) => {
             try {
-              const raw = (await client.getMySubmissions(r._orgUnitId!, r._folderId!)) as
-                | { HasSubmission?: boolean; Submissions?: unknown[] }
-                | unknown[];
-              const hasSubmission = Array.isArray(raw)
-                ? raw.length > 0
-                : !!(raw.HasSubmission || (raw.Submissions && (raw.Submissions as unknown[]).length > 0));
+              const raw = await client.getMySubmissions(r._orgUnitId!, r._folderId!);
+              const hasSubmission = hasDropboxSubmission(raw);
               return { name: r.name, courseName: r.courseName, submitted: hasSubmission };
             } catch {
               return { name: r.name, courseName: r.courseName, submitted: false };

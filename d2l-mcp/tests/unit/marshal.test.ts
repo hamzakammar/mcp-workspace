@@ -130,6 +130,32 @@ describe('removeEmpty', () => {
   });
 });
 
+// ─── formatDate ───────────────────────────────────────────────────────────────
+
+describe('formatDate', () => {
+  it('returns null for empty input', () => {
+    expect(formatDate(null)).toBeNull();
+    expect(formatDate(undefined)).toBeNull();
+  });
+
+  it('renders in America/Toronto (EDT in summer), not container UTC', () => {
+    // 03:59 UTC on Oct 10 is 11:59 PM EDT on Oct 9.
+    const out = formatDate('2026-10-10T03:59:00.000Z')!;
+    expect(out).toContain('Oct 9');
+    expect(out).toContain('11:59');
+    expect(out).toContain('PM');
+    expect(out).toContain('EDT');
+  });
+
+  it('renders EST in winter', () => {
+    // 04:59 UTC on Jan 16 is 11:59 PM EST on Jan 15.
+    const out = formatDate('2026-01-16T04:59:00.000Z')!;
+    expect(out).toContain('Jan 15');
+    expect(out).toContain('11:59');
+    expect(out).toContain('EST');
+  });
+});
+
 // ─── formatRelativeDate ───────────────────────────────────────────────────────
 
 describe('formatRelativeDate', () => {

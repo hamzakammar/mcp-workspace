@@ -161,6 +161,101 @@ const extToMime: Record<string, string> = {
   '.gif': 'image/gif',
 };
 
+// ── Per-user file isolation ─────────────────────────────────────────────────
+// Every MCP user shares this process, so local files are confined to a
+// per-user directory under the downloads base, and S3 reads are confined to
+// the user's own `users/{userId}/` prefix. Nothing outside those roots may be
+// read, written, or deleted through the file tools.
+
+/** Base directory for downloaded files (override with HORIZON_FILES_DIR). */
+export function getDownloadsBase(): string {
+  return process.env.HORIZON_FILES_DIR || path.join(os.homedir(), 'Downloads');
+}
+
+/** Filesystem-safe directory segment for a user id. */
+export function userDirSegment(userId: string): string {
+  const safe = String(userId || '').replace(/[^A-Za-z0-9_-]/g, '_');
+  return safe || 'anonymous';
+}
+
+/** The per-user files directory (created on demand). */
+export function getUserFilesDir(userId: string, base: string = getDownloadsBase()): string {
+  const dir = path.join(base, userDirSegment(userId));
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function isWithin(root: string, target: string): boolean {
+  const rel = path.relative(root, target);
+  return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/**
+ * Resolve `target` (absolute, or relative to `baseDir`) and assert the real
+ * path (symlinks resolved, including for not-yet-existing paths via their
+ * nearest existing ancestor) stays inside `baseDir`. Returns the real path.
+ */
+export function confinePath(baseDir: string, target: string): string {
+  const realBase = fs.realpathSync(baseDir);
+  const resolved = path.resolve(baseDir, target);
+
+  // realpath the longest existing ancestor, then re-append the remainder.
+  let existing = resolved;
+  const rest: string[] = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    rest.unshift(path.basename(existing));
+    existing = parent;
+  }
+  const real = path.join(fs.realpathSync(existing), ...rest);
+
+  if (!isWithin(realBase, real)) {
+    throw new Error(`Access denied: path is outside your files directory (${baseDir})`);
+  }
+  return real;
+}
+
+/**
+ * Normalize a user-supplied S3 reference to a key and require it to live under
+ * the caller's own `users/{userId}/` prefix (the prefix presignUpload uses).
+ */
+export function resolveUserS3Key(ref: string, userId: string, bucket: string): string {
+  let key = ref.trim();
+  if (key.startsWith('s3://')) {
+    key = key.slice('s3://'.length);
+    if (key.startsWith(`${bucket}/`)) key = key.slice(bucket.length + 1);
+  }
+  const prefix = `users/${userId}/`;
+  const segments = key.split('/');
+  if (!key.startsWith(prefix) || segments.includes('..') || segments.includes('.')) {
+    throw new Error(`Access denied: S3 key must be under your own path (${prefix})`);
+  }
+  return key;
+}
+
+/** Hostname of a D2L host setting that may or may not include a scheme. */
+export function normalizeHost(host: string): string {
+  return host.trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '').replace(/:\d+$/, '').toLowerCase();
+}
+
+/** True when `url` points at exactly the user's D2L host (https/http only). */
+export function isD2LUrl(url: string, d2lHost: string): boolean {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    return u.hostname.toLowerCase() === normalizeHost(d2lHost);
+  } catch {
+    return false;
+  }
+}
+
+/** Strip any directory components from a server-suggested filename. */
+function safeFilename(name: string, fallback = 'download'): string {
+  const base = path.basename(String(name || '').replace(/\\/g, '/')).trim();
+  return base && base !== '.' && base !== '..' ? base : fallback;
+}
+
 function saveBuffer(data: Buffer, filename: string, downloadsDir: string, savePath?: string): string {
   // Ensure the target directory exists
   const targetDir = savePath && !fs.existsSync(savePath) ? path.dirname(savePath) : downloadsDir;
@@ -190,13 +285,21 @@ export async function downloadFile(url: string, savePath?: string) {
   const d2lTokenData = await getD2LToken(userId);
   const d2lHost = d2lTokenData?.host || process.env.D2L_HOST || 'learn.ul.ie';
 
-  const fullUrl = url.startsWith('http') ? url : `https://${d2lHost}${url}`;
+  const fullUrl = url.startsWith('http') ? url : `https://${normalizeHost(d2lHost)}${url.startsWith('/') ? '' : '/'}${url}`;
+  // Only ever send the user's D2L session (cookies or authenticated browser)
+  // to their own D2L host — never to an arbitrary URL.
+  if (!isD2LUrl(fullUrl, d2lHost)) {
+    throw new Error(`download_file only supports files on your D2L host (${normalizeHost(d2lHost)}). Refusing: ${fullUrl}`);
+  }
   const urlPath = new URL(fullUrl).pathname;
-  const urlFilename = decodeURIComponent(urlPath.split('/').pop() || 'download');
+  const urlFilename = safeFilename(decodeURIComponent(urlPath.split('/').pop() || 'download'));
 
+  // Confine all writes to this user's files directory.
+  const userDir = getUserFilesDir(userId);
+  if (savePath) savePath = confinePath(userDir, savePath);
   const downloadsDir = savePath && fs.existsSync(savePath) && fs.statSync(savePath).isDirectory()
     ? savePath
-    : path.join(os.homedir(), 'Downloads');
+    : userDir;
 
   // Strategy 0: Direct HTTP fetch using D2L session cookies — no browser needed.
   // Use getToken() (not getD2LToken) so stale tokens trigger a silent re-login first.
@@ -227,7 +330,7 @@ export async function downloadFile(url: string, savePath?: string) {
           const contentDisposition = response.headers.get('content-disposition') || '';
           let filename = urlFilename;
           const filenameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-          if (filenameMatch) filename = filenameMatch[1].replace(/['"]/g, '').trim();
+          if (filenameMatch) filename = safeFilename(filenameMatch[1].replace(/['"]/g, '').trim(), urlFilename);
 
           const finalPath = saveBuffer(data, filename, downloadsDir, savePath);
           console.error(`[DOWNLOAD] File saved: ${finalPath} (${(data.length / 1024).toFixed(1)} KB)`);
@@ -272,7 +375,7 @@ export async function downloadFile(url: string, savePath?: string) {
       const contentDisposition = navResponse.headers()['content-disposition'] || '';
       let filename = urlFilename;
       const filenameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-      if (filenameMatch) filename = filenameMatch[1].replace(/['"]/g, '');
+      if (filenameMatch) filename = safeFilename(filenameMatch[1].replace(/['"]/g, ''), urlFilename);
 
       const finalPath = saveBuffer(Buffer.from(data), filename, downloadsDir, savePath);
       console.error(`[DOWNLOAD] Browser: file saved: ${finalPath} (${(data.length / 1024).toFixed(1)} KB)`);
@@ -320,7 +423,7 @@ export async function downloadFile(url: string, savePath?: string) {
 
     const download = await downloadPromise;
     if (download) {
-      const suggestedFilename = download.suggestedFilename() || urlFilename;
+      const suggestedFilename = safeFilename(download.suggestedFilename() || urlFilename, urlFilename);
       let finalPath = path.join(downloadsDir, suggestedFilename);
 
       let counter = 1;
@@ -357,47 +460,37 @@ export async function downloadFile(url: string, savePath?: string) {
 }
 
 /**
- * Resolve a user-provided path or filename to an absolute file path.
- * Mirrors the logic used by readFile so download/read/delete all agree.
+ * Resolve a user-provided path or filename to an absolute file path inside the
+ * user's own files directory. Mirrors the logic used by readFile so
+ * download/read/delete all agree. Anything resolving (after symlinks) outside
+ * the user's directory is rejected.
  */
-function resolveFilePath(filePath: string): string {
-  let finalPath = filePath;
+export function resolveFilePath(filePath: string, userId: string = getUserId(), base?: string): string {
+  const userDir = getUserFilesDir(userId, base);
 
-  // If path doesn't exist and doesn't start with /, try Downloads folder
-  if (!fs.existsSync(filePath) && !path.isAbsolute(filePath)) {
-    const downloadsPath = path.join(os.homedir(), "Downloads", filePath);
-    if (fs.existsSync(downloadsPath)) {
-      finalPath = downloadsPath;
-    }
-  }
+  // Exact path (absolute, or relative to the user's directory).
+  let finalPath = confinePath(userDir, filePath);
 
-  // If still not found, try to find by filename in Downloads
+  // If not found, try to find by filename within the user's directory only.
   if (!fs.existsSync(finalPath)) {
-    const downloadsDir = path.join(os.homedir(), "Downloads");
-    if (fs.existsSync(downloadsDir)) {
-      try {
-        const files = fs.readdirSync(downloadsDir);
-        const matchingFile = files.find(
-          (f) =>
-            f.toLowerCase().includes(filePath.toLowerCase()) || f === filePath
-        );
-        if (matchingFile) {
-          finalPath = path.join(downloadsDir, matchingFile);
-        }
-      } catch {
-        // Ignore readdir errors
+    try {
+      const needle = path.basename(filePath).toLowerCase();
+      const files = fs.readdirSync(userDir);
+      const matchingFile =
+        files.find((f) => f === path.basename(filePath)) ??
+        files.find((f) => needle && f.toLowerCase().includes(needle));
+      if (matchingFile) {
+        finalPath = confinePath(userDir, matchingFile);
       }
+    } catch (err: any) {
+      if (err?.message?.startsWith('Access denied')) throw err;
+      // Ignore readdir errors
     }
   }
 
   // Check if file exists
   if (!fs.existsSync(finalPath)) {
-    throw new Error(
-      `File not found: ${filePath}. Searched in Downloads folder: ${path.join(
-        os.homedir(),
-        "Downloads"
-      )}`
-    );
+    throw new Error(`File not found: ${filePath}. Searched in your files folder: ${userDir}`);
   }
 
   // Check if it's a directory
@@ -430,15 +523,17 @@ export async function readFile(filePath: string): Promise<{
     const s3Bucket = process.env.S3_BUCKET || 'study-mcp-notes';
     const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
 
-    let s3Key = isS3Key ? filePath.replace('s3://', '').replace(`${s3Bucket}/`, '') : '';
+    const userId = getUserId();
+    // User-supplied keys must be under this user's own prefix.
+    let s3Key = isS3Key ? resolveUserS3Key(filePath, userId, s3Bucket) : '';
 
-    // If UUID, look up the S3 key from the notes table
+    // If UUID, look up the S3 key from the notes table (scoped to this user —
+    // the service-role key bypasses RLS, so the user_id filter is mandatory).
     if (isUUID) {
-      const userId = getUserId();
       const sbUrl = process.env.SUPABASE_URL;
       const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
       if (sbUrl && sbKey) {
-        const resp = await fetch(`${sbUrl}/rest/v1/notes?id=eq.${filePath}&select=s3_key,title&limit=1`, {
+        const resp = await fetch(`${sbUrl}/rest/v1/notes?id=eq.${filePath}&user_id=eq.${encodeURIComponent(userId)}&select=s3_key,title&limit=1`, {
           headers: { 'apikey': sbKey, 'Authorization': `Bearer ${sbKey}` },
         });
         if (resp.ok) {

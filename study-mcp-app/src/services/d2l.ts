@@ -1,5 +1,11 @@
 import { apiClient } from '../config/api';
 
+// Health lives at the server root, not under BASE_URL (which ends in /api)
+const HEALTH_URL = 'https://horizon.hamzaammar.ca/health';
+
+// NOTE: apiClient's BASE_URL already ends in /api, so paths here must NOT start with /api.
+// apiClient throws ApiError ({ status, data }) for non-2xx responses.
+
 export interface D2LStatus {
   connected: boolean;
   syncing: boolean;
@@ -12,8 +18,14 @@ export class D2LService {
    */
   private async checkBackendHealth(): Promise<boolean> {
     try {
-      const response = await apiClient.get('/health', { timeout: 5000 });
-      return response.status === 200;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch(HEALTH_URL, { signal: controller.signal });
+        return response.ok;
+      } finally {
+        clearTimeout(timer);
+      }
     } catch (error) {
       console.error('[D2L] Backend health check failed:', error);
       return false;
@@ -25,7 +37,7 @@ export class D2LService {
    */
   async getStatus(): Promise<D2LStatus> {
     try {
-      const response = await apiClient.get<D2LStatus>('/api/d2l/status');
+      const response = await apiClient.get<D2LStatus>('/d2l/status');
       return {
         connected: response.data.connected || false,
         syncing: false,
@@ -54,25 +66,20 @@ export class D2LService {
           (process.env.EXPO_PUBLIC_API_BASE_URL || 'https://horizon.hamzaammar.ca'));
       }
 
-      const response = await apiClient.post('/api/d2l/token', credentials, {
-        timeout: 30000,
-      });
-      if (response.status !== 200) {
-        throw new Error(response.data?.error || 'Failed to store token');
-      }
+      await apiClient.post('/d2l/token', credentials);
       console.log('[D2L] Token stored successfully');
     } catch (error: any) {
       console.error('[D2L] Token storage error:', error);
-      if (error.code === 'ECONNREFUSED' || error.message?.includes('Cannot reach backend')) {
+      if (error.message?.includes('Cannot reach backend')) {
         throw error;
       }
-      if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+      if (error.message?.includes('timeout')) {
         throw new Error('Connection timeout. Please try again.');
       }
-      if (error.response?.status === 400) {
-        throw new Error(error.response.data?.error || 'Invalid or expired token');
+      if (error.status === 400) {
+        throw new Error(error.data?.error || 'Invalid or expired token');
       }
-      const errorMessage = error.response?.data?.error || error.message || 'Failed to store token';
+      const errorMessage = error.data?.error || error.message || 'Failed to store token';
       throw new Error(errorMessage);
     }
   }
@@ -90,25 +97,20 @@ export class D2LService {
           (process.env.EXPO_PUBLIC_API_BASE_URL || 'https://horizon.hamzaammar.ca'));
       }
 
-      const response = await apiClient.post('/api/d2l/connect-cookie', payload, {
-        timeout: 30000,
-      });
-      if (response.status !== 200) {
-        throw new Error(response.data?.error || 'Failed to store cookies');
-      }
+      await apiClient.post('/d2l/connect-cookie', payload);
       console.log('[D2L] Cookies stored successfully');
     } catch (error: any) {
       console.error('[D2L] Cookie storage error:', error);
-      if (error.code === 'ECONNREFUSED' || error.message?.includes('Cannot reach backend')) {
+      if (error.message?.includes('Cannot reach backend')) {
         throw error;
       }
-      if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+      if (error.message?.includes('timeout')) {
         throw new Error('Connection timeout. Please try again.');
       }
-      if (error.response?.status === 400) {
-        throw new Error(error.response.data?.error || 'Invalid or expired cookies');
+      if (error.status === 400) {
+        throw new Error(error.data?.error || 'Invalid or expired cookies');
       }
-      const errorMessage = error.response?.data?.error || error.message || 'Failed to store cookies';
+      const errorMessage = error.data?.error || error.message || 'Failed to store cookies';
       throw new Error(errorMessage);
     }
   }
@@ -127,29 +129,23 @@ export class D2LService {
           (process.env.EXPO_PUBLIC_API_BASE_URL || 'https://horizon.hamzaammar.ca'));
       }
 
-      // Set a longer timeout for authentication (90 seconds - Playwright can take a while)
-      const response = await apiClient.post('/api/d2l/connect', credentials, {
-        timeout: 90000, // 90 seconds
-      });
-      if (response.status !== 200) {
-        throw new Error(response.data?.error || 'Failed to connect to D2L');
-      }
+      await apiClient.post('/d2l/connect', credentials);
       console.log('[D2L] Connection successful');
     } catch (error: any) {
       console.error('[D2L] Connection error:', error);
-      if (error.code === 'ECONNREFUSED' || error.message?.includes('Cannot reach backend')) {
+      if (error.message?.includes('Cannot reach backend')) {
         throw error; // Re-throw our custom error
       }
-      if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+      if (error.message?.includes('timeout')) {
         throw new Error('Connection timeout. The authentication process took too long. Please try again.');
       }
-      if (error.response?.status === 404) {
+      if (error.status === 404) {
         throw new Error('API endpoint not found. Make sure the backend server is running and the API base URL is correct.');
       }
-      if (error.response?.status === 401) {
+      if (error.status === 401) {
         throw new Error('Invalid D2L credentials. Please check your username and password.');
       }
-      const errorMessage = error.response?.data?.error || error.message || 'Failed to connect to D2L';
+      const errorMessage = error.data?.error || error.message || 'Failed to connect to D2L';
       throw new Error(errorMessage);
     }
   }
@@ -159,37 +155,34 @@ export class D2LService {
    */
   async syncAll(): Promise<void> {
     try {
-      const response = await apiClient.post('/api/d2l/sync');
-      if (response.status !== 200) {
-        throw new Error(response.data?.message || response.data?.error || 'Failed to sync D2L data');
-      }
+      await apiClient.post('/d2l/sync');
     } catch (error: any) {
       console.error('[D2L] Sync error:', error);
-      console.error('[D2L] Sync error response:', error.response?.data);
-      console.error('[D2L] Sync error status:', error.response?.status);
-      
+      console.error('[D2L] Sync error response:', error.data);
+      console.error('[D2L] Sync error status:', error.status);
+
       // Get detailed error message
-      const errorMessage = error.response?.data?.message || 
-                          error.response?.data?.error || 
-                          error.message || 
+      const errorMessage = error.data?.message ||
+                          error.data?.error ||
+                          error.message ||
                           'Failed to sync D2L data';
-      
+
       // Include status code and check for specific error types
-      if (error.response?.status === 401) {
-        if (error.response?.data?.error === 'REAUTH_REQUIRED' || error.response?.data?.error === 'AUTH_REQUIRED') {
+      if (error.status === 401) {
+        if (error.data?.error === 'REAUTH_REQUIRED' || error.data?.error === 'AUTH_REQUIRED') {
           throw new Error('Your D2L session has expired. Please sign in again using the WebView.');
         }
         throw new Error(`Authentication failed: ${errorMessage}`);
       }
-      
-      if (error.response?.status === 403) {
+
+      if (error.status === 403) {
         throw new Error(`Access forbidden: ${errorMessage}. Please check your D2L connection.`);
       }
-      
-      const fullErrorMessage = error.response?.status 
-        ? `[${error.response.status}] ${errorMessage}`
+
+      const fullErrorMessage = error.status
+        ? `[${error.status}] ${errorMessage}`
         : errorMessage;
-      
+
       throw new Error(fullErrorMessage);
     }
   }
@@ -199,11 +192,11 @@ export class D2LService {
    */
   async getCourses(): Promise<any[]> {
     try {
-      const response = await apiClient.get('/api/d2l/courses');
+      const response = await apiClient.get('/d2l/courses');
       return response.data.courses || [];
     } catch (error: any) {
       console.error('Error fetching courses:', error);
-      throw new Error(error.response?.data?.error || 'Failed to fetch courses');
+      throw new Error(error.data?.message || error.data?.error || 'Failed to fetch courses');
     }
   }
 
@@ -212,11 +205,11 @@ export class D2LService {
    */
   async getAnnouncements(courseId: string): Promise<any[]> {
     try {
-      const response = await apiClient.get(`/api/d2l/courses/${courseId}/announcements`);
+      const response = await apiClient.get(`/d2l/courses/${courseId}/announcements`);
       return response.data.announcements || [];
     } catch (error: any) {
       console.error('Error fetching announcements:', error);
-      throw new Error(error.response?.data?.error || 'Failed to fetch announcements');
+      throw new Error(error.data?.message || error.data?.error || 'Failed to fetch announcements');
     }
   }
 
@@ -225,11 +218,11 @@ export class D2LService {
    */
   async getAssignments(courseId: string): Promise<any[]> {
     try {
-      const response = await apiClient.get(`/api/d2l/courses/${courseId}/assignments`);
+      const response = await apiClient.get(`/d2l/courses/${courseId}/assignments`);
       return response.data.assignments || [];
     } catch (error: any) {
       console.error('Error fetching assignments:', error);
-      throw new Error(error.response?.data?.error || 'Failed to fetch assignments');
+      throw new Error(error.data?.message || error.data?.error || 'Failed to fetch assignments');
     }
   }
 
@@ -238,11 +231,24 @@ export class D2LService {
    */
   async getGrades(courseId: string): Promise<any[]> {
     try {
-      const response = await apiClient.get(`/api/d2l/courses/${courseId}/grades`);
+      const response = await apiClient.get(`/d2l/courses/${courseId}/grades`);
       return response.data.grades || [];
     } catch (error: any) {
       console.error('Error fetching grades:', error);
-      throw new Error(error.response?.data?.error || 'Failed to fetch grades');
+      throw new Error(error.data?.message || error.data?.error || 'Failed to fetch grades');
+    }
+  }
+
+  /**
+   * Get course content (table of contents) — GET /api/d2l/courses/:courseId/content -> { modules }
+   */
+  async getContent(courseId: string): Promise<any[]> {
+    try {
+      const response = await apiClient.get(`/d2l/courses/${courseId}/content`);
+      return response.data.modules || [];
+    } catch (error: any) {
+      console.error('Error fetching course content:', error);
+      throw new Error(error.data?.message || error.data?.error || 'Failed to fetch course content');
     }
   }
 }

@@ -7,6 +7,7 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   RefreshControl,
+  Linking,
 } from 'react-native';
 import { useRoute, useNavigation } from '@react-navigation/native';
 import { AntDesign } from '@expo/vector-icons';
@@ -466,7 +467,14 @@ export default function CourseDetailScreen() {
                     key={topic.id || j}
                     style={styles.topicItem}
                     onPress={() => {
-                      if (topic.url) {
+                      if (!topic.url) return;
+                      // Absolute URLs off D2L (instructor-added external links) open in the
+                      // browser — the backend file proxy only serves the user's D2L host.
+                      if (/^https?:\/\//i.test(topic.url) && topic.type === 'Link') {
+                        Linking.openURL(topic.url).catch(() => {});
+                        return;
+                      }
+                      {
                         (navigation.navigate as any)('PDFViewer', {
                           title: topic.title || topic.name || 'Document',
                           courseId: course.id,

@@ -6,6 +6,7 @@
 import { Router, Request, Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { saveNotionToken } from "../study/notionAuth.js";
+import { verifyNotionState } from "./oauth/crypto.js";
 
 const router = Router();
 
@@ -159,7 +160,7 @@ router.get("/notion/callback", async (req: Request, res: Response) => {
   const { code, state, error: oauthError } = req.query as Record<string, string>;
 
   if (oauthError) {
-    res.status(400).send(`Notion OAuth error: ${oauthError}`);
+    res.status(400).type("text/plain").send(`Notion OAuth error: ${oauthError}`);
     return;
   }
 
@@ -168,17 +169,11 @@ router.get("/notion/callback", async (req: Request, res: Response) => {
     return;
   }
 
-  // Decode and validate state
-  let userId: string;
-  try {
-    const decoded = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
-    userId = decoded.userId;
-    const age = Date.now() - (decoded.ts ?? 0);
-    if (!userId || age > 10 * 60 * 1000) {
-      throw new Error("state expired or invalid");
-    }
-  } catch {
-    res.status(400).send("Invalid state parameter. Please restart the connection flow.");
+  // Verify the HMAC-signed state (issued by connect_notion) — it names the user
+  // whose account the token is saved to, so it must not be forgeable.
+  const userId = verifyNotionState(state);
+  if (!userId) {
+    res.status(400).send("Invalid or expired state parameter. Please restart the connection flow.");
     return;
   }
 
@@ -226,7 +221,7 @@ router.get("/notion/callback", async (req: Request, res: Response) => {
     res.redirect(`${onboardBase}?notion=connected`);
   } catch (e: any) {
     console.error("[NOTION_CALLBACK] Error:", e);
-    res.status(500).send(`Internal error: ${e.message}`);
+    res.status(500).type("text/plain").send("Internal error while connecting Notion. Please try again.");
   }
 });
 

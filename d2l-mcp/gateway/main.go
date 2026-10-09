@@ -69,7 +69,7 @@ func main() {
 	// chi router doesn't handle WS upgrades — must attach to the raw server
 	nodeURL := nodeWorkerURL()
 	srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Header.Get("Upgrade") == "websocket" {
+		if handlers.IsVNCWebSocket(req) {
 			handlers.ProxyWebSocket(nodeURL, w, req)
 			return
 		}

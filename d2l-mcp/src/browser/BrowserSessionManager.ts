@@ -19,6 +19,8 @@
 import { chromium, Browser, BrowserContext, Page } from "playwright";
 import { spawn, ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
+import { existsSync } from "fs";
+import net from "net";
 import path from "path";
 import fs from "fs/promises";
 import os from "os";
@@ -30,10 +32,14 @@ const SESSIONS_BASE = process.env.SESSIONS_PATH || "/tmp/sessions";
 const SESSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const VNC_BASE_PORT = 5900;
 const WS_BASE_PORT = 6080;
+const DISPLAY_BASE = 10;
 
-// Port pool — supports up to 50 concurrent auth sessions
+// Port/display pool — supports up to 50 concurrent auth sessions.
+// Resources are only returned to the pool once the owning process has exited,
+// so a new session can never bind to (or be proxied to) a dying predecessor.
 const MAX_SESSIONS = 50;
 const usedPorts = new Set<number>();
+const usedDisplays = new Set<number>();
 
 function allocatePort(base: number): number {
   for (let i = 0; i < MAX_SESSIONS; i++) {
@@ -48,6 +54,51 @@ function allocatePort(base: number): number {
 
 function releasePort(port: number) {
   usedPorts.delete(port);
+}
+
+/** Pick a display number that is neither in use by us nor held by a stale X server lock/socket. */
+function allocateDisplay(): number {
+  for (let i = 0; i < MAX_SESSIONS; i++) {
+    const d = DISPLAY_BASE + i;
+    if (usedDisplays.has(d)) continue;
+    if (existsSync(`/tmp/.X11-unix/X${d}`) || existsSync(`/tmp/.X${d}-lock`)) continue;
+    usedDisplays.add(d);
+    return d;
+  }
+  throw new Error("No available X displays for new browser session");
+}
+
+/** SIGTERM a child, escalate to SIGKILL after `ms`, resolve once it has exited. */
+function killAndWait(proc: ChildProcess | undefined, ms = 2000): Promise<void> {
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch {}
+      // Give the kernel a moment to reap; don't hang forever on a zombie.
+      setTimeout(resolve, 200);
+    }, ms);
+    proc.once("exit", done);
+    try { proc.kill("SIGTERM"); } catch { done(); }
+  });
+}
+
+/** Resolve once something is accepting TCP connections on localhost:port. */
+async function waitForPort(port: number, timeoutMs: number, proc?: ChildProcess): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (proc && proc.exitCode !== null) {
+      throw new Error(`process for port ${port} exited early with code ${proc.exitCode}`);
+    }
+    const ok = await new Promise<boolean>((resolve) => {
+      const sock = net.connect({ port, host: "127.0.0.1" });
+      sock.once("connect", () => { sock.destroy(); resolve(true); });
+      sock.once("error", () => { sock.destroy(); resolve(false); });
+    });
+    if (ok) return;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  throw new Error(`port ${port} not ready within ${timeoutMs}ms`);
 }
 
 export interface BrowserSession {
@@ -67,6 +118,8 @@ export interface BrowserSession {
   websockifyProc: ChildProcess;
   timeoutHandle: NodeJS.Timeout;
   status: "waiting" | "authenticated" | "failed" | "closed";
+  /** True once teardown has started. Closed sessions stay visible for status polling but must never be proxied. */
+  closed: boolean;
   createdAt: number;
 }
 
@@ -74,21 +127,24 @@ const activeSessions = new Map<string, BrowserSession>();
 const userSessionMap = new Map<string, string>(); // userId → sessionId
 
 /** Wait until Xvfb's Unix socket exists (means it's ready to accept connections). */
-async function waitForXvfb(displayNum: number, timeoutMs = 5000): Promise<void> {
+async function waitForXvfb(displayNum: number, proc: ChildProcess, timeoutMs = 5000): Promise<void> {
   const socketPath = `/tmp/.X11-unix/X${displayNum}`;
-  const { accessSync } = await import("fs");
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    try {
-      accessSync(socketPath);
+    if (proc.exitCode !== null) {
+      throw new Error(`Xvfb :${displayNum} exited early with code ${proc.exitCode}`);
+    }
+    if (existsSync(socketPath)) {
       console.log(`[XVFB] display :${displayNum} ready`);
       return;
-    } catch {
-      await new Promise(r => setTimeout(r, 100));
     }
+    await new Promise(r => setTimeout(r, 50));
   }
   throw new Error(`Xvfb display :${displayNum} did not start within ${timeoutMs}ms`);
 }
+
+/** Public path of the noVNC client, served directly by Express (see d2lAuthRoutes). */
+export const NOVNC_ASSET_PATH = "/vnc/assets";
 
 // S3 storage state helpers are imported from utils/s3Storage.ts
 // (loadStorageStateFromS3, saveStorageStateToS3) — encrypted + TTL-aware
@@ -106,79 +162,125 @@ export class BrowserSessionManager {
     apiHost: string | undefined,
     sessionType: 'd2l' | 'outline' | 'crowdmark',
   ): Promise<BrowserSession> {
+    const t0 = Date.now();
     // Close any existing session for this user
     const existingId = userSessionMap.get(userId);
     if (existingId) await BrowserSessionManager.closeSession(existingId);
 
     const sessionId = randomUUID();
-    const displayNum = 10 + activeSessions.size;
+    const displayNum = allocateDisplay();
     const vncPort = allocatePort(VNC_BASE_PORT);
     const wsPort = allocatePort(WS_BASE_PORT);
 
-    // 1. Start Xvfb virtual display
-    const xvfbProc = spawn("Xvfb", [
-      `:${displayNum}`, "-screen", "0", "1280x800x24", "-ac",
-    ], { stdio: ["ignore", "pipe", "pipe"] });
-    xvfbProc.stdout?.on("data", (d: Buffer) => console.log(`[XVFB] ${d.toString().trim()}`));
-    xvfbProc.stderr?.on("data", (d: Buffer) => console.error(`[XVFB] ${d.toString().trim()}`));
-    xvfbProc.on("exit", (code) => console.error(`[XVFB :${displayNum}] exited with code ${code}`));
-    await waitForXvfb(displayNum, 5000);
+    let xvfbProc: ChildProcess | undefined;
+    let x11vncProc: ChildProcess | undefined;
+    let websockifyProc: ChildProcess | undefined;
+    let browser: Browser | undefined;
 
-    // 2. Start x11vnc
-    const x11vncProc = spawn("x11vnc", [
-      "-display", `:${displayNum}`, "-rfbport", String(vncPort),
-      "-nopw", "-shared", "-forever", "-quiet",
-    ], { stdio: ["ignore", "ignore", "pipe"] });
-    x11vncProc.stderr?.on("data", (d: Buffer) => console.error(`[X11VNC] ${d.toString().trim()}`));
-    x11vncProc.on("exit", (code) => console.error(`[X11VNC] exited with code ${code}`));
-    await new Promise(r => setTimeout(r, 300));
-
-    // 3. Start websockify (noVNC WebSocket proxy)
-    const websockifyProc = spawn("websockify", [
-      "--web", "/usr/share/novnc", String(wsPort), `localhost:${vncPort}`,
-    ], { stdio: "ignore" });
-    await new Promise(r => setTimeout(r, 300));
-
-    // 4. Load saved storage state from S3 (service-specific key — skips Duo if still valid)
-    const storageStatePath = await loadStorageStateFromS3(userId, sessionType);
-
-    // 5. Launch Playwright browser
-    const browser = await chromium.launch({
-      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium",
-      headless: false,
-      env: { ...process.env, DISPLAY: `:${displayNum}` },
-      args: [
-        "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-        `--display=:${displayNum}`, "--window-size=1280,800", "--window-position=0,0",
-      ],
+    // Fetch saved storage state from S3 concurrently with display startup
+    // (service-specific key — skips Duo if still valid).
+    const storageStatePromise = loadStorageStateFromS3(userId, sessionType).catch((e) => {
+      console.error(`[VNC] Failed to load storage state for user ${userId}: ${e?.message}`);
+      return undefined;
     });
-    const context = await browser.newContext({
-      storageState: storageStatePath,
-      viewport: { width: 1280, height: 800 },
-    });
-    const page = await context.newPage();
-    await page.goto(targetUrl);
 
-    // 6. Session timeout
-    const timeoutHandle = setTimeout(async () => {
-      console.error(`[VNC] Session ${sessionId} timed out for user ${userId}`);
-      const s = activeSessions.get(sessionId);
-      if (s) { s.status = "failed"; await BrowserSessionManager.closeSession(sessionId); }
-    }, SESSION_TIMEOUT_MS);
+    try {
+      // 1. Start Xvfb virtual display
+      xvfbProc = spawn("Xvfb", [
+        `:${displayNum}`, "-screen", "0", "1280x800x24", "-ac", "-nolisten", "tcp",
+      ], { stdio: ["ignore", "pipe", "pipe"] });
+      xvfbProc.stdout?.on("data", (d: Buffer) => console.log(`[XVFB] ${d.toString().trim()}`));
+      xvfbProc.stderr?.on("data", (d: Buffer) => console.error(`[XVFB] ${d.toString().trim()}`));
+      xvfbProc.on("exit", (code) => console.error(`[XVFB :${displayNum}] exited with code ${code}`));
+      await waitForXvfb(displayNum, xvfbProc, 5000);
 
-    const session: BrowserSession = {
-      sessionId, userId, d2lHost: targetUrl, sessionType,
-      vncUrl: `https://${apiHost || process.env.API_HOST || "localhost"}/vnc/${sessionId}/vnc.html?autoconnect=true&reconnect=true&path=vnc/${sessionId}/websockify`,
-      wsPort, vncPort, displayNum,
-      browser, context, page,
-      xvfbProc, x11vncProc, websockifyProc,
-      timeoutHandle, status: "waiting", createdAt: Date.now(),
-    };
+      // 2. Launch the browser while x11vnc + websockify come up.
+      const browserPromise = chromium.launch({
+        executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium",
+        headless: false,
+        env: { ...process.env, DISPLAY: `:${displayNum}` },
+        args: [
+          "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+          "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+          "--disable-background-networking", "--disable-sync", "--disable-extensions",
+          `--display=:${displayNum}`, "--window-size=1280,800", "--window-position=0,0",
+        ],
+      });
+      browserPromise.catch(() => {}); // surfaced via the await below
 
-    activeSessions.set(sessionId, session);
-    userSessionMap.set(userId, sessionId);
-    console.error(`[VNC] Started ${sessionType} session ${sessionId} for user ${userId} on display :${displayNum}, wsPort ${wsPort}`);
-    return session;
+      // 3. Start x11vnc (localhost only — reached through websockify)
+      x11vncProc = spawn("x11vnc", [
+        "-display", `:${displayNum}`, "-rfbport", String(vncPort), "-localhost",
+        "-nopw", "-shared", "-forever", "-quiet",
+      ], { stdio: ["ignore", "ignore", "pipe"] });
+      x11vncProc.stderr?.on("data", (d: Buffer) => console.error(`[X11VNC] ${d.toString().trim()}`));
+      x11vncProc.on("exit", (code) => console.error(`[X11VNC :${displayNum}] exited with code ${code}`));
+      await waitForPort(vncPort, 10_000, x11vncProc);
+
+      // 4. Start websockify (WebSocket ⇄ VNC bridge). The noVNC client itself is
+      //    served as static files by Express, so websockify only carries the stream.
+      // --heartbeat: WS pings keep an idle stream alive past the ALB's 60s idle timeout.
+      websockifyProc = spawn("websockify", ["--heartbeat", "25", String(wsPort), `localhost:${vncPort}`], {
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      websockifyProc.stderr?.on("data", (d: Buffer) => {
+        const line = d.toString().trim();
+        // websockify logs every connection; only surface problems
+        if (/error|exception|traceback|refused/i.test(line)) console.error(`[WEBSOCKIFY] ${line}`);
+      });
+      websockifyProc.on("exit", (code) => console.error(`[WEBSOCKIFY :${wsPort}] exited with code ${code}`));
+      await waitForPort(wsPort, 10_000, websockifyProc);
+
+      // 5. Browser context with restored state
+      browser = await browserPromise;
+      const storageStatePath = await storageStatePromise;
+      const context = await browser.newContext({
+        storageState: storageStatePath,
+        viewport: { width: 1280, height: 800 },
+      });
+      if (storageStatePath) await fs.unlink(storageStatePath).catch(() => {});
+      const page = await context.newPage();
+
+      // Navigate in the background — the user can watch the page load over VNC.
+      // Awaiting here made the start request block on the full SSO redirect chain.
+      page.goto(targetUrl, { timeout: 60_000 }).catch(async (err) => {
+        console.error(`[VNC] Initial navigation to ${targetUrl} failed for session ${sessionId}: ${err?.message}`);
+        if (!page.isClosed()) await page.goto(targetUrl, { timeout: 60_000 }).catch(() => {});
+      });
+
+      // 6. Session timeout
+      const timeoutHandle = setTimeout(async () => {
+        console.error(`[VNC] Session ${sessionId} timed out for user ${userId}`);
+        const s = activeSessions.get(sessionId);
+        if (s) { s.status = "failed"; await BrowserSessionManager.closeSession(sessionId); }
+      }, SESSION_TIMEOUT_MS);
+
+      const host = apiHost || process.env.API_HOST || "localhost";
+      const session: BrowserSession = {
+        sessionId, userId, d2lHost: targetUrl, sessionType,
+        vncUrl: `https://${host}${NOVNC_ASSET_PATH}/vnc.html?autoconnect=true&reconnect=true&resize=scale&path=vnc/${sessionId}/websockify`,
+        wsPort, vncPort, displayNum,
+        browser, context, page,
+        xvfbProc, x11vncProc, websockifyProc,
+        timeoutHandle, status: "waiting", closed: false, createdAt: Date.now(),
+      };
+
+      activeSessions.set(sessionId, session);
+      userSessionMap.set(userId, sessionId);
+      console.error(`[VNC] Started ${sessionType} session ${sessionId} for user ${userId} on display :${displayNum}, wsPort ${wsPort} in ${Date.now() - t0}ms`);
+      return session;
+    } catch (err) {
+      console.error(`[VNC] Failed to start ${sessionType} session for user ${userId} after ${Date.now() - t0}ms:`, err);
+      try { await browser?.close(); } catch {}
+      await Promise.all([killAndWait(websockifyProc), killAndWait(x11vncProc)]);
+      await killAndWait(xvfbProc);
+      releasePort(vncPort);
+      releasePort(wsPort);
+      usedDisplays.delete(displayNum);
+      const statePath = await storageStatePromise;
+      if (statePath) await fs.unlink(statePath).catch(() => {});
+      throw err;
+    }
   }
 
   /**
@@ -631,25 +733,36 @@ export class BrowserSessionManager {
 
   static async closeSession(sessionId: string) {
     const session = activeSessions.get(sessionId);
-    if (!session) return;
+    if (!session || session.closed) return;
+    session.closed = true;
 
     clearTimeout(session.timeoutHandle);
 
     try { await session.browser.close(); } catch {}
-    try { session.websockifyProc.kill("SIGTERM"); } catch {}
-    try { session.x11vncProc.kill("SIGTERM"); } catch {}
-    try { session.xvfbProc.kill("SIGTERM"); } catch {}
+    await Promise.all([killAndWait(session.websockifyProc), killAndWait(session.x11vncProc)]);
+    await killAndWait(session.xvfbProc);
 
+    // Only now that every process has exited can the resources be reused.
     releasePort(session.vncPort);
     releasePort(session.wsPort);
+    usedDisplays.delete(session.displayNum);
 
     // Keep in map 60s so status poll can see final authenticated state
     setTimeout(() => {
       activeSessions.delete(sessionId);
-      userSessionMap.delete(session.userId);
+      // The user may have started a newer session since — don't clobber its mapping.
+      if (userSessionMap.get(session.userId) === sessionId) {
+        userSessionMap.delete(session.userId);
+      }
     }, 60_000);
 
     console.error(`[VNC] Closed session ${sessionId} for user ${session.userId}`);
+  }
+
+  /** Session that is still running and may be proxied to (not merely retained for status polling). */
+  static getLiveSession(sessionId: string): BrowserSession | undefined {
+    const s = activeSessions.get(sessionId);
+    return s && !s.closed ? s : undefined;
   }
 
   static async closeAll() {

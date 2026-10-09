@@ -22,4 +22,4 @@ create index if not exists idx_course_outlines_user on public.course_outlines(us
 create index if not exists idx_course_outlines_course on public.course_outlines(course_code);
 
 
-alter table public.course_outlines disable row level security;
+alter table public.course_outlines enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it

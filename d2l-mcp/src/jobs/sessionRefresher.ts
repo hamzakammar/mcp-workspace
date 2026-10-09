@@ -523,7 +523,14 @@ export async function refreshD2LSession(userId: string): Promise<RefreshResult> 
 export function startSessionRefreshScheduler(): void {
   console.error("[REFRESH] Session refresh scheduler started (interval: 30min, threshold: 12h)");
 
+  let cycleInFlight = false;
   const runRefreshCycle = async () => {
+    // A cycle launches headless Chromium per user and can outlast the interval.
+    if (cycleInFlight) {
+      console.error("[REFRESH] Previous cycle still running — skipping");
+      return;
+    }
+    cycleInFlight = true;
     try {
       const cutoff = new Date(Date.now() - STALE_THRESHOLD_MS).toISOString();
 
@@ -553,6 +560,14 @@ export function startSessionRefreshScheduler(): void {
         const result = await refreshD2LSession(user.user_id);
 
         if (!result.success && (result.reason === "duo_required" || result.reason === "no_stored_state")) {
+          // Persist the flag. Without it the stale-user query above (duo_required_at IS NULL)
+          // picked the same user up every 30 min forever — relaunching Chromium against
+          // ADFS/Duo and re-sending this push each time. VNC re-auth clears it.
+          const { error: markErr } = await supabase.from("user_credentials")
+            .update({ duo_required_at: new Date().toISOString() })
+            .eq("user_id", user.user_id).eq("service", "d2l");
+          if (markErr) console.error(`[REFRESH] Failed to mark duo_required for user ${user.user_id}:`, markErr.message);
+
           sendPushToUser(
             user.user_id,
             "D2L Session Expired",
@@ -597,6 +612,8 @@ export function startSessionRefreshScheduler(): void {
       }
     } catch (err: any) {
       console.error("[REFRESH] Scheduler cycle error:", err?.message);
+    } finally {
+      cycleInFlight = false;
     }
   };
 

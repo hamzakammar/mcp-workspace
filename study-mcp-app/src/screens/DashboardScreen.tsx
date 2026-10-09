@@ -92,21 +92,21 @@ export default function DashboardScreen() {
     } catch (error: any) {
       console.error('Error loading dashboard:', error);
       // Show user-friendly error message
-      if (error.response?.status === 401) {
+      if (error.status === 401) {
         // Unauthorized - token issue
-        const errorMsg = error.response?.data?.error || 'Authentication failed';
+        const errorMsg = error.data?.error || 'Authentication failed';
         console.warn('Unauthorized (401):', errorMsg);
         Alert.alert(
           'Authentication Error',
           errorMsg + '\n\nPlease try logging out and logging back in.',
           [{ text: 'OK' }]
         );
-      } else if (error.response?.status === 502 || error.response?.status === 504) {
+      } else if (error.status === 502 || error.status === 504) {
         // Backend not available or timeout
         console.warn('Backend server not available or timed out. Make sure the backend is running.');
-      } else if (error.response?.status === 503) {
+      } else if (error.status === 503) {
         // Service unavailable - likely database issue
-        const errorMsg = error.response?.data?.message || error.response?.data?.error || 'Database connection issue';
+        const errorMsg = error.data?.message || error.data?.error || 'Database connection issue';
         console.warn('Service unavailable (503):', errorMsg);
         Alert.alert(
           'Service Unavailable',

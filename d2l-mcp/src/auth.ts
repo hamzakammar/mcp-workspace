@@ -212,7 +212,18 @@ export async function isDuoRequired(userId: string): Promise<boolean> {
  *      ADFS accepts the credentials without Duo on a fresh browser session.
  * Returns the new token JSON string on success, null if re-login cannot complete headlessly.
  */
-async function attemptSilentRelogin(userId: string): Promise<string | null> {
+const silentReloginInFlight = new Map<string, Promise<string | null>>();
+
+/** Single-flight wrapper: concurrent callers for one user share one browser login. */
+function attemptSilentRelogin(userId: string): Promise<string | null> {
+  const existing = silentReloginInFlight.get(userId);
+  if (existing) return existing;
+  const run = attemptSilentReloginOnce(userId).finally(() => silentReloginInFlight.delete(userId));
+  silentReloginInFlight.set(userId, run);
+  return run;
+}
+
+async function attemptSilentReloginOnce(userId: string): Promise<string | null> {
   // Hard stop: if duo_required_at is already set, launching a headless browser
   // will hit the ADFS Duo wall and send another push notification. Bail immediately.
   const alreadyFlagged = await isDuoRequired(userId).catch(() => false);
@@ -1315,15 +1326,30 @@ export async function refreshTokenIfNeeded(userId?: string): Promise<string> {
  * scheduled refresh had a chance to run).
  * Returns the new token on success, null if re-login cannot complete headlessly.
  */
+// One in-flight re-login per user. Tools fan out one D2L request per course, so
+// an expired session produced N concurrent 403s → N headless Chromium logins.
+const forceRefreshInFlight = new Map<string, Promise<string | null>>();
+
 export async function forceRefreshToken(userId: string): Promise<string | null> {
-  clearTokenCache(userId);
-  userValidatedInSession.delete(userId);
-  console.error(`[AUTH] Force-refreshing token for user ${userId} (session died mid-use)`);
-  const token = await attemptSilentRelogin(userId);
-  if (!token) {
-    await markDuoRequired(userId);
+  const existing = forceRefreshInFlight.get(userId);
+  if (existing) return existing;
+
+  const run = (async () => {
+    clearTokenCache(userId);
+    userValidatedInSession.delete(userId);
+    console.error(`[AUTH] Force-refreshing token for user ${userId} (session died mid-use)`);
+    const token = await attemptSilentRelogin(userId);
+    if (!token) {
+      await markDuoRequired(userId);
+    }
+    return token;
+  })();
+  forceRefreshInFlight.set(userId, run);
+  try {
+    return await run;
+  } finally {
+    forceRefreshInFlight.delete(userId);
   }
-  return token;
 }
 
 export function clearTokenCache(userId?: string): void {

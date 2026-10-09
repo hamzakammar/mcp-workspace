@@ -17,6 +17,23 @@ import { encryptPassword } from "../utils/kms.js";
 import { logCredentialAccess } from "../utils/auditLog.js";
 import { deleteAllUserData } from "../utils/deleteUserData.js";
 
+
+/**
+ * Resolve a D2L file URL (absolute or host-relative) and require it to be on
+ * the user's own D2L host — the request carries their D2L session cookies, so
+ * an external link from course content must never be fetched with them.
+ */
+function resolveD2LFileUrl(fileUrl: string, d2lHost: string): string | null {
+  const host = String(d2lHost || "").replace(/^https?:\/\//i, "").replace(/\/.*$/, "").toLowerCase();
+  try {
+    const u = new URL(fileUrl, `https://${host}`);
+    if (u.protocol !== "https:" || u.host.toLowerCase() !== host) return null;
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
 const router = Router();
 const rawPdfUpload = express.raw({ type: "*/*", limit: "60mb" });
 
@@ -1463,8 +1480,11 @@ router.get("/d2l/courses/:courseId/file", async (req: Request, res: Response) =>
       return;
     }
 
-    // Build full URL if relative
-    const fullUrl = fileUrl.startsWith("http") ? fileUrl : `https://${creds.host}${fileUrl}`;
+    const fullUrl = resolveD2LFileUrl(fileUrl, creds.host);
+    if (!fullUrl) {
+      res.status(400).json({ error: "Only files hosted on your D2L site can be proxied. Open external links directly." });
+      return;
+    }
 
     // Fetch with session cookies
     const { getToken } = await import("../auth.js");
@@ -1479,7 +1499,8 @@ router.get("/d2l/courses/:courseId/file", async (req: Request, res: Response) =>
 
     const fetchResp = await fetch(fullUrl, {
       headers: { Cookie: cookieHeader },
-      redirect: "follow",
+      redirect: "follow", // undici drops Cookie on cross-origin redirects
+      signal: AbortSignal.timeout(60_000),
     });
 
     if (!fetchResp.ok) {
@@ -1541,7 +1562,11 @@ router.post("/d2l/courses/:courseId/file/save", async (req: Request, res: Respon
       return;
     }
 
-    const fullUrl = fileUrl.startsWith("http") ? fileUrl : `https://${creds.host}${fileUrl}`;
+    const fullUrl = resolveD2LFileUrl(fileUrl, creds.host);
+    if (!fullUrl) {
+      res.status(400).json({ error: "Only files hosted on your D2L site can be proxied. Open external links directly." });
+      return;
+    }
 
     const { getToken } = await import("../auth.js");
     const token2 = await getToken(userId);
@@ -1557,7 +1582,8 @@ router.post("/d2l/courses/:courseId/file/save", async (req: Request, res: Respon
     console.error(`[API] Downloading D2L file: ${fullUrl}`);
     const fetchResp = await fetch(fullUrl, {
       headers: { Cookie: cookieHeader },
-      redirect: "follow",
+      redirect: "follow", // undici drops Cookie on cross-origin redirects
+      signal: AbortSignal.timeout(60_000),
     });
 
     if (!fetchResp.ok) {

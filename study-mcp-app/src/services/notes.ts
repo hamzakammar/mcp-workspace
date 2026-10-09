@@ -64,13 +64,16 @@ export class NotesService {
     const response = await fetch(fileUri);
     const blob = await response.blob();
 
-    await fetch(uploadUrl, {
+    const uploadRes = await fetch(uploadUrl, {
       method: 'PUT',
       body: blob,
       headers: {
         'Content-Type': contentType,
       },
     });
+    if (!uploadRes.ok) {
+      throw new Error(`Upload failed (HTTP ${uploadRes.status})`);
+    }
   }
 
   /**

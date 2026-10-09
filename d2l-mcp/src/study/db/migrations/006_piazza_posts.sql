@@ -25,7 +25,7 @@ create index if not exists idx_piazza_posts_created on public.piazza_posts(creat
 create index if not exists idx_piazza_posts_embedding_hnsw
   on public.piazza_posts using hnsw (embedding vector_cosine_ops);
 
-alter table public.piazza_posts disable row level security;
+alter table public.piazza_posts enable row level security; -- was "disable" (2026-10-09 sweep): prod runs with RLS on; service_role bypasses it
 
 -- Semantic search RPC for piazza_posts
 create or replace function public.match_piazza_posts (

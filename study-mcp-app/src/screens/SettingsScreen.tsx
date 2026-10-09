@@ -22,6 +22,7 @@ interface IntegrationStatus {
   connected: boolean;
   syncing: boolean;
   lastSync?: string;
+  classesCount?: number;
 }
 
 export default function SettingsScreen() {
