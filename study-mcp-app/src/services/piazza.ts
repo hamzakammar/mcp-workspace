@@ -130,7 +130,7 @@ export class PiazzaService {
     try {
       await apiClient.delete('/piazza/disconnect');
     } catch (error: any) {
-      const errorMessage = error.response?.data?.error || error.message || 'Failed to disconnect Piazza';
+      const errorMessage = error.data?.error || error.message || 'Failed to disconnect Piazza';
       throw new Error(errorMessage);
     }
   }

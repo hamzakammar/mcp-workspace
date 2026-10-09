@@ -102,7 +102,9 @@ export default function LoginScreen() {
       return;
     }
     try {
-      const { error } = await supabase.auth.resetPasswordForEmail(email);
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: 'https://horizon.hamzaammar.ca/onboard',
+      });
       if (error) throw error;
       Alert.alert('Check Your Email', 'Password reset instructions have been sent to ' + email);
     } catch (e: any) {

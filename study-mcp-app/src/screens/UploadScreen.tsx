@@ -163,19 +163,19 @@ export default function UploadScreen() {
       );
     } catch (error: any) {
       console.error('Upload error:', error);
-      console.error('Upload error response:', error.response?.data);
-      console.error('Upload error status:', error.response?.status);
+      console.error('Upload error response:', error.data);
+      console.error('Upload error status:', error.status);
 
       // Get detailed error message
-      const errorMessage = error.response?.data?.error ||
-        error.response?.data?.details ||
-        error.response?.data?.message ||
+      const errorMessage = error.data?.error ||
+        error.data?.details ||
+        error.data?.message ||
         error.message ||
         'An error occurred during upload';
 
       // Include status code if available
-      const fullErrorMessage = error.response?.status
-        ? `[${error.response.status}] ${errorMessage}`
+      const fullErrorMessage = error.status
+        ? `[${error.status}] ${errorMessage}`
         : errorMessage;
 
       setError(fullErrorMessage);

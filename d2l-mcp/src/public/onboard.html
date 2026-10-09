@@ -467,11 +467,11 @@
       <div id="alertBox" class="hidden"></div>
 
       <div class="field">
-        <label>Email</label>
+        <label for="email">Email</label>
         <input type="email" id="email" placeholder="you@university.ca" autocomplete="email" />
       </div>
       <div class="field" style="margin-bottom:20px">
-        <label>Password</label>
+        <label for="password">Password</label>
         <input type="password" id="password" placeholder="••••••••" autocomplete="current-password" />
       </div>
 
@@ -484,11 +484,11 @@
         <div style="font-size:13px;font-weight:600;margin-bottom:4px">Reset your password</div>
         <div style="font-size:11.5px;color:var(--muted);margin-bottom:10px">Enter a new password for your account.</div>
         <div class="field" style="margin-bottom:8px">
-          <label>New password</label>
+          <label for="newPassword">New password</label>
           <input type="password" id="newPassword" placeholder="At least 8 characters" autocomplete="new-password" />
         </div>
         <div class="field" style="margin-bottom:12px">
-          <label>Confirm new password</label>
+          <label for="confirmNewPassword">Confirm new password</label>
           <input type="password" id="confirmNewPassword" placeholder="Repeat password" autocomplete="new-password" />
         </div>
         <button class="btn btn-primary" id="resetBtn" onclick="submitPasswordReset()">Update password</button>
@@ -511,7 +511,7 @@
       <div id="d2lAlertBox" class="hidden"></div>
 
       <div class="field">
-        <label>University D2L host</label>
+        <label for="d2lHost">University D2L host</label>
         <input type="text" id="d2lHost" value="learn.uwaterloo.ca" />
       </div>
 
@@ -523,11 +523,11 @@
         </button>
         <div id="credsFields" class="hidden" style="margin-top:12px;display:flex;flex-direction:column;gap:10px">
           <div class="field" style="margin-bottom:0">
-            <label>WatIAM username</label>
+            <label for="d2lUsername">WatIAM username</label>
             <input type="text" id="d2lUsername" placeholder="watiam" autocomplete="username" />
           </div>
           <div class="field" style="margin-bottom:0">
-            <label>Password</label>
+            <label for="d2lPassword">Password</label>
             <input type="password" id="d2lPassword" placeholder="••••••••" autocomplete="current-password" />
           </div>
           <p style="font-size:11.5px;color:var(--muted);line-height:1.5">Stored securely. Used only to refresh your session when Duo cookies expire — you'll still need to approve Duo periodically.</p>
@@ -586,11 +586,11 @@
       <div id="piazzaAlertBox" class="hidden"></div>
 
       <div class="field">
-        <label>Piazza email</label>
+        <label for="piazzaEmail">Piazza email</label>
         <input type="email" id="piazzaEmail" placeholder="you@university.ca" autocomplete="email" />
       </div>
       <div class="field" style="margin-bottom:20px">
-        <label>Password</label>
+        <label for="piazzaPassword">Password</label>
         <input type="password" id="piazzaPassword" placeholder="••••••••" autocomplete="current-password" />
       </div>
 
@@ -678,8 +678,8 @@
       <!-- Piazza reconnect inline -->
       <div id="piazzaReconnectBox" class="hidden" style="margin-top:8px;padding:12px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm)">
         <div style="font-size:12.5px;font-weight:500;margin-bottom:8px">Connect Piazza</div>
-        <div class="field"><label>Piazza email</label><input type="email" id="piazzaReEmail" placeholder="you@university.edu" /></div>
-        <div class="field"><label>Password</label><input type="password" id="piazzaRePw" placeholder="Piazza password" /></div>
+        <div class="field"><label for="piazzaReEmail">Piazza email</label><input type="email" id="piazzaReEmail" placeholder="you@university.edu" /></div>
+        <div class="field"><label for="piazzaRePw">Password</label><input type="password" id="piazzaRePw" placeholder="Piazza password" /></div>
         <button class="btn btn-primary" style="font-size:12.5px;padding:8px" onclick="reconnectPiazza(this)">Connect</button>
         <div id="piazzaReconnectStatus" style="font-size:12px;color:var(--muted);margin-top:6px"></div>
       </div>
@@ -766,7 +766,9 @@
       </div>
 
       <div id="notesList" style="margin-top:6px;display:flex;flex-direction:column;gap:6px;margin-bottom:12px"></div>
-      <div id="dropZone" onclick="document.getElementById('fileInput').click()"
+      <div id="dropZone" role="button" tabindex="0" aria-label="Upload PDFs: drop files here or press Enter to browse"
+        onclick="document.getElementById('fileInput').click()"
+        onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); document.getElementById('fileInput').click(); }"
         style="border:1.5px dashed var(--border-hi);border-radius:var(--radius);padding:20px;text-align:center;cursor:pointer;transition:border-color 0.15s,background 0.15s"
         ondragover="event.preventDefault();this.style.borderColor='var(--accent)';this.style.background='rgba(15,23,42,0.03)'"
         ondragleave="this.style.borderColor='';this.style.background=''"
@@ -774,7 +776,7 @@
         <div style="margin-bottom:6px;color:var(--muted)"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></div>
         <div style="font-size:13px;font-weight:500;margin-bottom:3px">Drop PDFs here or click to browse</div>
         <div style="font-size:11.5px;color:var(--muted)">PDF only · max 50MB per file</div>
-        <input type="file" id="fileInput" accept=".pdf" multiple style="display:none" onchange="handleFiles(this.files)" />
+        <input type="file" id="fileInput" accept=".pdf" multiple style="display:none" onchange="handleFiles(this.files); this.value = ''" />
       </div>
 
       <div id="uploadQueue" style="margin-top:10px;display:flex;flex-direction:column;gap:6px"></div>
@@ -913,6 +915,7 @@
     let token = null;
     let refreshToken = null;
     let tokenExpiresAt = null;
+    let currentUserId = null;
     let refreshTimer = null;
     let pollInterval = null;
     let notesPoll = null;
@@ -931,25 +934,72 @@
       refreshTimer = setTimeout(doTokenRefresh, msUntilRefresh);
     }
 
-    async function doTokenRefresh() {
-      if (!refreshToken) return;
-      try {
-        const res = await fetch(`${API}/auth/refresh`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ refreshToken }),
-        });
-        const data = await res.json();
-        if (res.ok && data.token) {
-          setSession(data);
-        }
-      } catch {}
+    // Shared in-flight refresh so concurrent callers don't race (Supabase rotates refresh tokens).
+    // Resolves true (refreshed), false (refresh rejected — session is dead), or null (network error).
+    let refreshInFlight = null;
+    function doTokenRefresh() {
+      if (refreshInFlight) return refreshInFlight;
+      refreshInFlight = (async () => {
+        try {
+          // Another tab may have already rotated the tokens — adopt its fresh access token if so.
+          const lsToken = localStorage.getItem('hzn_token');
+          const lsExp = Number(localStorage.getItem('hzn_expiresAt'));
+          if (lsToken && lsToken !== token && lsExp * 1000 - Date.now() > 60 * 1000) {
+            setSession({ token: lsToken, refreshToken: localStorage.getItem('hzn_refreshToken') || refreshToken, expiresAt: lsExp });
+            return true;
+          }
+        } catch {}
+        let rt = refreshToken;
+        try { rt = localStorage.getItem('hzn_refreshToken') || rt; } catch {}
+        if (!rt) return false;
+        try {
+          const res = await fetch(`${API}/auth/refresh`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refreshToken: rt }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (res.ok && data.token) { setSession(data); return true; }
+          return res.status >= 500 ? null : false;
+        } catch { return null; }
+      })();
+      return refreshInFlight.finally(() => { refreshInFlight = null; });
     }
+
+    function tokenExpiresWithin(seconds) {
+      return !!tokenExpiresAt && (tokenExpiresAt * 1000 - Date.now()) < seconds * 1000;
+    }
+
+    // fetch() wrapper for authenticated API calls: refreshes a near-expiry token first,
+    // retries once on 401, and signs the user out if the session can't be refreshed.
+    async function authFetch(url, opts = {}) {
+      if (token && tokenExpiresWithin(60)) await doTokenRefresh();
+      const withAuth = () => ({ ...opts, headers: { ...(opts.headers || {}), 'Authorization': `Bearer ${token}` } });
+      const res = await fetch(url, withAuth());
+      if (res.status === 401 && token) {
+        const refreshed = await doTokenRefresh();
+        if (refreshed === true) return fetch(url, withAuth());
+        if (refreshed === false && token) logout('Your session expired. Please sign in again.');
+      }
+      return res;
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && token && tokenExpiresWithin(5 * 60)) doTokenRefresh();
+    });
 
     function setSession(data) {
       token = data.token;
       refreshToken = data.refreshToken;
       tokenExpiresAt = data.expiresAt;
+      if (data.userId) {
+        currentUserId = data.userId;
+        // Cached API key belongs to whoever last signed in on this browser — drop it if that's someone else
+        try {
+          const owner = localStorage.getItem('hzn_apiKeyUser');
+          if (owner && owner !== currentUserId) { localStorage.removeItem('hzn_apiKey'); localStorage.removeItem('hzn_apiKeyUser'); }
+        } catch {}
+      }
       scheduleTokenRefresh(tokenExpiresAt);
       // Persist for returning users
       try {
@@ -960,11 +1010,16 @@
     }
 
     // ── Helpers ────────────────────────────────────────────────────────
-    function showAlert(id, msg, type = 'error') {
+    // msg is rendered as plain text (it often contains server error strings). Pass allowHtml only for trusted markup.
+    function showAlert(id, msg, type = 'error', allowHtml = false) {
       const box = document.getElementById(id);
       box.className = `alert alert-${type}`;
-      box.innerHTML = msg;
+      if (allowHtml) box.innerHTML = msg; else box.textContent = msg;
       box.classList.remove('hidden');
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
     function hideAlert(id) { document.getElementById(id).classList.add('hidden'); }
 
@@ -1131,6 +1186,14 @@
         token = data.token;
         if (!token) throw new Error('No token returned — please try again.');
         setSession(data);
+        // Returning users who already connected D2L go straight to the dashboard (like tryAutoLogin)
+        if (mode === 'signin') {
+          try {
+            const sr = await authFetch(`${API}/api/d2l/status`);
+            const sd = sr.ok ? await sr.json() : {};
+            if (sd.connected || sd.reauthRequired) { showSuccess(); return; }
+          } catch {}
+        }
         document.getElementById('stepAuth').classList.add('hidden');
         document.getElementById('stepD2L').classList.remove('hidden');
       } catch (e) {
@@ -1153,9 +1216,9 @@
       try {
         // Save credentials if provided
         if (username && password) {
-          const credRes = await fetch(`${API}/api/d2l/save-credentials`, {
+          const credRes = await authFetch(`${API}/api/d2l/save-credentials`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ host: d2lHost, username, password }),
           });
           if (!credRes.ok) {
@@ -1164,9 +1227,9 @@
           }
         }
 
-        const res = await fetch(`${API}/auth/d2l/start`, {
+        const res = await authFetch(`${API}/auth/d2l/start`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ d2lHost }),
         });
         const data = await res.json();
@@ -1177,6 +1240,7 @@
         document.getElementById('vncStep').classList.remove('hidden');
         btn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-.18-5.4"/></svg> Restart session`;
         btn.disabled = false;
+        if (pollInterval) clearInterval(pollInterval);
         pollInterval = setInterval(pollStatus, 2500);
       } catch (e) {
         showAlert('d2lAlertBox', e.message);
@@ -1192,6 +1256,7 @@
         const data = await res.json();
         if (data.status === 'authenticated') {
           clearInterval(pollInterval);
+          pollInterval = null;
           const d2 = document.getElementById('step2dot');
           const d3 = document.getElementById('step3dot');
           d2.className = 'step-dot done'; d2.textContent = '✓';
@@ -1201,6 +1266,7 @@
           }, 700);
         } else if (data.status === 'failed' || data.status === 'no_session') {
           clearInterval(pollInterval);
+          pollInterval = null;
           showAlert('d2lAlertBox', 'Session expired or failed. Please try again.');
         }
       } catch {}
@@ -1218,9 +1284,9 @@
       hideAlert('piazzaAlertBox');
 
       try {
-        const res = await fetch(`${API}/api/piazza/connect`, {
+        const res = await authFetch(`${API}/api/piazza/connect`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email, password }),
         });
         const data = await res.json();
@@ -1237,6 +1303,8 @@
 
     // ── Step 3: Dashboard ──────────────────────────────────────────────
     function showSuccess() {
+      // Idempotent: the dashboard is already showing (e.g. a duplicate poll tick) — don't re-init
+      if (!token || !document.getElementById('stepSuccess').classList.contains('hidden')) return;
       document.getElementById('stepAuth').classList.add('hidden');
       document.getElementById('stepD2L').classList.add('hidden');
       document.getElementById('stepPiazza').classList.add('hidden');
@@ -1280,46 +1348,56 @@
 
     async function ensureApiKey() {
       const display = document.getElementById('apiKeyDisplay');
-      // Check localStorage first
-      const cached = localStorage.getItem('hzn_apiKey');
-      if (cached) {
-        setApiKeyUI(cached);
-        return;
-      }
-      // Check if server has one and retrieve it
+      // The server only stores a hash, so the plaintext key lives only in this browser's cache
+      // (hzn_apiKey, owned by hzn_apiKeyUser) from when it was generated here.
+      let cached = null;
       try {
-        const checkRes = await fetch(`${API}/api/keys`, { headers: { 'Authorization': `Bearer ${token}` } });
+        cached = localStorage.getItem('hzn_apiKey');
+        const owner = localStorage.getItem('hzn_apiKeyUser');
+        if (cached && owner && currentUserId && owner !== currentUserId) cached = null;
+        if (cached && !owner && currentUserId) localStorage.setItem('hzn_apiKeyUser', currentUserId);
+      } catch {}
+      try {
+        const checkRes = await authFetch(`${API}/api/keys`);
         const checkData = await checkRes.json();
-        if (checkData.hasKey) {
-          if (checkData.key) {
-            // Key is stored — cache it locally and show it
-            localStorage.setItem('hzn_apiKey', checkData.key);
-            setApiKeyUI(checkData.key);
-          } else {
-            // Key exists but was created before plaintext storage — need to regenerate once
-            display.textContent = 'Key exists but not recoverable.';
-            display.style.filter = 'none'; display.style.opacity = '1';
-            document.getElementById('regenKeyBtn').textContent = 'Regenerate & reveal';
-            populateConfigs(null);
-          }
+        if (checkRes.ok && checkData.hasKey) {
+          if (cached) { setApiKeyUI(cached); return; }
+          // Key exists but was generated elsewhere — it can't be shown again
+          display.textContent = 'Your API key is already set up (it is only shown once, when created). Your AI clients keep working with it — regenerate only if you have lost it.';
+          display.style.filter = 'none'; display.style.opacity = '1'; display.style.cursor = 'text';
+          populateConfigs(null);
+          return;
+        }
+        if (checkRes.ok && !checkData.hasKey) {
+          // Server has no key (cached one, if any, was revoked) — create one
+          try { localStorage.removeItem('hzn_apiKey'); localStorage.removeItem('hzn_apiKeyUser'); } catch {}
+          await createApiKey();
           return;
         }
       } catch {}
-      // No key exists — create one
-      await createApiKey();
+      // Couldn't check with the server — fall back to the cached key if we have one
+      if (cached) setApiKeyUI(cached);
+      else {
+        display.textContent = 'Unable to check your API key. Refresh the page to try again.';
+        display.style.filter = 'none'; display.style.opacity = '1';
+        populateConfigs(null);
+      }
     }
 
     async function createApiKey() {
       const display = document.getElementById('apiKeyDisplay');
       display.textContent = 'Generating...';
       try {
-        const res = await fetch(`${API}/api/keys`, {
+        const res = await authFetch(`${API}/api/keys`, {
           method: 'POST',
-          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json' },
         });
         const data = await res.json();
         if (data.apiKey) {
-          localStorage.setItem('hzn_apiKey', data.apiKey);
+          try {
+            localStorage.setItem('hzn_apiKey', data.apiKey);
+            if (currentUserId) localStorage.setItem('hzn_apiKeyUser', currentUserId);
+          } catch {}
           setApiKeyUI(data.apiKey);
         } else {
           display.textContent = data.error || 'Failed to generate key';
@@ -1344,7 +1422,7 @@
       btn.disabled = true; btn.textContent = 'Regenerating...';
       try {
         // Delete existing
-        const delRes = await fetch(`${API}/api/keys`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` } });
+        const delRes = await authFetch(`${API}/api/keys`, { method: 'DELETE' });
         if (!delRes.ok) {
           let msg = `Failed to revoke key (${delRes.status})`;
           try {
@@ -1353,7 +1431,7 @@
           } catch {}
           throw new Error(msg);
         }
-        localStorage.removeItem('hzn_apiKey');
+        try { localStorage.removeItem('hzn_apiKey'); localStorage.removeItem('hzn_apiKeyUser'); } catch {}
         // Create new
         await createApiKey();
       } catch (e) {
@@ -1372,7 +1450,7 @@
     }
 
     function populateConfigs(apiKey) {
-      const headerVal = apiKey || '< regenerate key above >';
+      const headerVal = apiKey || '<your API key>';
       const claudeJson = JSON.stringify({
         mcpServers: {
           horizon: {
@@ -1398,7 +1476,7 @@
     async function loadConnectionStatus() {
       // D2L status
       try {
-        const res = await fetch(`${API}/api/d2l/status`, { headers: { 'Authorization': `Bearer ${token}` } });
+        const res = await authFetch(`${API}/api/d2l/status`);
         const data = await res.json();
         const dot = document.getElementById('d2lStatusDot');
         const text = document.getElementById('d2lStatusText');
@@ -1414,10 +1492,11 @@
           if (box) box.classList.add('hidden');
           if (d2lReloginPoll) { clearInterval(d2lReloginPoll); d2lReloginPoll = null; }
         } else {
-          dot.style.background = data.duoRequired ? 'var(--warn)' : 'var(--danger)';
-          text.textContent = data.duoRequired ? 'Expired — click Re-login' : 'Not connected — click Connect to get started';
-          text.style.color = data.duoRequired ? 'var(--warn)' : 'var(--danger)';
-          btn.textContent = data.duoRequired ? 'Re-login' : 'Connect';
+          const expired = data.reauthRequired || data.duoRequired;
+          dot.style.background = expired ? 'var(--warn)' : 'var(--danger)';
+          text.textContent = expired ? 'Expired — click Re-login' : 'Not connected — click Connect to get started';
+          text.style.color = expired ? 'var(--warn)' : 'var(--danger)';
+          btn.textContent = expired ? 'Re-login' : 'Connect';
           btn.style.display = '';
         }
       } catch {
@@ -1426,7 +1505,7 @@
 
       // Piazza status
       try {
-        const res = await fetch(`${API}/api/piazza/status`, { headers: { 'Authorization': `Bearer ${token}` } });
+        const res = await authFetch(`${API}/api/piazza/status`);
         const data = await res.json();
         const dot = document.getElementById('piazzaStatusDot');
         const text = document.getElementById('piazzaStatusText');
@@ -1449,7 +1528,7 @@
 
       // Crowdmark status
       try {
-        const res = await fetch(`${API}/api/crowdmark/status`, { headers: { 'Authorization': `Bearer ${token}` } });
+        const res = await authFetch(`${API}/api/crowdmark/status`);
         const data = await res.json();
         const dot = document.getElementById('crowdmarkStatusDot');
         const text = document.getElementById('crowdmarkStatusText');
@@ -1478,7 +1557,7 @@
 
       // Outline status
       try {
-        const res = await fetch(`${API}/api/outline/status`, { headers: { 'Authorization': `Bearer ${token}` } });
+        const res = await authFetch(`${API}/api/outline/status`);
         const data = await res.json();
         const dot = document.getElementById('outlineStatusDot');
         const text = document.getElementById('outlineStatusText');
@@ -1507,7 +1586,7 @@
 
       // Notion status
       try {
-        const res = await fetch(`${API}/api/notion/status`, { headers: { 'Authorization': `Bearer ${token}` } });
+        const res = await authFetch(`${API}/api/notion/status`);
         const data = await res.json();
         const dot = document.getElementById('notionStatusDot');
         const text = document.getElementById('notionStatusText');
@@ -1537,9 +1616,9 @@
       box.classList.remove('hidden');
       status.textContent = 'Starting browser session...';
       try {
-        const res = await fetch(`${API}/auth/d2l/start`, {
+        const res = await authFetch(`${API}/auth/d2l/start`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ d2lHost: 'learn.uwaterloo.ca' }),
         });
         const data = await res.json();
@@ -1560,10 +1639,12 @@
               document.getElementById('d2lStatusDot').style.background = 'var(--success)';
               document.getElementById('d2lStatusText').textContent = 'Connected · just now';
               setTimeout(() => box.classList.add('hidden'), 3000);
-            } else if (sd.status === 'failed') {
+            } else if (sd.status === 'failed' || sd.status === 'no_session') {
               clearInterval(d2lReloginPoll);
               d2lReloginPoll = null;
-              status.innerHTML = '<span style="color:var(--danger)">&#10005;</span> Login failed. Try again.';
+              status.innerHTML = sd.status === 'no_session'
+                ? '<span style="color:var(--danger)">&#10005;</span> Login session expired. Click Re-login to start a new one.'
+                : '<span style="color:var(--danger)">&#10005;</span> Login failed. Try again.';
             }
           } catch {}
         }, 2500);
@@ -1586,9 +1667,9 @@
       btn.textContent = 'Connecting...';
       status.textContent = '';
       try {
-        const res = await fetch(`${API}/api/piazza/connect`, {
+        const res = await authFetch(`${API}/api/piazza/connect`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email, password }),
         });
         const data = await res.json();
@@ -1598,7 +1679,8 @@
         document.getElementById('piazzaStatusText').textContent = 'Connected';
         setTimeout(() => document.getElementById('piazzaReconnectBox').classList.add('hidden'), 2000);
       } catch (e) {
-        status.innerHTML = `<span style="color:var(--danger)">&#10005;</span> ${e.message}`;
+        status.innerHTML = '<span style="color:var(--danger)">&#10005;</span> ';
+        status.append(e.message || 'Failed');
       } finally {
         btn.disabled = false;
         btn.textContent = 'Connect';
@@ -1617,9 +1699,9 @@
       btn.innerHTML = '<span class="spin"></span> Starting session…';
       status.textContent = '';
       try {
-        const res = await fetch(`${API}/auth/crowdmark/start`, {
+        const res = await authFetch(`${API}/auth/crowdmark/start`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
         });
         const data = await res.json();
@@ -1664,7 +1746,8 @@
           } catch {}
         }, 2500);
       } catch (e) {
-        status.innerHTML = `<span style="color:var(--danger)">&#10005;</span> ${e.message}`;
+        status.innerHTML = '<span style="color:var(--danger)">&#10005;</span> ';
+        status.append(e.message || 'Failed');
         btn.disabled = false;
         btn.textContent = 'Open login browser';
       }
@@ -1685,9 +1768,7 @@
       btn.disabled = true;
       status.textContent = 'Requesting authorisation URL...';
       try {
-        const res = await fetch(`${API}/api/notion/oauth-url`, {
-          headers: { 'Authorization': `Bearer ${token}` },
-        });
+        const res = await authFetch(`${API}/api/notion/oauth-url`);
         const data = await res.json();
         if (!data.url) throw new Error(data.error || 'No URL returned');
         status.textContent = 'Redirecting to Notion...';
@@ -1705,9 +1786,9 @@
       btn.innerHTML = '<span class="spin"></span> Starting session…';
       status.textContent = '';
       try {
-        const res = await fetch(`${API}/auth/outline/start`, {
+        const res = await authFetch(`${API}/auth/outline/start`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
         });
         const data = await res.json();
@@ -1752,7 +1833,8 @@
           } catch {}
         }, 2500);
       } catch (e) {
-        status.innerHTML = `<span style="color:var(--danger)">&#10005;</span> ${e.message}`;
+        status.innerHTML = '<span style="color:var(--danger)">&#10005;</span> ';
+        status.append(e.message || 'Failed');
         btn.disabled = false;
         btn.textContent = 'Open login browser';
       }
@@ -1766,8 +1848,18 @@
       handleFiles(e.dataTransfer.files);
     }
 
+    const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // matches the "max 50MB" hint (server relay limit is 60MB)
     function handleFiles(files) {
-      [...files].filter(f => f.type === 'application/pdf').forEach(uploadFile);
+      const all = [...files];
+      const isPdf = f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name);
+      const notPdf = all.filter(f => !isPdf(f));
+      const tooBig = all.filter(f => isPdf(f) && f.size > MAX_UPLOAD_BYTES);
+      const problems = [];
+      if (notPdf.length) problems.push(`Skipped ${notPdf.length} non-PDF file${notPdf.length > 1 ? 's' : ''} (${notPdf.map(f => f.name).join(', ')}). Only PDFs are supported.`);
+      if (tooBig.length) problems.push(`Skipped ${tooBig.map(f => f.name).join(', ')} — files must be 50MB or smaller.`);
+      if (problems.length) showAlert('uploadAlertBox', problems.join(' '));
+      else hideAlert('uploadAlertBox');
+      all.filter(f => isPdf(f) && f.size <= MAX_UPLOAD_BYTES).forEach(uploadFile);
     }
 
     async function uploadFile(file) {
@@ -1776,7 +1868,8 @@
       const item = document.createElement('div');
       item.id = itemId;
       item.style.cssText = 'display:flex;align-items:center;gap:10px;padding:9px 12px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12.5px';
-      item.innerHTML = `<span class="spin" style="flex-shrink:0"></span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${file.name}</span><span style="color:var(--muted)">0%</span>`;
+      item.innerHTML = `<span class="spin" style="flex-shrink:0"></span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span><span style="color:var(--muted)">0%</span>`;
+      item.children[1].textContent = file.name;
       queueEl.appendChild(item);
 
       const setStatus = (text, color = 'var(--muted)') => {
@@ -1787,9 +1880,9 @@
 
       try {
         // 1. Get presigned URL
-        const presignRes = await fetch(`${API}/api/notes/presign-upload`, {
+        const presignRes = await authFetch(`${API}/api/notes/presign-upload`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filename: file.name, contentType: 'application/pdf', size: file.size }),
         });
         const presignData = await presignRes.json().catch(() => ({}));
@@ -1816,10 +1909,9 @@
         }
         if (!uploaded) {
           setStatus('Direct upload failed — trying fallback...');
-          const relayRes = await fetch(`${API}/api/notes/upload-direct?s3Key=${encodeURIComponent(s3Key)}`, {
+          const relayRes = await authFetch(`${API}/api/notes/upload-direct?s3Key=${encodeURIComponent(s3Key)}`, {
             method: 'POST',
             headers: {
-              'Authorization': `Bearer ${token}`,
               'Content-Type': 'application/pdf',
             },
             body: file,
@@ -1842,9 +1934,9 @@
         let lastProcessErr = 'Failed to process PDF';
         for (let attempt = 1; attempt <= 5; attempt++) {
           setStatus(`Processing… (${attempt}/5)`);
-          const processRes = await fetch(`${API}/api/notes/process`, {
+          const processRes = await authFetch(`${API}/api/notes/process`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ s3Key, title: file.name.replace(/\.pdf$/i, '') }),
           });
           if (processRes.ok) {
@@ -1887,7 +1979,7 @@
           <span class="spin"></span><span>Loading files...</span>
         </div>`;
       try {
-        const res = await fetch(`${API}/api/notes`, { headers: { 'Authorization': `Bearer ${token}` } });
+        const res = await authFetch(`${API}/api/notes`);
         if (!res.ok) { showAlert('uploadAlertBox', `Failed to load notes: ${res.status}`); return; }
         const data = await res.json();
         const notes = data.notes || data;
@@ -1900,19 +1992,19 @@
           return;
         }
         el.innerHTML = notes.map(n => {
-          const safeTitle = String(n.title || 'Untitled').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+          const safeTitle = escapeHtml(n.title || 'Untitled');
           const statusColor = n.status === 'ready' ? 'var(--success)' : n.status === 'error' ? 'var(--danger)' : 'var(--warn)';
-          const statusLabel = n.status === 'ready' ? 'Ready' : n.status === 'processing' ? 'Processing...' : n.status === 'error' ? 'Error' : n.status;
+          const statusLabel = n.status === 'ready' ? 'Ready' : n.status === 'processing' ? 'Processing...' : n.status === 'error' ? 'Error' : escapeHtml(n.status || '');
           const pages = n.page_count ? `${n.page_count} pg` : '';
           const date = n.created_at ? new Date(n.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
           const meta = [pages, date].filter(Boolean).join(' · ');
-          const noteId = String(n.id || '');
+          const noteId = String(n.id || '').replace(/[^A-Za-z0-9_-]/g, ''); // interpolated into inline onclick JS
           return `
           <div style="display:flex;align-items:center;gap:10px;padding:10px 13px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12.5px">
             <span style="flex-shrink:0;color:var(--muted)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></span>
             <div style="flex:1;min-width:0">
               <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500">${safeTitle}</div>
-              <div style="font-size:11px;color:var(--muted);margin-top:1px">${meta}</div>
+              <div style="font-size:11px;color:var(--muted);margin-top:1px">${escapeHtml(meta)}</div>
             </div>
             <span style="font-size:10.5px;padding:2px 7px;border-radius:4px;background:${statusColor}15;color:${statusColor};font-weight:500">${statusLabel}</span>
             ${n.status === 'ready' && n.s3_key ? `<button onclick="viewNote('${noteId}')" style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:11.5px;font-family:inherit;font-weight:500;padding:2px 6px">View</button>` : ''}
@@ -1927,7 +2019,7 @@
     async function deleteNote(id, btn) {
       btn.disabled = true;
       try {
-        const res = await fetch(`${API}/api/notes/${id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` } });
+        const res = await authFetch(`${API}/api/notes/${id}`, { method: 'DELETE' });
         if (!res.ok) throw new Error(`Delete failed (${res.status})`);
         loadNotes();
       } catch (e) {
@@ -1938,7 +2030,7 @@
 
     async function viewNote(id) {
       try {
-        const res = await fetch(`${API}/api/notes/${id}/view`, { headers: { 'Authorization': `Bearer ${token}` } });
+        const res = await authFetch(`${API}/api/notes/${id}/view`);
         if (!res.ok) throw new Error(`View failed (${res.status})`);
         const data = await res.json();
         if (data.viewUrl) window.open(data.viewUrl, '_blank');
@@ -1964,18 +2056,24 @@
     }
 
     // ── Logout ─────────────────────────────────────────────────────────
-    function logout() {
-      token = null; refreshToken = null; tokenExpiresAt = null; sessionId = null;
+    function logout(message) {
+      token = null; refreshToken = null; tokenExpiresAt = null; sessionId = null; currentUserId = null;
       if (refreshTimer) clearTimeout(refreshTimer);
-      if (pollInterval) clearInterval(pollInterval);
-      if (notesPoll) clearInterval(notesPoll);
-      try { localStorage.removeItem('hzn_token'); localStorage.removeItem('hzn_refreshToken'); localStorage.removeItem('hzn_expiresAt'); localStorage.removeItem('hzn_apiKey'); } catch {}
+      if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+      if (notesPoll) { clearInterval(notesPoll); notesPoll = null; }
+      if (d2lReloginPoll) { clearInterval(d2lReloginPoll); d2lReloginPoll = null; }
+      if (crowdmarkPollInterval) { clearInterval(crowdmarkPollInterval); crowdmarkPollInterval = null; }
+      if (outlinePollInterval) { clearInterval(outlinePollInterval); outlinePollInterval = null; }
+      // hzn_apiKey/hzn_apiKeyUser are kept: the key can't be re-fetched from the server, and
+      // setSession() drops it if a different user signs in on this browser.
+      try { localStorage.removeItem('hzn_token'); localStorage.removeItem('hzn_refreshToken'); localStorage.removeItem('hzn_expiresAt'); } catch {}
       ['stepD2L','stepPiazza','stepSuccess','vncStep'].forEach(id => document.getElementById(id).classList.add('hidden'));
       document.querySelector('.wrap').classList.remove('wide');
       document.getElementById('stepAuth').classList.remove('hidden');
       document.getElementById('authBtn').disabled = false;
       document.getElementById('authBtn').textContent = 'Sign in';
       switchTab('signin');
+      if (typeof message === 'string' && message) showAlert('alertBox', message, 'info');
     }
 
     // ── Auto-login for returning users ────────────────────────────────

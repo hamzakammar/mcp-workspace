@@ -37,7 +37,10 @@ export default function SignUpScreen() {
     }
     setLoading(true);
     try {
-      await signUp(email, password, name);
+      const { needsVerification } = await signUp(email, password, name);
+      if (needsVerification) {
+        (navigation.navigate as any)('VerifyEmail', { email });
+      }
     } catch (error: any) {
       Alert.alert('Sign Up Failed', error.message || 'An error occurred');
     } finally {
