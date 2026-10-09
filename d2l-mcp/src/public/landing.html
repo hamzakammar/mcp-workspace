@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Horizon</title>
+  <meta name="description" content="Connect D2L once, then ask your AI about your courses." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #f5f5f4;
+      --text: #1c1917;
+      --muted: #78716c;
+      --btn-bg: #1c1917;
+      --btn-text: #fafaf9;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0c0a09;
+        --text: #f5f5f4;
+        --muted: #a8a29e;
+        --btn-bg: #f5f5f4;
+        --btn-text: #1c1917;
+      }
+    }
+
+    html, body { height: 100%; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    main { max-width: 340px; }
+
+    .mark {
+      display: block;
+      width: 22px; height: 22px;
+      color: var(--text);
+      margin-bottom: 28px;
+    }
+
+    h1 {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.1px;
+      margin-bottom: 6px;
+    }
+
+    p {
+      font-size: 15px;
+      line-height: 1.5;
+      color: var(--muted);
+      margin-bottom: 28px;
+    }
+
+    a.btn {
+      display: inline-block;
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--btn-text);
+      background: var(--btn-bg);
+      text-decoration: none;
+      padding: 9px 16px;
+      border-radius: 8px;
+      transition: opacity .15s;
+    }
+    a.btn:hover { opacity: .85; }
+    a.btn:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+  </style>
+</head>
+<body>
+  <main>
+    <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+    <h1>Horizon</h1>
+    <p>Connect D2L once, then ask your AI about your courses, deadlines and grades.</p>
+    <a class="btn" href="/onboard">Get started</a>
+  </main>
+</body>
+</html>

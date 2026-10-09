@@ -964,6 +964,11 @@ async function main() {
     // Onboarding page (no auth)
     const publicDir = path.join(process.cwd(), "dist", "public");
     app.use(express.static(publicDir));
+    // Landing page — just points people at /onboard.
+    app.get("/", (_req, res) => {
+      res.setHeader("Cache-Control", "public, max-age=300");
+      res.sendFile(path.join(publicDir, "landing.html"));
+    });
     app.get("/onboard", (req, res) => {
       const filePath = path.join(publicDir, "onboard.html");
       console.error(`[ONBOARD] Serving from: ${filePath}`);
