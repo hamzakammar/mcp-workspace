@@ -33,6 +33,24 @@ Severity guide:
 
 <!-- Add new entries below this line, newest first. -->
 
+### [DEBT-016] VNC reconnect "loading race" — stream can die before the user sees it
+- **Severity:** medium
+- **Area:** `d2l-mcp/src/browser/BrowserSessionManager.ts`, `src/public/onboard.html`
+- **Logged:** 2026-10-24
+- **Author:** agent
+- **Description:** On `/auth/d2l/start` the Playwright `page.goto` is fired un-awaited (`:246`); if the restored S3 state still has a valid ADFS cookie the watcher auto-detects login within ~2s and auto-closes the session 3s later (`:716`). `getLiveSession` then returns undefined (stream dead) while the status record is kept 60s returning `authenticated`. A user who opens the VNC tab late sees D2L's home ("the main site") or a dead stream, then Horizon silently advances to the dashboard — matching Ali's "popup wouldn't open, redirected to main site, worked on retry." NOTE: the user's "VNC not ready yet" hypothesis is NOT the cause — `/start` blocks on `waitForPort` until Xvfb/x11vnc/websockify are up.
+- **Impact:** Confusing reconnects; no VNC-level loading/retry state on the onboarding (`startD2L`) path.
+- **Fix:** Done on the dashboard reconnect path (explicit states + Retry + "session was still valid, reconnected automatically" message). Still TODO: the same explicit states + Retry on the onboarding `startD2L`/`pollStatus` path, and consider not auto-closing a *restored* (non-interactive) session so aggressively, or exposing a `restored` flag in status so the client can message precisely.
+
+### [DEBT-015] Credential filler is not isolated from the LLM/MCP process
+- **Severity:** high
+- **Area:** `d2l-mcp/src/jobs/sessionRefresher.ts`, `src/auth.ts`, `src/utils/kms.ts`, ECS task role
+- **Logged:** 2026-10-24
+- **Author:** agent
+- **Description:** The same Node backend that serves MCP tools also holds `kms:Decrypt` and decrypts the stored D2L password in-process at headless-login time. KMS + per-user EncryptionContext (ADR-0001) protect a DB leak but not a live compromise of that host: an attacker with code-exec there can call the same decrypt path or scrape plaintext from memory. The model never sees the password (REST, not MCP), but the host does.
+- **Impact:** Server compromise ⇒ live D2L credentials for all users with a stored password.
+- **Fix:** Split decrypt-and-fill into a separate least-privilege worker/role (only it gets `kms:Decrypt`), per-user KMS context (done) + CloudTrail anomaly alerts, egress allow-list, short-lived plaintext/zeroize; optionally AWS Nitro Enclave for the fill step; and/or prefer session-cookie reuse over storing the password where the refresh path suffices. See ADR-0001 Option C/D. **Requires owner approval (architecture + deploy).**
+
 ### [DEBT-014] Account deletion / logout leave data and access behind
 - **Severity:** medium
 - **Area:** `d2l-mcp/src/utils/deleteUserData.ts`, `src/api/push.ts`, `/auth/logout`

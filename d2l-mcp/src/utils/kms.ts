@@ -49,13 +49,23 @@ export function isEncrypted(value: string | null | undefined): boolean {
 /**
  * Encrypt a short plaintext string (e.g. a password) with KMS.
  * Returns a string safe to store in any text column.
+ *
+ * `context` is a KMS Encryption Context (additional authenticated data). When set
+ * (e.g. `{ userId, purpose: "d2l_password" }`) the exact same map is required to
+ * decrypt, so a ciphertext stolen from one row cannot be decrypted as another user's
+ * credential, and every KMS call is tagged with it in CloudTrail. Omitting it keeps
+ * the legacy (unbound) behaviour for callers that have not opted in.
  */
-export async function encryptPassword(plaintext: string): Promise<string> {
+export async function encryptPassword(
+  plaintext: string,
+  context?: Record<string, string>
+): Promise<string> {
   const kms = getKmsClient();
   const { CiphertextBlob } = await kms.send(
     new EncryptCommand({
       KeyId: KMS_KEY_ARN!,
       Plaintext: Buffer.from(plaintext, "utf-8"),
+      ...(context && Object.keys(context).length ? { EncryptionContext: context } : {}),
     })
   );
   if (!CiphertextBlob) throw new Error("[KMS] EncryptCommand returned no ciphertext");
@@ -66,17 +76,50 @@ export async function encryptPassword(plaintext: string): Promise<string> {
  * Decrypt a value produced by encryptPassword.
  * Pass-through for values that are not yet encrypted (env-var fallback, legacy rows
  * before migration). These will be re-encrypted on the next write.
+ *
+ * `context` must match the Encryption Context used at encrypt time. For backward
+ * compatibility, if a context is supplied but the decrypt fails (a legacy row was
+ * encrypted WITHOUT a context, so KMS throws InvalidCiphertextException), we retry
+ * once with no context. That legacy row re-encrypts WITH the context on its next save.
+ * A context MISMATCH (e.g. another user's ciphertext) fails both attempts and throws —
+ * which is the cross-user protection we want.
  */
-export async function decryptPassword(ciphertext: string): Promise<string> {
+export async function decryptPassword(
+  ciphertext: string,
+  context?: Record<string, string>
+): Promise<string> {
   if (!isEncrypted(ciphertext)) {
     // Plaintext — return as-is. Will be encrypted on next credential write.
     return ciphertext;
   }
   const kms = getKmsClient();
   const blob = Buffer.from(ciphertext.slice(ENC_PREFIX.length), "base64");
-  const { Plaintext } = await kms.send(new DecryptCommand({ CiphertextBlob: blob }));
-  if (!Plaintext) throw new Error("[KMS] DecryptCommand returned no plaintext");
-  return Buffer.from(Plaintext).toString("utf-8");
+  const hasContext = !!(context && Object.keys(context).length);
+  try {
+    const { Plaintext } = await kms.send(
+      new DecryptCommand({
+        CiphertextBlob: blob,
+        ...(hasContext ? { EncryptionContext: context } : {}),
+      })
+    );
+    if (!Plaintext) throw new Error("[KMS] DecryptCommand returned no plaintext");
+    return Buffer.from(Plaintext).toString("utf-8");
+  } catch (err) {
+    if (hasContext) {
+      // Legacy row encrypted before context binding — retry unbound. (A genuine
+      // context mismatch from a different user's ciphertext also lands here and
+      // fails again below, so it still cannot be decrypted.)
+      const { Plaintext } = await kms.send(new DecryptCommand({ CiphertextBlob: blob }));
+      if (!Plaintext) throw new Error("[KMS] DecryptCommand returned no plaintext");
+      return Buffer.from(Plaintext).toString("utf-8");
+    }
+    throw err;
+  }
+}
+
+/** KMS Encryption Context binding a stored D2L password to its owning user. */
+export function d2lPasswordContext(userId: string): Record<string, string> {
+  return { userId, purpose: "d2l_password" };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

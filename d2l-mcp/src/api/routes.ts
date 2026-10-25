@@ -13,7 +13,7 @@ import { D2LClient } from "../client.js";
 import { getToken } from "../auth.js";
 import { getPiazzaCookieHeader } from "../study/piazzaAuth.js";
 import { registerDeviceToken, sendPushToUser, checkAndNotifyUpdates } from "./push.js";
-import { encryptPassword } from "../utils/kms.js";
+import { encryptPassword, d2lPasswordContext } from "../utils/kms.js";
 import { logCredentialAccess } from "../utils/auditLog.js";
 import { deleteAllUserData } from "../utils/deleteUserData.js";
 
@@ -929,8 +929,8 @@ router.post("/d2l/connect", async (req: Request, res: Response) => {
 
   try {
     // First, verify credentials by attempting to authenticate
-    // Store credentials with KMS-encrypted password
-    const encryptedPassword = await encryptPassword(password);
+    // Store credentials with KMS-encrypted password, bound to this user (AAD)
+    const encryptedPassword = await encryptPassword(password, d2lPasswordContext(userId));
     await logCredentialAccess(userId, "d2l_password", "write", "POST /d2l/connect");
     const { error: tempError } = await supabase
       .from("user_credentials")
@@ -1698,7 +1698,7 @@ router.post("/d2l/save-credentials", async (req: Request, res: Response) => {
     if (!sbUrl || !sbKey) throw new Error("Missing Supabase config");
     const d2lHost = host || process.env.D2L_HOST || "learn.uwaterloo.ca";
 
-    const encryptedPassword = await encryptPassword(password);
+    const encryptedPassword = await encryptPassword(password, d2lPasswordContext(userId));
     await logCredentialAccess(userId, "d2l_password", "write", "POST /d2l/save-credentials");
 
     // First try PATCH — only updates if row already exists (preserves token)
