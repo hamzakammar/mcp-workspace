@@ -619,6 +619,7 @@
             <div style="font-size:13px;font-weight:500">D2L / Brightspace <span style="font-size:11px;color:var(--muted);font-weight:400">required</span></div>
             <div id="d2lStatusText" style="font-size:11.5px;color:var(--muted)">Checking...</div>
           </div>
+          <span id="d2lSavedBadge" title="Your WatIAM login is saved (encrypted) so Horizon can reconnect automatically" style="display:none;align-items:center;gap:4px;font-size:10.5px;font-weight:600;color:var(--success);background:color-mix(in srgb, var(--success) 12%, transparent);border:1px solid color-mix(in srgb, var(--success) 35%, transparent);padding:2px 7px;border-radius:999px;flex-shrink:0"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Login saved</span>
           <span id="d2lStatusDot" style="width:8px;height:8px;border-radius:50%;background:#d4d4d4;flex-shrink:0"></span>
           <button id="d2lReconnectBtn" class="copy-btn" style="font-size:11.5px;padding:4px 10px;display:none" onclick="reconnectD2L()">Re-login</button>
         </div>
@@ -1495,6 +1496,8 @@
         const dot = document.getElementById('d2lStatusDot');
         const text = document.getElementById('d2lStatusText');
         const btn = document.getElementById('d2lReconnectBtn');
+        const savedBadge = document.getElementById('d2lSavedBadge');
+        if (savedBadge) savedBadge.style.display = data.credentialsSaved ? 'inline-flex' : 'none';
         if (data.connected) {
           dot.style.background = 'var(--success)';
           text.textContent = 'Connected';

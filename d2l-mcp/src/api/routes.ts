@@ -1015,17 +1015,20 @@ router.get("/d2l/status", async (req: Request, res: Response) => {
     // Check if credentials exist in database
     const { data: credsData, error: credError } = await supabase
       .from("user_credentials")
-      .select("host, username, token, updated_at")
+      .select("host, username, password, token, updated_at")
       .eq("user_id", userId)
       .eq("service", "d2l")
       .limit(1);
-    
+
     const creds = Array.isArray(credsData) ? credsData[0] : credsData;
 
     // Check if we have token (cookie-based auth) or username (legacy credential-based)
     const hasToken = !credError && !!creds && !!creds.token;
     const hasUsername = !credError && !!creds && !!creds.username;
     const connected = hasToken || hasUsername;
+    // Auto-reconnect credentials are saved only when BOTH username and password exist.
+    // (We never return the password itself — just whether it's stored.)
+    const credentialsSaved = !credError && !!creds && !!creds.username && !!creds.password;
 
     // Check token age - if older than 20 hours, signal reauth required
     let reauthRequired = false;
@@ -1070,6 +1073,7 @@ router.get("/d2l/status", async (req: Request, res: Response) => {
     res.json({
       connected: connected && !reauthRequired,
       reauthRequired,
+      credentialsSaved,
       lastSync: lastTask?.created_at || null,
       coursesCount,
     });
@@ -1078,6 +1082,7 @@ router.get("/d2l/status", async (req: Request, res: Response) => {
     res.json({
       connected: false,
       reauthRequired: false,
+      credentialsSaved: false,
       lastSync: null,
       coursesCount: 0,
     });
