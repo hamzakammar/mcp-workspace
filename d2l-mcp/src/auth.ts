@@ -7,7 +7,7 @@ import fs from "fs/promises";
 import os from "os";
 import { supabase } from "./utils/supabase.js";
 import { loadStorageStateFromS3, saveStorageStateToS3 } from "./utils/s3Storage.js";
-import { decryptPassword } from "./utils/kms.js";
+import { decryptPassword, d2lPasswordContext } from "./utils/kms.js";
 import { logCredentialAccess } from "./utils/auditLog.js";
 
 const REMOTE_DEBUG = process.env.REMOTE_DEBUG === "true";
@@ -64,7 +64,7 @@ export async function getD2LCredentials(userId?: string): Promise<{ host: string
             return {
               host: rows[0].host || process.env.D2L_HOST || "learn.uwaterloo.ca",
               username: rows[0].username,
-              password: await decryptPassword(rows[0].password),
+              password: await decryptPassword(rows[0].password, d2lPasswordContext(userId)),
             };
           }
         }
