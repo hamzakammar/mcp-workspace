@@ -1,6 +1,6 @@
 # ADR-0001: D2L credential storage for auto-relogin — KMS per-user binding; filler isolation deferred
 
-> **Status:** proposed
+> **Status:** accepted — Option B shipped & verified in prod 2026-10-24 (task def rev 147); Option C (filler isolation) deferred to DEBT-015
 > **Date:** 2026-10-24
 > **Author(s):** agent (investigation requested by owner; Ali's daily-reconnect pain)
 
