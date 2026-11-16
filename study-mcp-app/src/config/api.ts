@@ -1,6 +1,15 @@
 import { supabase } from '../lib/supabase';
 
-const BASE_URL = 'https://horizon.hamzaammar.ca/api';
+/**
+ * Server origin (no trailing slash, no /api). EXPO_PUBLIC_API_BASE_URL is documented
+ * in .env.example as the origin (e.g. https://your-domain.com); a trailing /api is
+ * tolerated and stripped. Health lives at `${API_ORIGIN}/health`, REST at BASE_URL.
+ */
+export const API_ORIGIN =
+  process.env.EXPO_PUBLIC_API_BASE_URL?.replace(/\/+$/, '').replace(/\/api$/, '') ||
+  'https://horizon.hamzaammar.ca';
+
+export const BASE_URL = `${API_ORIGIN}/api`;
 
 /** Error thrown by apiClient for non-2xx responses: `status` is the HTTP status, `data` the parsed error body. */
 export class ApiError extends Error {

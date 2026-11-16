@@ -14,7 +14,7 @@ Based on your existing migration scripts, use your EC2 bastion:
 cd d2l-mcp
 
 # Use your existing bastion setup (same as run-migration-003-via-ec2.sh)
-# Your bastion: ec2-user@44.201.36.38
+# Your bastion: ec2-user@<BASTION_HOST>
 # Key: ~/Downloads/study-mcp-bastion-key.pem or ~/.ssh/PokeIntegrations.pem
 
 # Option 1: Create a migration script (recommended)
@@ -44,13 +44,13 @@ alter table public.device_tokens disable row level security;
 SQL
 
 # Copy to EC2 bastion
-scp -i ~/.ssh/PokeIntegrations.pem /tmp/add_device_tokens.sql ec2-user@44.201.36.38:~/
+scp -i ~/.ssh/PokeIntegrations.pem /tmp/add_device_tokens.sql ec2-user@<BASTION_HOST>:~/
 
 # Run on RDS via bastion
 read -sp "Enter your RDS password: " RDS_PASSWORD
 echo ""
 
-ssh -i ~/.ssh/PokeIntegrations.pem ec2-user@44.201.36.38 << EOF
+ssh -i ~/.ssh/PokeIntegrations.pem ec2-user@<BASTION_HOST> << EOF
 export PGPASSWORD='${RDS_PASSWORD}'
 psql -h study-mcp-db.cunwmoma690l.us-east-1.rds.amazonaws.com \
      -U postgres \
@@ -66,7 +66,7 @@ EOF
 read -sp "Enter your RDS password: " RDS_PASSWORD
 echo ""
 
-ssh -i ~/.ssh/PokeIntegrations.pem ec2-user@44.201.36.38 << EOF
+ssh -i ~/.ssh/PokeIntegrations.pem ec2-user@<BASTION_HOST> << EOF
 export PGPASSWORD='${RDS_PASSWORD}'
 psql "postgresql://postgres:\${PGPASSWORD}@study-mcp-db.cunwmoma690l.us-east-1.rds.amazonaws.com:5432/postgres?sslmode=require" << SQL
 create table if not exists public.device_tokens (
@@ -117,7 +117,7 @@ alter table public.device_tokens disable row level security;
 
 ```bash
 # Via EC2 bastion
-ssh -i ~/.ssh/PokeIntegrations.pem ec2-user@44.201.36.38 << EOF
+ssh -i ~/.ssh/PokeIntegrations.pem ec2-user@<BASTION_HOST> << EOF
 export PGPASSWORD='${RDS_PASSWORD}'
 psql -h study-mcp-db.cunwmoma690l.us-east-1.rds.amazonaws.com \
      -U postgres \

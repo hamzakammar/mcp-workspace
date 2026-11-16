@@ -17,6 +17,7 @@ import {
   generateToken,
   sha256hex,
   isRegisteredRedirectUri,
+  isValidRedirectUriForRegistration,
   signAuthRequest,
   verifyAuthRequest,
   type AuthRequest,
@@ -48,21 +49,57 @@ function redirectWithError(redirectUri: string, state: string | undefined, error
   return u.toString();
 }
 
+/** Anti-clickjacking + no-cache headers for every HTML page we render. */
+function setPageHeaders(res: Response): Response {
+  return res
+    .set("Content-Security-Policy", "frame-ancestors 'none'")
+    .set("X-Frame-Options", "DENY")
+    .set("Cache-Control", "no-store");
+}
+
 function renderErrorPage(res: Response, status: number, title: string, message: string): void {
-  res.status(status).type("html").send(`<!doctype html><html><head><meta charset="utf-8">
+  setPageHeaders(res).status(status).type("html").send(`<!doctype html><html><head><meta charset="utf-8">
 <title>${esc(title)}</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>body{font-family:system-ui,-apple-system,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#111}
 h1{font-size:1.25rem}p{color:#444}</style></head>
 <body><h1>${esc(title)}</h1><p>${esc(message)}</p></body></html>`);
 }
 
+/**
+ * Human-readable destination for the consent page: the host for http(s)
+ * redirect URIs, or the scheme (plus host, if any) for custom app schemes such
+ * as cursor:// or com.example.app:/cb. Exported for tests.
+ */
+export function describeRedirectTarget(redirectUri: string): string {
+  try {
+    const u = new URL(redirectUri);
+    if (u.protocol === "http:" || u.protocol === "https:") return u.host;
+    return u.host ? `${u.protocol}//${u.host}` : u.protocol;
+  } catch {
+    return redirectUri;
+  }
+}
+
+/** Sign the interim auth request; on failure (e.g. missing session secret)
+ * render a 500 page and return null so Express requests never hang. */
+function signOrFail(res: Response, authReq: AuthRequest): string | null {
+  try {
+    return signAuthRequest(authReq);
+  } catch (e: any) {
+    console.error("[OAUTH] signAuthRequest failed:", e?.message || e);
+    renderErrorPage(res, 500, "Server error", "Could not start authorization. Please try again later.");
+    return null;
+  }
+}
+
 function renderConsentPage(res: Response, opts: {
   clientName: string;
   scope: string;
   authRequestBlob: string;
+  redirectUri: string;
   error?: string;
 }): void {
-  res.status(200).type("html").send(`<!doctype html><html><head><meta charset="utf-8">
+  setPageHeaders(res).status(200).type("html").send(`<!doctype html><html><head><meta charset="utf-8">
 <title>Authorize access — Horizon</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
@@ -77,6 +114,7 @@ function renderConsentPage(res: Response, opts: {
   label{display:block;font-size:.85rem;margin:.75rem 0 .25rem}
   input{width:100%;box-sizing:border-box;padding:.6rem .7rem;border:1px solid #8886;border-radius:8px;font-size:1rem;background:transparent;color:inherit}
   button{width:100%;margin-top:1.25rem;padding:.7rem;border:0;border-radius:8px;background:#4f46e5;color:#fff;font-size:1rem;font-weight:600;cursor:pointer}
+  .dest{font-weight:600;word-break:break-all}
   .err{color:#c0392b;font-size:.85rem;margin-top:.75rem}
 </style></head>
 <body>
@@ -85,6 +123,7 @@ function renderConsentPage(res: Response, opts: {
   <div class="card">
     <div><span class="client">${esc(opts.clientName)}</span> is requesting access to:</div>
     <span class="scope">${esc(opts.scope)}</span>
+    <div class="sub" style="margin-top:.75rem;margin-bottom:0">After you approve, you will be sent back to <span class="dest">${esc(describeRedirectTarget(opts.redirectUri))}</span>.</div>
     <div class="sub" style="margin-top:.75rem;margin-bottom:0">This lets it read and act on your courses, tasks, and notes through the Horizon MCP tools on your behalf.</div>
   </div>
   <form method="POST" action="/authorize" autocomplete="off">
@@ -124,7 +163,9 @@ router.get("/authorize", async (req: Request, res: Response) => {
     renderErrorPage(res, 400, "Unknown client", "The client_id is not registered.");
     return;
   }
-  if (!isRegisteredRedirectUri(client.redirect_uris, redirectUri)) {
+  // Also re-check the scheme so clients registered before the scheme denylist
+  // (e.g. javascript:/data:) can't be used.
+  if (!isRegisteredRedirectUri(client.redirect_uris, redirectUri) || !isValidRedirectUriForRegistration(redirectUri)) {
     renderErrorPage(res, 400, "Invalid redirect URI", "redirect_uri does not match a registered value.");
     return;
   }
@@ -159,17 +200,27 @@ router.get("/authorize", async (req: Request, res: Response) => {
     exp: Math.floor(Date.now() / 1000) + 600, // 10 min to complete login
   };
 
+  const blob = signOrFail(res, authReq);
+  if (!blob) return;
   renderConsentPage(res, {
     clientName: client.client_name || client.client_id,
     scope: SCOPE,
-    authRequestBlob: signAuthRequest(authReq),
+    authRequestBlob: blob,
+    redirectUri,
   });
 });
 
 // ── POST /authorize ───────────────────────────────────────────────────────────
 router.post("/authorize", async (req: Request, res: Response) => {
   const body = req.body || {};
-  const authReq = verifyAuthRequest(String(body.auth_request || ""));
+  let authReq: AuthRequest | null;
+  try {
+    authReq = verifyAuthRequest(String(body.auth_request || ""));
+  } catch (e: any) {
+    console.error("[OAUTH] verifyAuthRequest failed:", e?.message || e);
+    renderErrorPage(res, 500, "Server error", "Could not verify authorization request.");
+    return;
+  }
   if (!authReq) {
     renderErrorPage(res, 400, "Session expired", "Your authorization session expired. Please restart the connection from your client.");
     return;
@@ -184,7 +235,11 @@ router.post("/authorize", async (req: Request, res: Response) => {
     renderErrorPage(res, 500, "Server error", "Could not load client.");
     return;
   }
-  if (!client || !isRegisteredRedirectUri(client.redirect_uris, authReq.redirect_uri)) {
+  if (
+    !client ||
+    !isRegisteredRedirectUri(client.redirect_uris, authReq.redirect_uri) ||
+    !isValidRedirectUriForRegistration(authReq.redirect_uri)
+  ) {
     renderErrorPage(res, 400, "Invalid request", "Client or redirect URI is no longer valid.");
     return;
   }
@@ -192,10 +247,13 @@ router.post("/authorize", async (req: Request, res: Response) => {
   const email = String(body.email || "");
   const password = String(body.password || "");
   if (!email || !password) {
+    const blob = signOrFail(res, authReq);
+    if (!blob) return;
     renderConsentPage(res, {
       clientName: client.client_name || client.client_id,
       scope: SCOPE,
-      authRequestBlob: signAuthRequest(authReq),
+      authRequestBlob: blob,
+      redirectUri: authReq.redirect_uri,
       error: "Email and password are required.",
     });
     return;
@@ -207,10 +265,13 @@ router.post("/authorize", async (req: Request, res: Response) => {
     const supabase = getSupabase();
     const { data, error } = await supabase.auth.signInWithPassword({ email, password });
     if (error || !data.user?.id) {
+      const blob = signOrFail(res, authReq);
+      if (!blob) return;
       renderConsentPage(res, {
         clientName: client.client_name || client.client_id,
         scope: SCOPE,
-        authRequestBlob: signAuthRequest(authReq),
+        authRequestBlob: blob,
+        redirectUri: authReq.redirect_uri,
         error: "Invalid email or password.",
       });
       return;

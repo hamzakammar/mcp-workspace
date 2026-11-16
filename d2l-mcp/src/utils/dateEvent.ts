@@ -28,6 +28,8 @@ export interface DateEvent {
   confidence: Confidence;
   rawSnippet: string; // Original text used for classification
   assignmentId?: number | null;
+  /** D2L AssociatedEntityType (e.g. "D2L.LE.Dropbox.Dropbox"); ids are only unique per type. */
+  entityType?: string | null;
 }
 
 // Classification patterns
@@ -41,13 +43,6 @@ const PATTERNS = {
       /\bno later than\b/i,
       /\bdue date\b/i,
       /\bsubmission deadline\b/i,
-      // Assessment deliverables — these are graded work, not scheduled meetings.
-      /\bassignment\b/i,
-      /\bhomework\b/i,
-      /\bproblem set\b/i,
-      /\bpset\b/i,
-      /\bproject\b/i,
-      /\bmilestone\b/i,
     ],
     medium: [
       /\bsubmit\b/i,
@@ -55,10 +50,31 @@ const PATTERNS = {
       /\bturn in\b/i,
     ],
   },
-  available_from: {
+  // Assessment deliverables — these are graded work, not scheduled meetings. Only
+  // checked after explicit availability phrases, so "Assignment 1 - Availability
+  // Starts" is an opening date, not a deadline.
+  dueNouns: {
     high: [
+      /\bassignment\b/i,
+      /\bhomework\b/i,
+      /\bproblem set\b/i,
+      /\bpset\b/i,
+      /\bproject\b/i,
+      /\bmilestone\b/i,
+    ],
+  },
+  // Explicit "this opens now" phrases — strong enough to beat deliverable nouns.
+  available_from_explicit: {
+    high: [
+      /\bavailability\s+(?:starts|begins|opens)\b/i,
       /\bavailable from\b/i,
       /\bopens\b/i,
+    ],
+  },
+  // Weaker availability words ("Assignment 1 (available on Crowdmark)",
+  // "Project posted") — only used when no deliverable noun matched.
+  available_from: {
+    high: [
       /\breleased\b/i,
       /\bposted\b/i,
       /\bwill be available\b/i,
@@ -72,8 +88,10 @@ const PATTERNS = {
   },
   closes: {
     high: [
+      /\bavailability ends?\b/i,
       /\bcloses\b/i,
       /\bavailable until\b/i,
+      /\bopen until\b/i,
       /\bwindow closes\b/i,
       /\bwill close\b/i,
       /\bends\b/i,
@@ -123,6 +141,34 @@ const PATTERNS = {
   },
 };
 
+type Rule = { dateType: DateType; confidence: Confidence; patterns: RegExp[] };
+
+/**
+ * Ordered classification rules. Explicit deadline phrases ("due", "deadline")
+ * win; then explicit availability phrases (ends/until → CLOSES, then
+ * "availability starts" / "opens" / "available from" → AVAILABLE_FROM); then
+ * deliverable nouns ("assignment", "project") imply a due date. Plain
+ * "available"/"posted"/"released" never beat a deliverable noun.
+ */
+const RULES: Rule[] = [
+  { dateType: DateType.DUE, confidence: Confidence.HIGH, patterns: PATTERNS.due.high },
+  { dateType: DateType.CLOSES, confidence: Confidence.HIGH, patterns: PATTERNS.closes.high },
+  { dateType: DateType.AVAILABLE_FROM, confidence: Confidence.HIGH, patterns: PATTERNS.available_from_explicit.high },
+  { dateType: DateType.DUE, confidence: Confidence.HIGH, patterns: PATTERNS.dueNouns.high },
+  { dateType: DateType.DUE, confidence: Confidence.MEDIUM, patterns: PATTERNS.due.medium },
+  { dateType: DateType.AVAILABLE_FROM, confidence: Confidence.HIGH, patterns: PATTERNS.available_from.high },
+  { dateType: DateType.AVAILABLE_FROM, confidence: Confidence.MEDIUM, patterns: PATTERNS.available_from.medium },
+  { dateType: DateType.CLOSES, confidence: Confidence.MEDIUM, patterns: PATTERNS.closes.medium },
+  { dateType: DateType.FEEDBACK_RELEASE, confidence: Confidence.HIGH, patterns: PATTERNS.feedback_release.high },
+  { dateType: DateType.EXAM, confidence: Confidence.HIGH, patterns: PATTERNS.exam.high },
+  { dateType: DateType.LECTURE, confidence: Confidence.HIGH, patterns: PATTERNS.lecture.high },
+];
+
+/** True when `text` contains an explicit deadline phrase ("due", "deadline", …). */
+export function hasDuePhrase(text: string | null | undefined): boolean {
+  return !!text && PATTERNS.due.high.some((p) => p.test(text));
+}
+
 /**
  * Classify a date event based on title, description, and context
  */
@@ -132,34 +178,12 @@ export function classifyDateEvent(
   eventType: string | null = null
 ): { dateType: DateType; confidence: Confidence; snippet: string } {
   const text = `${title} ${description}`.toLowerCase();
-  
-  // Check each pattern category in priority order
-  for (const [type, levels] of Object.entries(PATTERNS)) {
-    // Check high confidence patterns first
-    if (levels.high) {
-      for (const pattern of levels.high) {
-        if (pattern.test(text)) {
-          const match = text.match(pattern);
-          return {
-            dateType: type as DateType,
-            confidence: Confidence.HIGH,
-            snippet: match ? match[0] : text.substring(0, 50),
-          };
-        }
-      }
-    }
-    
-    // Then medium confidence patterns
-    if ('medium' in levels && levels.medium) {
-      for (const pattern of levels.medium) {
-        if (pattern.test(text)) {
-          const match = text.match(pattern);
-          return {
-            dateType: type as DateType,
-            confidence: Confidence.MEDIUM,
-            snippet: match ? match[0] : text.substring(0, 50),
-          };
-        }
+
+  for (const rule of RULES) {
+    for (const pattern of rule.patterns) {
+      const match = text.match(pattern);
+      if (match) {
+        return { dateType: rule.dateType, confidence: rule.confidence, snippet: match[0] };
       }
     }
   }
@@ -189,19 +213,24 @@ export function classifyDateEvent(
   };
 }
 
+function isDropboxEntity(entityType: string | null | undefined): boolean {
+  return !!entityType && /Dropbox/i.test(entityType);
+}
+
 /**
- * Deduplicate date events by assignment ID, prioritizing due dates
+ * Deduplicate date events by associated entity (type + id), prioritizing due dates
  */
 export function deduplicateDateEvents(events: DateEvent[]): DateEvent[] {
-  // Group by assignmentId
-  const grouped = new Map<number, DateEvent[]>();
+  // Group by entity type + id — a Dropbox folder and a Quiz can share a numeric id.
+  const grouped = new Map<string, DateEvent[]>();
   const nonAssignment: DateEvent[] = [];
   
   for (const event of events) {
     if (event.assignmentId) {
-      const group = grouped.get(event.assignmentId) || [];
+      const key = `${event.entityType || ''}#${event.assignmentId}`;
+      const group = grouped.get(key) || [];
       group.push(event);
-      grouped.set(event.assignmentId, group);
+      grouped.set(key, group);
     } else {
       nonAssignment.push(event);
     }
@@ -211,12 +240,32 @@ export function deduplicateDateEvents(events: DateEvent[]): DateEvent[] {
   const deduplicated: DateEvent[] = [];
   
   for (const [_, group] of grouped) {
+    // A Dropbox folder whose only end-type date is "availability ends"/"closes"
+    // has that as its effective deadline.
+    if (isDropboxEntity(group[0].entityType) && !group.some((e) => e.dateType === DateType.DUE)) {
+      const closes = group
+        .filter((e) => e.dateType === DateType.CLOSES)
+        .sort((a, b) => new Date(b.datetime).getTime() - new Date(a.datetime).getTime())[0];
+      if (closes) {
+        deduplicated.push({ ...closes, dateType: DateType.DUE, confidence: Confidence.MEDIUM });
+        continue;
+      }
+    }
+
     if (group.length === 1) {
       deduplicated.push(group[0]);
       continue;
     }
-    
-    // Priority: DUE with high confidence > DUE with medium > other types
+
+    // Priority: an explicit "due"/"deadline" phrase > DUE high > DUE medium > other
+    const duePhrase = group.find(
+      (e) => e.dateType === DateType.DUE && (hasDuePhrase(e.rawSnippet) || hasDuePhrase(e.title)),
+    );
+    if (duePhrase) {
+      deduplicated.push(duePhrase);
+      continue;
+    }
+
     const dueHighConf = group.find(e => e.dateType === DateType.DUE && e.confidence === Confidence.HIGH);
     if (dueHighConf) {
       deduplicated.push(dueHighConf);

@@ -12,6 +12,9 @@ services:
       - SUPABASE_URL=https://qialmumlcezeqvyyhjlu.supabase.co
       - SUPABASE_JWKS_URL=https://qialmumlcezeqvyyhjlu.supabase.co/auth/v1/.well-known/jwks.json
       - PORT=8080
+      # /metrics is served only to "Authorization: Bearer $METRICS_TOKEN".
+      # Put the same value in ./metrics_token (gitignored) for Prometheus.
+      - METRICS_TOKEN=${METRICS_TOKEN:?set METRICS_TOKEN (same value as ./metrics_token)}
     depends_on:
       - backend
 
@@ -31,6 +34,8 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Create with: printf '%s' "$METRICS_TOKEN" > metrics_token  (gitignored)
+      - ./metrics_token:/etc/prometheus/metrics_token:ro
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"

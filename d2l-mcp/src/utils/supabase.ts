@@ -1,6 +1,27 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import fs from 'node:fs';
 import pg from 'pg';
 const { Pool } = pg;
+
+/**
+ * Run a pg-backed query and always settle with a Supabase-style result.
+ * Query errors resolve to `{ data: null, error }` (matching supabase-js) instead
+ * of leaving the awaiting caller hanging. Returned as a real Promise so the
+ * thenables below honour both onFulfilled and onRejected.
+ */
+function settle(run: () => Promise<any>): Promise<any> {
+  return run().catch((e: any) => ({ data: null, error: e }));
+}
+
+/** SSL config for the pg fallback: verify against PG_CA_CERT when provided. */
+function pgSslConfig(): { rejectUnauthorized: boolean; ca?: string } {
+  const caPath = process.env.PG_CA_CERT;
+  if (caPath) {
+    return { rejectUnauthorized: true, ca: fs.readFileSync(caPath, 'utf-8') };
+  }
+  // Legacy default: encrypted but unverified (RDS requires SSL).
+  return { rejectUnauthorized: false };
+}
 
 // Support multiple env var names for flexibility
 const supabaseUrl = process.env.SUPABASE_URL || process.env.DATABASE_URL;
@@ -17,7 +38,7 @@ let supabase: any;
 if (supabaseUrl.startsWith('postgresql://')) {
   const pool = new Pool({ 
     connectionString: supabaseUrl,
-    ssl: { rejectUnauthorized: false } // RDS requires SSL
+    ssl: pgSslConfig() // RDS requires SSL; set PG_CA_CERT to verify the server cert
   });
   
   // Create a Supabase-like client wrapper using pg pool
@@ -91,23 +112,18 @@ if (supabaseUrl.startsWith('postgresql://')) {
               paramIndex++;
               // Return promise-like object that can be awaited
               return {
-                then: async (resolve: any) => {
-                  try {
-                    const result = await pool.query(query, params);
-                    if (isCount) {
-                      // For count queries, return the count value
-                      resolve({ 
-                        data: isHead ? null : result.rows, 
-                        count: parseInt(result.rows[0]?.count || '0', 10),
-                        error: null 
-                      });
-                    } else {
-                      resolve({ data: result.rows, error: null });
-                    }
-                  } catch (e: any) {
-                    resolve({ data: null, error: e });
+                then: (resolve?: any, reject?: any) => settle(async () => {
+                  const result = await pool.query(query, params);
+                  if (isCount) {
+                    // For count queries, return the count value
+                    return {
+                      data: isHead ? null : result.rows,
+                      count: parseInt(result.rows[0]?.count || '0', 10),
+                      error: null
+                    };
                   }
-                }
+                  return { data: result.rows, error: null };
+                }).then(resolve, reject)
               };
             },
             order: (col: string, opts: { ascending?: boolean } = {}) => {
@@ -116,22 +132,17 @@ if (supabaseUrl.startsWith('postgresql://')) {
               // Return builder so limit() can be chained
               return builder;
             },
-            then: async (resolve: any) => {
-              try {
-                const result = await pool.query(query, params);
-                if (isCount) {
-                  resolve({ 
-                    data: isHead ? null : result.rows, 
-                    count: parseInt(result.rows[0]?.count || '0', 10),
-                    error: null 
-                  });
-                } else {
-                  resolve({ data: result.rows, error: null });
-                }
-              } catch (e: any) {
-                resolve({ data: null, error: e });
+            then: (resolve?: any, reject?: any) => settle(async () => {
+              const result = await pool.query(query, params);
+              if (isCount) {
+                return {
+                  data: isHead ? null : result.rows,
+                  count: parseInt(result.rows[0]?.count || '0', 10),
+                  error: null
+                };
               }
-            }
+              return { data: result.rows, error: null };
+            }).then(resolve, reject)
           };
           return builder;
         },
@@ -144,28 +155,28 @@ if (supabaseUrl.startsWith('postgresql://')) {
           const selectBuilder = (cols: string = '*') => {
             const builder: any = {
               single: () => ({
-                then: async (resolve: any) => {
+                then: (resolve?: any, reject?: any) => settle(async () => {
                   const result = await pool.query(insertQuery.replace('RETURNING *', `RETURNING ${cols}`), vals);
-                  resolve({ 
-                    data: result.rows.length > 0 ? result.rows[0] : null, 
-                    error: result.rows.length === 0 ? new Error('No rows returned') : null 
-                  });
-                }
+                  return {
+                    data: result.rows.length > 0 ? result.rows[0] : null,
+                    error: result.rows.length === 0 ? new Error('No rows returned') : null
+                  };
+                }).then(resolve, reject)
               }),
-              then: async (resolve: any) => {
+              then: (resolve?: any, reject?: any) => settle(async () => {
                 const result = await pool.query(insertQuery.replace('RETURNING *', `RETURNING ${cols}`), vals);
-                resolve({ data: result.rows, error: null });
-              }
+                return { data: result.rows, error: null };
+              }).then(resolve, reject)
             };
             return builder;
           };
           
           return {
             select: selectBuilder,
-            then: async (resolve: any) => {
+            then: (resolve?: any, reject?: any) => settle(async () => {
               const result = await pool.query(insertQuery, vals);
-              resolve({ data: result.rows, error: null });
-            }
+              return { data: result.rows, error: null };
+            }).then(resolve, reject)
           };
         },
         upsert: (data: any, opts?: any) => {
@@ -180,10 +191,10 @@ if (supabaseUrl.startsWith('postgresql://')) {
           }
           
           return {
-            then: async (resolve: any) => {
+            then: (resolve?: any, reject?: any) => settle(async () => {
               const result = await pool.query(`INSERT INTO ${table} (${keys.join(', ')}) VALUES (${placeholders})${onConflict} RETURNING *`, vals);
-              resolve({ data: result.rows, error: null });
-            }
+              return { data: result.rows, error: null };
+            }).then(resolve, reject)
           };
         },
         update: (data: any) => {
@@ -208,15 +219,15 @@ if (supabaseUrl.startsWith('postgresql://')) {
               return builder; // Return builder for chaining
             },
             select: (cols: string = '*') => ({
-              then: async (resolve: any) => {
+              then: (resolve?: any, reject?: any) => settle(async () => {
                 const result = await pool.query(`${updateQuery} RETURNING ${cols}`, params);
-                resolve({ data: result.rows, error: null });
-              }
+                return { data: result.rows, error: null };
+              }).then(resolve, reject)
             }),
-            then: async (resolve: any) => {
+            then: (resolve?: any, reject?: any) => settle(async () => {
               const result = await pool.query(`${updateQuery} RETURNING *`, params);
-              resolve({ data: result.rows, error: null });
-            }
+              return { data: result.rows, error: null };
+            }).then(resolve, reject)
           };
           
           return builder;
@@ -234,10 +245,10 @@ if (supabaseUrl.startsWith('postgresql://')) {
               paramIndex++;
               return builder;
             },
-            then: async (resolve: any) => {
+            then: (resolve?: any, reject?: any) => settle(async () => {
               const result = await pool.query(`${deleteQuery} RETURNING *`, params);
-              resolve({ data: result.rows, error: null });
-            }
+              return { data: result.rows, error: null };
+            }).then(resolve, reject)
           };
           return builder;
         }

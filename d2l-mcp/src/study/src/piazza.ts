@@ -127,7 +127,7 @@ async function generateEmbedding(text: string): Promise<number[]> {
   return response.data[0].embedding;
 }
 
-async function upsertPiazzaPosts(
+export async function upsertPiazzaPosts(
   userId: string,
   rows: Array<{
     user_id: string;
@@ -143,11 +143,42 @@ async function upsertPiazzaPosts(
 ) {
   if (!rows.length) return 0;
 
-  const { error } = await supabase
+  // Posts whose title/body changed (or are new) must have their embedding cleared
+  // so piazza_embed_missing re-embeds them. Unchanged posts keep their embedding.
+  // If we can't read existing rows, fall back to clearing all (safe: just re-embeds).
+  let changed = rows;
+  let unchanged: typeof rows = [];
+  const courseIds = [...new Set(rows.map((r) => r.course_id))];
+  const { data: existing, error: selectError } = await supabase
     .from("piazza_posts")
-    .upsert(rows, { onConflict: "user_id,course_id,post_id" });
+    .select("course_id, post_id, title, body")
+    .eq("user_id", userId)
+    .in("course_id", courseIds)
+    .in("post_id", rows.map((r) => r.post_id));
 
-  if (error) throw new Error(`Supabase upsert piazza_posts failed: ${error.message}`);
+  if (!selectError && Array.isArray(existing)) {
+    const prev = new Map<string, { title: string | null; body: string | null }>();
+    for (const e of existing as any[]) prev.set(`${e.course_id}\u0000${e.post_id}`, { title: e.title ?? null, body: e.body ?? null });
+    changed = [];
+    for (const r of rows) {
+      const p = prev.get(`${r.course_id}\u0000${r.post_id}`);
+      if (p && p.title === r.title && (p.body ?? null) === (r.body ?? null)) unchanged.push(r);
+      else changed.push(r);
+    }
+  }
+
+  if (changed.length) {
+    const { error } = await supabase
+      .from("piazza_posts")
+      .upsert(changed.map((r) => ({ ...r, embedding: null })), { onConflict: "user_id,course_id,post_id" });
+    if (error) throw new Error(`Supabase upsert piazza_posts failed: ${error.message}`);
+  }
+  if (unchanged.length) {
+    const { error } = await supabase
+      .from("piazza_posts")
+      .upsert(unchanged, { onConflict: "user_id,course_id,post_id" });
+    if (error) throw new Error(`Supabase upsert piazza_posts failed: ${error.message}`);
+  }
   return rows.length;
 }
 
@@ -330,19 +361,58 @@ export const PiazzaTools = {
       userId: string;
     }): Promise<string> => {
       try {
-        let query = supabase
-          .from("piazza_posts")
-          .select("id, title, body")
-          .eq("user_id", userId)
-          .is("embedding", null)
-          .limit(limit);
+        // Page through rows with null embeddings using an id cursor so rows that are
+        // skipped (too short / embed failure) don't get re-selected forever.
+        const PAGE_SIZE = Math.max(limit, 100);
+        const MAX_PAGES = 50;
+        let lastId: string | null = null;
+        let scanned = 0;
+        let embedded = 0;
+        let skipped = 0;
+        const updates: Array<{ id: string; embedding: number[] }> = [];
 
-        if (courseId) query = query.eq("course_id", courseId);
+        for (let page = 0; page < MAX_PAGES && updates.length < limit; page++) {
+          let query = supabase
+            .from("piazza_posts")
+            .select("id, title, body")
+            .eq("user_id", userId)
+            .is("embedding", null);
 
-        const { data: rows, error } = await query;
-        if (error) return JSON.stringify({ success: false, error: error.message }, null, 2);
+          if (courseId) query = query.eq("course_id", courseId);
+          if (lastId !== null) query = query.gt("id", lastId);
 
-        if (!rows || rows.length === 0) {
+          const { data: rows, error } = await query.order("id", { ascending: true }).limit(PAGE_SIZE);
+          if (error) return JSON.stringify({ success: false, error: error.message }, null, 2);
+          if (!rows || rows.length === 0) break;
+          scanned += rows.length;
+
+          for (const row of rows as any[]) {
+            lastId = row.id;
+            if (updates.length >= limit) break;
+            const title = row.title ?? "";
+            const body = row.body ?? "";
+            const text = `${title}\n\n${body}`.trim();
+
+            if (text.length < minChars) {
+              skipped++;
+              continue;
+            }
+
+            try {
+              const embedding = await generateEmbedding(text);
+              updates.push({ id: row.id, embedding });
+              embedded++;
+              console.error(`[PZ-EMBED] Embedded ${row.id}`);
+            } catch (e) {
+              console.error(`[PZ-EMBED] Failed ${row.id}:`, e);
+              skipped++;
+            }
+          }
+
+          if (rows.length < PAGE_SIZE) break;
+        }
+
+        if (scanned === 0) {
           return JSON.stringify(
             { success: true, embedded: 0, skipped: 0, remaining: 0, message: "No rows with missing embeddings found" },
             null,
@@ -350,33 +420,8 @@ export const PiazzaTools = {
           );
         }
 
-        let embedded = 0;
-        let skipped = 0;
-        const updates: Array<{ id: string; embedding: number[] }> = [];
-
-        for (const row of rows as any[]) {
-          const title = row.title ?? "";
-          const body = row.body ?? "";
-          const text = `${title}\n\n${body}`.trim();
-
-          if (text.length < minChars) {
-            skipped++;
-            continue;
-          }
-
-          try {
-            const embedding = await generateEmbedding(text);
-            updates.push({ id: row.id, embedding });
-            embedded++;
-            console.error(`[PZ-EMBED] Embedded ${row.id}`);
-          } catch (e) {
-            console.error(`[PZ-EMBED] Failed ${row.id}:`, e);
-            skipped++;
-          }
-        }
-
         for (const u of updates) {
-          const { error: updateError } = await supabase.from("piazza_posts").update({ embedding: u.embedding }).eq("id", u.id);
+          const { error: updateError } = await supabase.from("piazza_posts").update({ embedding: u.embedding }).eq("id", u.id).eq("user_id", userId);
           if (updateError) console.error(`[PZ-EMBED] Update error ${u.id}:`, updateError);
         }
 

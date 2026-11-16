@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 import { getAuthenticatedContext, getD2LToken, getToken } from '../auth.js';
 import { getUserId } from '../utils/userContext.js';
+import { DEFAULT_D2L_HOST, resolveAllowedD2LHost } from '../utils/d2lHost.js';
 import mammoth from 'mammoth';
 
 // Extract text content from various file types
@@ -256,14 +257,84 @@ function safeFilename(name: string, fallback = 'download'): string {
   return base && base !== '.' && base !== '..' ? base : fallback;
 }
 
-function saveBuffer(data: Buffer, filename: string, downloadsDir: string, savePath?: string): string {
-  // Ensure the target directory exists
-  const targetDir = savePath && !fs.existsSync(savePath) ? path.dirname(savePath) : downloadsDir;
-  fs.mkdirSync(targetDir, { recursive: true });
+/** Refuse downloads larger than this (bytes). */
+export const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
 
-  let finalPath = savePath && fs.existsSync(savePath) && !fs.statSync(savePath).isDirectory()
-    ? savePath
-    : path.join(downloadsDir, filename);
+class DownloadTooLargeError extends Error {
+  constructor(bytes?: number) {
+    super(
+      `File is too large to download (${bytes != null ? `${(bytes / (1024 * 1024)).toFixed(1)} MB` : 'over the limit'}; ` +
+      `max ${MAX_DOWNLOAD_BYTES / (1024 * 1024)} MB).`,
+    );
+    this.name = 'DownloadTooLargeError';
+  }
+}
+
+/** Throw if a Content-Length header announces a body over the cap. */
+function assertContentLengthOk(contentLength: string | null | undefined): void {
+  const n = contentLength ? Number(contentLength) : NaN;
+  if (Number.isFinite(n) && n > MAX_DOWNLOAD_BYTES) throw new DownloadTooLargeError(n);
+}
+
+/** Read a fetch body, aborting once it exceeds MAX_DOWNLOAD_BYTES. */
+async function readBodyCapped(response: Response): Promise<Buffer> {
+  assertContentLengthOk(response.headers.get('content-length'));
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_DOWNLOAD_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new DownloadTooLargeError(total);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
+}
+
+/** Write a readable stream to `filePath`, aborting (and removing the partial file) past the cap. */
+export async function streamToFileCapped(stream: NodeJS.ReadableStream, filePath: string): Promise<number> {
+  const out = fs.createWriteStream(filePath);
+  let total = 0;
+  try {
+    for await (const chunk of stream as AsyncIterable<Buffer>) {
+      total += chunk.length;
+      if (total > MAX_DOWNLOAD_BYTES) throw new DownloadTooLargeError(total);
+      if (!out.write(chunk)) await new Promise<void>((resolve) => out.once('drain', () => resolve()));
+    }
+    await new Promise<void>((resolve, reject) => out.end((err?: Error | null) => (err ? reject(err) : resolve())));
+    return total;
+  } catch (err) {
+    out.destroy();
+    (stream as { destroy?: () => void }).destroy?.();
+    try { fs.unlinkSync(filePath); } catch { /* best effort */ }
+    throw err;
+  }
+}
+
+/**
+ * Pick the on-disk path for a download. `savePath` (already confined) may be:
+ *  - an existing file → overwrite-safe numbered sibling of it
+ *  - an existing directory → <dir>/<filename>
+ *  - a new path with an extension → that exact file (parent dirs created)
+ *  - a new path without an extension → treated as a new directory
+ */
+export function chooseSavePath(filename: string, downloadsDir: string, savePath?: string): string {
+  if (!savePath) return path.join(downloadsDir, filename);
+  if (fs.existsSync(savePath)) {
+    return fs.statSync(savePath).isDirectory() ? path.join(savePath, filename) : savePath;
+  }
+  return path.extname(savePath) ? savePath : path.join(savePath, filename);
+}
+
+function saveBuffer(data: Buffer, filename: string, downloadsDir: string, savePath?: string): string {
+  let finalPath = chooseSavePath(filename, downloadsDir, savePath);
+  // Ensure the target directory exists
+  fs.mkdirSync(path.dirname(finalPath), { recursive: true });
 
   let counter = 1;
   const ext = path.extname(finalPath);
@@ -283,7 +354,11 @@ export async function downloadFile(url: string, savePath?: string) {
 
   // Resolve host for this user, and get a fresh token (triggers re-login if stale)
   const d2lTokenData = await getD2LToken(userId);
-  const d2lHost = d2lTokenData?.host || process.env.D2L_HOST || 'learn.ul.ie';
+  const rawHost = d2lTokenData?.host || DEFAULT_D2L_HOST;
+  const d2lHost = resolveAllowedD2LHost(rawHost);
+  if (!d2lHost) {
+    throw new Error(`Stored D2L host "${rawHost}" is not an allowed D2L host; reconnect D2L with a supported host.`);
+  }
 
   const fullUrl = url.startsWith('http') ? url : `https://${normalizeHost(d2lHost)}${url.startsWith('/') ? '' : '/'}${url}`;
   // Only ever send the user's D2L session (cookies or authenticated browser)
@@ -325,7 +400,7 @@ export async function downloadFile(url: string, savePath?: string) {
         console.error(`[DOWNLOAD] Direct fetch status: ${response.status}, content-type: ${contentType}`);
 
         if (response.ok && !contentType.includes('text/html')) {
-          const data = Buffer.from(await response.arrayBuffer());
+          const data = await readBodyCapped(response);
 
           const contentDisposition = response.headers.get('content-disposition') || '';
           let filename = urlFilename;
@@ -355,6 +430,7 @@ export async function downloadFile(url: string, savePath?: string) {
         }
       }
     } catch (fetchErr: any) {
+      if (fetchErr instanceof DownloadTooLargeError) throw fetchErr;
       console.error(`[DOWNLOAD] Direct fetch error: ${fetchErr?.message} — falling back to browser`);
     }
   }
@@ -370,7 +446,12 @@ export async function downloadFile(url: string, savePath?: string) {
 
     const navContentType = navResponse?.headers()['content-type'] || '';
     if (navResponse && navResponse.ok() && !navContentType.includes('text/html')) {
+      // Refuse early when Content-Length announces an oversized body. Playwright
+      // has no streaming API for page responses (Chromium already holds the
+      // body), so without Content-Length the post-read check below is the cap.
+      assertContentLengthOk(navResponse.headers()['content-length']);
       const data = await navResponse.body();
+      if (data.length > MAX_DOWNLOAD_BYTES) throw new DownloadTooLargeError(data.length);
 
       const contentDisposition = navResponse.headers()['content-disposition'] || '';
       let filename = urlFilename;
@@ -435,7 +516,11 @@ export async function downloadFile(url: string, savePath?: string) {
         counter++;
       }
 
-      await download.saveAs(finalPath);
+      // Stream the download to disk with a running byte cap (instead of saveAs,
+      // which would write an arbitrarily large file before we could check it).
+      const readStream = await download.createReadStream();
+      if (!readStream) throw new Error('Browser download failed: no data stream available.');
+      await streamToFileCapped(readStream, finalPath);
       console.error(`[DOWNLOAD] Browser download saved: ${finalPath}`);
 
       const data = fs.readFileSync(finalPath);
@@ -465,7 +550,13 @@ export async function downloadFile(url: string, savePath?: string) {
  * download/read/delete all agree. Anything resolving (after symlinks) outside
  * the user's directory is rejected.
  */
-export function resolveFilePath(filePath: string, userId: string = getUserId(), base?: string): string {
+export function resolveFilePath(
+  filePath: string,
+  userId: string = getUserId(),
+  base?: string,
+  opts: { allowSubstringMatch?: boolean } = {},
+): string {
+  const allowSubstringMatch = opts.allowSubstringMatch ?? true;
   const userDir = getUserFilesDir(userId, base);
 
   // Exact path (absolute, or relative to the user's directory).
@@ -476,9 +567,11 @@ export function resolveFilePath(filePath: string, userId: string = getUserId(), 
     try {
       const needle = path.basename(filePath).toLowerCase();
       const files = fs.readdirSync(userDir);
+      // Exact name, then case-insensitive exact name, then (reads only) substring.
       const matchingFile =
         files.find((f) => f === path.basename(filePath)) ??
-        files.find((f) => needle && f.toLowerCase().includes(needle));
+        files.find((f) => needle && f.toLowerCase() === needle) ??
+        (allowSubstringMatch ? files.find((f) => needle && f.toLowerCase().includes(needle)) : undefined);
       if (matchingFile) {
         finalPath = confinePath(userDir, matchingFile);
       }
@@ -624,7 +717,8 @@ export async function deleteFile(filePath: string): Promise<{
   filename: string;
   deleted: boolean;
 }> {
-  const finalPath = resolveFilePath(filePath);
+  // Deletion is destructive: never fall back to a fuzzy substring match.
+  const finalPath = resolveFilePath(filePath, getUserId(), undefined, { allowSubstringMatch: false });
 
   try {
     fs.unlinkSync(finalPath);

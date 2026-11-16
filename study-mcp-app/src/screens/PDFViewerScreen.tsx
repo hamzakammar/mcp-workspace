@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
@@ -12,10 +12,9 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRoute, useNavigation } from '@react-navigation/native';
 import { AntDesign } from '@expo/vector-icons';
 import Pdf from 'react-native-pdf';
-import { apiClient } from '../config/api';
+import { apiClient, BASE_URL } from '../config/api';
 import { supabase } from '../lib/supabase';
 
-const BASE_URL = 'https://horizon.hamzaammar.ca/api';
 const { width } = Dimensions.get('window');
 
 interface RouteParams {
@@ -37,14 +36,31 @@ export default function PDFViewerScreen() {
   const [saved, setSaved] = useState(false);
   const [authHeader, setAuthHeader] = useState<string>('');
 
-  // Get auth token for PDF header
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
+  // Get auth token for PDF header. getSession() refreshes an expired access
+  // token, so calling this again on Retry recovers from a stale header.
+  const loadAuthHeader = useCallback(async () => {
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
       if (session?.access_token) {
         setAuthHeader(`Bearer ${session.access_token}`);
+      } else {
+        setError('Not signed in. Please log in again.');
       }
-    });
+    } catch (e: any) {
+      setError(e?.message || 'Could not get auth session');
+    }
   }, []);
+
+  useEffect(() => {
+    loadAuthHeader();
+  }, [loadAuthHeader]);
+
+  const handleRetry = () => {
+    setError(null);
+    setLoading(true);
+    setAuthHeader('');
+    loadAuthHeader();
+  };
 
   const proxyUrl = `${BASE_URL}/d2l/courses/${courseId}/file?url=${encodeURIComponent(fileUrl)}`;
 
@@ -112,7 +128,7 @@ export default function PDFViewerScreen() {
           <AntDesign name="warning" size={48} color="#f59e0b" />
           <Text style={styles.errorTitle}>Failed to load PDF</Text>
           <Text style={styles.errorText}>{error}</Text>
-          <TouchableOpacity style={styles.retryButton} onPress={() => setError(null)}>
+          <TouchableOpacity style={styles.retryButton} onPress={handleRetry}>
             <Text style={styles.retryText}>Retry</Text>
           </TouchableOpacity>
         </View>

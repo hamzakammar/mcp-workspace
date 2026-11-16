@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { client } from '../client.js';
+import { isQuizAttemptCompleted, loadQuizAttemptSummary, type RawQuizAttempt } from '../utils/marshal.js';
 
 interface RawQuiz {
   QuizId: number;
@@ -20,12 +21,7 @@ interface RawQuiz {
   Description: { Text: string; Html: string } | null;
 }
 
-interface RawAttempt {
-  AttemptId: number;
-  CompletionDate: string | null;
-  Score: number | null;
-  IsCompleted: boolean;
-}
+type RawAttempt = RawQuizAttempt & { CompletionDate?: string | null };
 
 export interface MarshalledQuiz {
   quizId: string;
@@ -33,20 +29,19 @@ export interface MarshalledQuiz {
   dueDate: string | null;
   timeLimitMinutes: number | null;
   attemptsAllowed: number | null; // null = unlimited
-  attemptsUsed: number;
+  attemptsUsed: number | null; // null when attempts could not be loaded
   lastAttemptScore: number | null;
+  attemptsUnknown?: true;
 }
 
-function marshalQuiz(
+export function marshalQuiz(
   quiz: RawQuiz,
-  attempts: RawAttempt[]
+  attempts: RawAttempt[],
+  attemptsUnknown = false
 ): MarshalledQuiz {
-  const completedAttempts = attempts.filter((a) => a.IsCompleted);
-  const lastAttempt = completedAttempts.sort(
-    (a, b) =>
-      new Date(b.CompletionDate || 0).getTime() -
-      new Date(a.CompletionDate || 0).getTime()
-  )[0];
+  const completedAttempts = attempts.filter(isQuizAttemptCompleted);
+  const completedAt = (a: RawAttempt) => new Date(a.Completed || a.CompletionDate || 0).getTime();
+  const lastAttempt = [...completedAttempts].sort((a, b) => completedAt(b) - completedAt(a))[0];
 
   return {
     quizId: String(quiz.QuizId),
@@ -60,8 +55,9 @@ function marshalQuiz(
       quiz.AttemptsAllowed?.IsUnlimited
         ? null
         : (quiz.AttemptsAllowed?.NumberOfAttemptsAllowed ?? null),
-    attemptsUsed: completedAttempts.length,
+    attemptsUsed: attemptsUnknown ? null : completedAttempts.length,
     lastAttemptScore: lastAttempt?.Score ?? null,
+    ...(attemptsUnknown ? { attemptsUnknown: true as const } : {}),
   };
 }
 
@@ -85,17 +81,9 @@ export const quizTools = {
       // Fetch attempts for each quiz in parallel
       const results = await Promise.all(
         quizList.map(async (quiz) => {
-          let attempts: RawAttempt[] = [];
-          try {
-            const attemptsRaw = await client.getQuizAttempts(orgUnitId, quiz.QuizId) as { Objects: RawAttempt[] } | RawAttempt[];
-            attempts = Array.isArray(attemptsRaw)
-              ? attemptsRaw
-              : (attemptsRaw as { Objects: RawAttempt[] }).Objects || [];
-          } catch {
-            // Attempts endpoint may return 403/404 for unstarted quizzes — treat as 0 attempts
-            attempts = [];
-          }
-          return marshalQuiz(quiz, attempts);
+          // 404 → no attempts; any other failure → attemptsUnknown (not "0 used").
+          const summary = await loadQuizAttemptSummary(() => client.getQuizAttempts(orgUnitId, quiz.QuizId));
+          return marshalQuiz(quiz, summary.attempts as RawAttempt[], summary.unknown);
         })
       );
 

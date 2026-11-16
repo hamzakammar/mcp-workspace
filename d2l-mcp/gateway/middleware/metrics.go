@@ -8,8 +8,26 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	gometrics "github.com/hamzakammar/horizon-gateway/metrics"
 )
+
+// unmatchedRoute is the label used when no chi route pattern is available.
+const unmatchedRoute = "unmatched"
+
+// routeLabel returns a low-cardinality route label: the chi route pattern
+// (e.g. "/health", "/*"), never the raw path, which can contain per-session
+// UUIDs (VNC/onboarding) that would leak via /metrics. Must be called AFTER
+// next.ServeHTTP, since chi fills the pattern during routing.
+func routeLabel(r *http.Request) string {
+	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if p := rctx.RoutePattern(); p != "" {
+			return p
+		}
+	}
+	return unmatchedRoute
+}
 
 // responseWriter wraps http.ResponseWriter to capture the status code.
 type responseWriter struct {
@@ -53,13 +71,13 @@ func Metrics(next http.Handler) http.Handler {
 
 		duration := time.Since(start).Seconds()
 		status := strconv.Itoa(rw.status)
-		route := r.URL.Path
+		route := routeLabel(r)
 		method := r.Method
 
 		labels := []string{method, route, status}
 		gometrics.RequestDuration.WithLabelValues(labels...).Observe(duration)
 		gometrics.RequestsTotal.WithLabelValues(labels...).Inc()
 
-		fmt.Printf("[%s] %s %s %d (%.3fs)\n", time.Now().Format(time.RFC3339), method, route, rw.status, duration)
+		fmt.Printf("[%s] %s %s %d (%.3fs)\n", time.Now().Format(time.RFC3339), method, r.URL.Path, rw.status, duration)
 	})
 }

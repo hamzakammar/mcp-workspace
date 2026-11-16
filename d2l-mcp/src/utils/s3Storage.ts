@@ -17,6 +17,8 @@
 import path from "path";
 import os from "os";
 import fs from "fs/promises";
+import { randomBytes } from "crypto";
+import type { BrowserContextOptions } from "playwright";
 import {
   S3Client,
   GetObjectCommand,
@@ -52,17 +54,112 @@ function isStateExpired(capturedAt: string): boolean {
   return ageMs > STORAGE_STATE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
 }
 
+/** Parsed Playwright storage state, passable directly as `newContext({ storageState })`. */
+export type StorageStateObject = Exclude<NonNullable<BrowserContextOptions["storageState"]>, string>;
+
+export interface LoadStorageStateOpts {
+  rejectIfLegacy?: boolean;
+  ignoreExpiry?: boolean;
+}
+
+/**
+ * Build a unique, per-call temp file path for decrypted storage state.
+ * Includes the service and a random suffix so concurrent loads (different
+ * services, or the same service twice) never share or clobber a file.
+ */
+export function storageStateTempPath(userId: string, service?: string): string {
+  const svc = (service || "d2l").replace(/[^a-z0-9_-]/gi, "");
+  const uid = userId.replace(/[^a-z0-9_-]/gi, "");
+  return path.join(os.tmpdir(), `browser-state-${svc}-${uid}-${randomBytes(8).toString("hex")}.json`);
+}
+
+/** Services whose state can be written via storageStateTempPath. Listed
+ * explicitly because both service and user id may contain '-'. */
+const STORAGE_STATE_TEMP_SERVICES = ["d2l", "outline", "crowdmark", "piazza"];
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * True if `name` (a bare file name in os.tmpdir()) is a temp file holding
+ * browser/session state for exactly `userId`. Used by account deletion.
+ * Matches:
+ *  - storageStateTempPath(): browser-state-<svc>-<sanitized uid>-<16 hex>.json
+ *  - legacy fixed name: browser-state-<uid>.json
+ *  - fixed-name save temp files: silent-relogin-state-<uid>.json,
+ *    cred-login-state-<uid>.json, refresh-state-<uid>.json,
+ *    crowdmark-refresh-<uid>.json, and outline-state-<uid>-<ms>.json
+ * Every pattern is anchored, so 'dev' never matches 'dev-user' files.
+ */
+export function isStorageStateTempFileFor(name: string, userId: string): boolean {
+  if (!userId) return false;
+  const uid = userId.replace(/[^a-z0-9_-]/gi, "");
+  if (uid) {
+    const svc = STORAGE_STATE_TEMP_SERVICES.join("|");
+    if (new RegExp(`^browser-state-(?:${svc})-${escapeRegex(uid)}-[0-9a-f]{16}\\.json$`).test(name)) return true;
+  }
+  const exact = [
+    `browser-state-${userId}.json`,
+    `silent-relogin-state-${userId}.json`,
+    `cred-login-state-${userId}.json`,
+    `refresh-state-${userId}.json`,
+    `crowdmark-refresh-${userId}.json`,
+  ];
+  if (exact.includes(name)) return true;
+  return new RegExp(`^outline-state-${escapeRegex(userId)}-\\d+\\.json$`).test(name);
+}
+
+/**
+ * Download and decrypt browser storage state from S3, returning the parsed
+ * object (no plaintext ever touches disk). Prefer this over
+ * loadStorageStateFromS3 and pass the result straight to
+ * `browser.newContext({ storageState })`.
+ *
+ * Returns `undefined` on the same conditions as loadStorageStateFromS3, or if
+ * the stored plaintext is not valid JSON.
+ */
+export async function loadStorageStateObjectFromS3(
+  userId: string,
+  service?: string,
+  opts?: LoadStorageStateOpts
+): Promise<StorageStateObject | undefined> {
+  const plaintext = await loadStorageStatePlaintext(userId, service, opts);
+  if (plaintext === undefined) return undefined;
+  try {
+    return JSON.parse(plaintext) as StorageStateObject;
+  } catch {
+    console.error(`[S3] Storage state for user ${userId} is not valid JSON — ignoring`);
+    return undefined;
+  }
+}
+
 /**
  * Download and decrypt browser storage state from S3.
- * Returns the local temp file path on success, or `undefined` if:
+ * Returns a local temp file path on success, or `undefined` if:
  *   - the object does not exist
  *   - the state is expired (> STORAGE_STATE_MAX_AGE_DAYS days old)
  *   - decryption fails
+ *
+ * The temp file is unique per call (mode 0600); the CALLER MUST DELETE IT once
+ * the browser context has read it. Prefer loadStorageStateObjectFromS3.
  */
 export async function loadStorageStateFromS3(
   userId: string,
   service?: string,
-  opts?: { rejectIfLegacy?: boolean; ignoreExpiry?: boolean }
+  opts?: LoadStorageStateOpts
+): Promise<string | undefined> {
+  const plaintext = await loadStorageStatePlaintext(userId, service, opts);
+  if (plaintext === undefined) return undefined;
+  const tmpPath = storageStateTempPath(userId, service);
+  await fs.writeFile(tmpPath, plaintext, { encoding: "utf-8", mode: 0o600 });
+  return tmpPath;
+}
+
+async function loadStorageStatePlaintext(
+  userId: string,
+  service: string | undefined,
+  opts: LoadStorageStateOpts | undefined
 ): Promise<string | undefined> {
   const key = storageStateKey(userId, service);
   try {
@@ -84,12 +181,10 @@ export async function loadStorageStateFromS3(
       }
 
       const { plaintext } = await decryptEnvelope(data);
-      const tmpPath = path.join(os.tmpdir(), `browser-state-${userId}.json`);
-      await fs.writeFile(tmpPath, plaintext, "utf-8");
       console.error(`[S3] Loaded and decrypted browser storage state for user ${userId}`);
 
       await logCredentialAccess(userId, "s3_state", "read", "loadStorageStateFromS3");
-      return tmpPath;
+      return plaintext;
 
     } else {
       // ── Legacy unencrypted object ─────────────────────────────────────
@@ -118,11 +213,9 @@ export async function loadStorageStateFromS3(
         `Will be re-encrypted on next successful auth.`
       );
       const plaintext = data.toString("utf-8");
-      const tmpPath = path.join(os.tmpdir(), `browser-state-${userId}.json`);
-      await fs.writeFile(tmpPath, plaintext, "utf-8");
 
       await logCredentialAccess(userId, "s3_state", "read", "loadStorageStateFromS3:legacy");
-      return tmpPath;
+      return plaintext;
     }
   } catch (e: any) {
     if (e?.name === "NoSuchKey" || e?.$metadata?.httpStatusCode === 404) {
@@ -140,12 +233,14 @@ export async function loadStorageStateFromS3(
  * also stored as S3 object metadata so the TTL job can check age cheaply.
  *
  * @param userId     The user ID.
- * @param statePath  Path to the local JSON file to upload.
+ * @param statePath  Path to the local JSON file to upload, OR the storage state
+ *                   object itself (from `await context.storageState()`) — prefer
+ *                   the object so plaintext never touches disk.
  * @param capturedAt When the session was captured (defaults to now).
  */
 export async function saveStorageStateToS3(
   userId: string,
-  statePath: string,
+  statePath: string | StorageStateObject,
   capturedAt?: Date,
   service?: string
 ): Promise<void> {
@@ -153,7 +248,9 @@ export async function saveStorageStateToS3(
   const captureTime = capturedAt ?? new Date();
 
   try {
-    const plaintext = await fs.readFile(statePath, "utf-8");
+    const plaintext = typeof statePath === "string"
+      ? await fs.readFile(statePath, "utf-8")
+      : JSON.stringify(statePath);
 
     if (KMS_KEY_ARN) {
       // ── Encrypted path (production) ───────────────────────────────────

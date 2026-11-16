@@ -63,7 +63,12 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     try {
       const result = await authService.handleLogin(email, password);
       if (result?.user) {
-        setUser(result.user);
+        // Same {id,email,name} shape onAuthStateChange sets (not the raw Supabase User).
+        setUser({
+          id: result.user.id,
+          email: result.user.email || '',
+          name: result.user.user_metadata?.name || '',
+        });
         setIsAuthenticated(true);
       } else {
         throw new Error('Login failed: No user data returned');

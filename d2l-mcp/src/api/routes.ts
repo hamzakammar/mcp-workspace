@@ -16,6 +16,12 @@ import { registerDeviceToken, sendPushToUser, checkAndNotifyUpdates } from "./pu
 import { encryptPassword, d2lPasswordContext } from "../utils/kms.js";
 import { logCredentialAccess } from "../utils/auditLog.js";
 import { deleteAllUserData } from "../utils/deleteUserData.js";
+import { resolveAllowedD2LHost, DEFAULT_D2L_HOST } from "../utils/d2lHost.js";
+import { signNotionState } from "./oauth/crypto.js";
+import { Readable, Transform, pipeline } from "node:stream";
+import { lookup as dnsLookup } from "node:dns/promises";
+import net from "node:net";
+import { isPrivateIp } from "../study/src/courseWebsite/fetcher.js";
 
 
 /**
@@ -34,7 +40,211 @@ function resolveD2LFileUrl(fileUrl: string, d2lHost: string): string | null {
   }
 }
 
+type FetchResponse = globalThis.Response;
+
+/** Upper bound on files proxied/saved from D2L. */
+export const MAX_D2L_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_D2L_REDIRECTS = 5;
+
+export class D2LFileFetchError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+export type HostLookup = (host: string) => Promise<Array<{ address: string }>>;
+const defaultLookup: HostLookup = (host) => dnsLookup(host, { all: true });
+
+export interface SafeFetchOptions {
+  fetchImpl?: typeof fetch;
+  /** Abort if response headers haven't arrived within this long (default 60s). */
+  headerTimeoutMs?: number;
+  lookup?: HostLookup;
+}
+
+/** Throws unless every address `host` resolves to is public (no SSRF to internal ranges). */
+async function assertPublicHost(hostname: string, lookup: HostLookup): Promise<void> {
+  const bare = hostname.replace(/^\[(.*)\]$/, "$1");
+  let addrs: Array<{ address: string }>;
+  if (net.isIP(bare)) {
+    addrs = [{ address: bare }];
+  } else {
+    try { addrs = await lookup(bare); } catch { throw new D2LFileFetchError(502, "Could not resolve file redirect host"); }
+  }
+  if (addrs.length === 0 || addrs.some((a) => isPrivateIp(a.address))) {
+    throw new D2LFileFetchError(502, "D2L redirected to a disallowed address");
+  }
+}
+
+/**
+ * Fetch a D2L file, following redirects manually (max 5) so each hop is
+ * re-checked:
+ *  - https on the user's (allowed) D2L host (exact host incl. port) → sent
+ *    WITH the session cookie;
+ *  - any other https host (e.g. a signed CDN URL) → allowed only if it
+ *    resolves to public IPs, and sent WITHOUT the cookie;
+ *  - anything else → 502.
+ * The header timeout is cleared once headers arrive; the returned controller
+ * can abort the body (idle timeout / client disconnect).
+ */
+export async function fetchD2LFileSafely(
+  startUrl: string,
+  d2lHost: string,
+  cookieHeader: string,
+  opts: SafeFetchOptions = {},
+): Promise<{ resp: FetchResponse; controller: AbortController }> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const lookup = opts.lookup ?? defaultLookup;
+  const controller = new AbortController();
+  const headerTimer = setTimeout(
+    () => controller.abort(new D2LFileFetchError(504, "Timed out waiting for D2L")),
+    opts.headerTimeoutMs ?? 60_000,
+  );
+  try {
+    let url = startUrl;
+    for (let hop = 0; hop <= MAX_D2L_REDIRECTS; hop++) {
+      let parsed: URL;
+      try { parsed = new URL(url); } catch { throw new D2LFileFetchError(502, "Invalid redirect target from D2L"); }
+      if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+        throw new D2LFileFetchError(502, "D2L redirected to a non-https URL");
+      }
+      const onD2L = parsed.host.toLowerCase() === d2lHost.toLowerCase();
+      if (!onD2L) {
+        if (hop === 0) throw new D2LFileFetchError(400, "Only files hosted on your D2L site can be proxied");
+        await assertPublicHost(parsed.hostname, lookup);
+      }
+      const resp = await fetchImpl(url, {
+        headers: onD2L ? { Cookie: cookieHeader } : {},
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      if (resp.status >= 300 && resp.status < 400 && resp.status !== 304) {
+        const location = resp.headers.get("location");
+        try { await resp.body?.cancel(); } catch { /* ignore */ }
+        if (!location) throw new D2LFileFetchError(502, "D2L redirect without a Location header");
+        url = new URL(location, url).toString();
+        continue;
+      }
+      return { resp, controller };
+    }
+    throw new D2LFileFetchError(502, "Too many redirects from D2L");
+  } catch (e) {
+    if (controller.signal.aborted && controller.signal.reason instanceof D2LFileFetchError) throw controller.signal.reason;
+    throw e;
+  } finally {
+    clearTimeout(headerTimer);
+  }
+}
+
+/** Default idle timeout for D2L file bodies: abort if no data arrives for this long. */
+export const D2L_BODY_IDLE_MS = 30_000;
+
+/** True if the declared content length is over `max`. */
+export function exceedsMaxSize(resp: FetchResponse, max = MAX_D2L_FILE_BYTES): boolean {
+  const len = Number(resp.headers.get("content-length"));
+  return Number.isFinite(len) && len > max;
+}
+
+/**
+ * Read a response body into a Buffer, aborting once it exceeds `max` bytes or
+ * when no data arrives for `idleMs`.
+ */
+export async function readBodyWithLimit(resp: FetchResponse, max = MAX_D2L_FILE_BYTES, idleMs = D2L_BODY_IDLE_MS): Promise<Buffer> {
+  if (!resp.body) return Buffer.alloc(0);
+  const reader = resp.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const idle = new Promise<never>((_, reject) => {
+      idleTimer = setTimeout(() => reject(new D2LFileFetchError(504, "D2L stopped sending data")), idleMs);
+    });
+    let chunk: ReadableStreamReadResult<Uint8Array>;
+    try {
+      chunk = await Promise.race([reader.read(), idle]);
+    } catch (e) {
+      try { await reader.cancel(); } catch { /* ignore */ }
+      throw e;
+    } finally {
+      clearTimeout(idleTimer);
+    }
+    const { done, value } = chunk;
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      try { await reader.cancel(); } catch { /* ignore */ }
+      throw new D2LFileFetchError(413, `File exceeds ${Math.round(max / 1024 / 1024)} MB limit`);
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks);
+}
+
+/** Accept a body as PDF if it is labelled as one or starts with the PDF magic bytes. */
+export function looksLikePdf(contentType: string | null | undefined, buffer: Buffer): boolean {
+  if (buffer.length === 0) return false;
+  // PDF readers accept the header anywhere in the first 1 KB.
+  if (buffer.subarray(0, 1024).includes("%PDF-")) return true;
+  return /application\/(x-)?pdf/i.test(contentType || "");
+}
+
+/** Build the Cookie header from the stored D2L token (JSON session vals or raw cookie string). */
+function d2lCookieHeader(token: string): string {
+  try {
+    const parsed = JSON.parse(token);
+    if (parsed.d2lSessionVal && parsed.d2lSecureSessionVal) {
+      return `d2lSessionVal=${parsed.d2lSessionVal}; d2lSecureSessionVal=${parsed.d2lSecureSessionVal}`;
+    }
+  } catch {}
+  return token;
+}
+
+type D2LCredsSnapshot = { host: string | null; username: string | null; password: string | null; token: string | null; updated_at: string | null } | null;
+
+/** Read the user's current D2L credentials row (or null) before overwriting it. */
+export async function snapshotD2LCreds(sb: any, userId: string): Promise<D2LCredsSnapshot> {
+  const { data, error } = await sb
+    .from("user_credentials")
+    .select("host, username, password, token, updated_at")
+    .eq("user_id", userId)
+    .eq("service", "d2l")
+    .limit(1);
+  if (error) throw new Error(`Failed to read existing credentials: ${error.message || error}`);
+  const row = Array.isArray(data) ? data[0] : data;
+  return row ?? null;
+}
+
+/**
+ * Undo a failed connect attempt. With a previous row, restore just `fields`
+ * from it (other columns — e.g. saved username/password on a cookie connect —
+ * are never touched). With no previous row, the row holds only what this
+ * request wrote, so remove it. Returns the error, if any.
+ */
+export async function restoreD2LCreds(
+  sb: any,
+  userId: string,
+  previous: D2LCredsSnapshot,
+  fields: Array<"host" | "username" | "password" | "token" | "updated_at">,
+  written: { column: "token" | "password"; value: string },
+): Promise<unknown> {
+  // Only touch the row if it still holds what this request wrote: a concurrent
+  // successful connect/refresh must not be clobbered. Zero rows matched means
+  // someone else has already replaced it — nothing to roll back.
+  if (!previous) {
+    const { error } = await sb.from("user_credentials").delete()
+      .eq("user_id", userId).eq("service", "d2l").eq(written.column, written.value);
+    return error ?? null;
+  }
+  const patch: Record<string, unknown> = {};
+  for (const f of fields) patch[f] = previous[f] ?? null;
+  const { error } = await sb.from("user_credentials").update(patch)
+    .eq("user_id", userId).eq("service", "d2l").eq(written.column, written.value);
+  return error ?? null;
+}
+
 const router = Router();
+const MAX_NOTE_UPLOAD_BYTES = 60 * 1024 * 1024; // matches rawPdfUpload limit
+const MIME_TYPE_RE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i;
 const rawPdfUpload = express.raw({ type: "*/*", limit: "60mb" });
 
 import { randomBytes, createHash } from "node:crypto";
@@ -148,6 +358,18 @@ router.post("/notes/presign-upload", async (req: Request, res: Response) => {
     res.status(400).json({ error: "filename, contentType, and size required" });
     return;
   }
+  if (typeof filename !== "string" || filename.length > 255) {
+    res.status(400).json({ error: "filename must be a string of at most 255 characters" });
+    return;
+  }
+  if (typeof contentType !== "string" || contentType.length > 100 || !MIME_TYPE_RE.test(contentType)) {
+    res.status(400).json({ error: "contentType must be a valid MIME type" });
+    return;
+  }
+  if (!Number.isInteger(size) || size <= 0 || size > MAX_NOTE_UPLOAD_BYTES) {
+    res.status(400).json({ error: `size must be a positive integer up to ${MAX_NOTE_UPLOAD_BYTES} bytes` });
+    return;
+  }
   if (!isS3Configured()) {
     res.status(503).json({ error: "S3 not configured (AWS_REGION, S3_BUCKET)" });
     return;
@@ -200,7 +422,7 @@ router.post("/notes/process", async (req: Request, res: Response) => {
   const { s3Key, courseId, title } = req.body || {};
 
   // Validate input
-  if (!s3Key || !title) {
+  if (!s3Key || !title || typeof s3Key !== "string") {
     res.status(400).json({ error: "Invalid input: s3Key and title are required." });
     return;
   }
@@ -398,7 +620,7 @@ router.get("/notes", async (req: Request, res: Response) => {
     const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
     if (!sbUrl || !sbKey) throw new Error("Missing Supabase config");
     let url = `${sbUrl}/rest/v1/notes?user_id=eq.${userId}&select=id,title,course_id,created_at,page_count,status,s3_key&order=created_at.desc`;
-    if (courseId) url += `&course_id=eq.${courseId}`;
+    if (courseId) url += `&course_id=eq.${encodeURIComponent(courseId)}`;
     const resp = await fetch(url, {
       headers: { "apikey": sbKey, "Authorization": `Bearer ${sbKey}` },
     });
@@ -419,7 +641,7 @@ router.get("/notes/:id/view", async (req: Request, res: Response) => {
     const sbUrl = process.env.SUPABASE_URL;
     const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
     if (!sbUrl || !sbKey) throw new Error("Missing Supabase config");
-    const resp = await fetch(`${sbUrl}/rest/v1/notes?user_id=eq.${userId}&id=eq.${noteId}&select=s3_key&limit=1`, {
+    const resp = await fetch(`${sbUrl}/rest/v1/notes?user_id=eq.${encodeURIComponent(userId)}&id=eq.${encodeURIComponent(noteId)}&select=s3_key&limit=1`, {
       headers: { "apikey": sbKey, "Authorization": `Bearer ${sbKey}` },
     });
     if (!resp.ok) throw new Error(await resp.text());
@@ -454,7 +676,7 @@ router.delete("/notes/:id", async (req: Request, res: Response) => {
     const headers = { "apikey": sbKey, "Authorization": `Bearer ${sbKey}` };
 
     // First delete note_sections for this note/user
-    const secResp = await fetch(`${sbUrl}/rest/v1/note_sections?user_id=eq.${userId}&note_id=eq.${noteId}`, {
+    const secResp = await fetch(`${sbUrl}/rest/v1/note_sections?user_id=eq.${encodeURIComponent(userId)}&note_id=eq.${encodeURIComponent(noteId)}`, {
       method: "DELETE", headers,
     });
     if (!secResp.ok) {
@@ -465,7 +687,7 @@ router.delete("/notes/:id", async (req: Request, res: Response) => {
     }
 
     // Then delete the note itself
-    const noteResp = await fetch(`${sbUrl}/rest/v1/notes?user_id=eq.${userId}&id=eq.${noteId}`, {
+    const noteResp = await fetch(`${sbUrl}/rest/v1/notes?user_id=eq.${encodeURIComponent(userId)}&id=eq.${encodeURIComponent(noteId)}`, {
       method: "DELETE", headers: { ...headers, "Prefer": "return=representation" },
     });
     if (!noteResp.ok) {
@@ -479,6 +701,18 @@ router.delete("/notes/:id", async (req: Request, res: Response) => {
     if (!deletedNotes || deletedNotes.length === 0) {
       res.status(404).json({ error: "Note not found" });
       return;
+    }
+
+    // Best-effort: remove the uploaded PDF too, but only from this user's prefix.
+    const s3Key = deletedNotes[0]?.s3_key;
+    if (isS3Configured() && typeof s3Key === "string" && s3Key.startsWith(`users/${userId}/`)) {
+      try {
+        const { DeleteObjectCommand, S3Client } = await import("@aws-sdk/client-s3");
+        const s3 = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
+        await s3.send(new DeleteObjectCommand({ Bucket: getBucket(), Key: s3Key }));
+      } catch (s3Err) {
+        console.error("[API] notes delete - S3 object delete failed (ignored):", s3Err);
+      }
     }
 
     res.json({ status: "deleted", noteId });
@@ -651,10 +885,15 @@ router.post("/notes/embed-missing", async (req: Request, res: Response) => {
  *  the raw results here. No server-side D2L calls needed — avoids IP/session mismatch. */
 router.post("/d2l/connect-and-sync", async (req: Request, res: Response) => {
   const userId = req.userId!;
-  const { host, cookies, courseData } = req.body || {};
+  const { host: rawHost, cookies, courseData } = req.body || {};
 
-  if (!host || !cookies) {
+  if (!rawHost || !cookies) {
     res.status(400).json({ error: "host and cookies required" });
+    return;
+  }
+  const host = resolveAllowedD2LHost(rawHost);
+  if (!host) {
+    res.status(400).json({ error: "Unsupported D2L host" });
     return;
   }
 
@@ -761,16 +1000,25 @@ router.post("/d2l/connect-and-sync", async (req: Request, res: Response) => {
 /** POST /api/d2l/connect-cookie — Store D2L cookies directly (from WebView) */
 router.post("/d2l/connect-cookie", async (req: Request, res: Response) => {
   const userId = req.userId!;
-  const { host, cookies } = req.body || {};
+  const { host: rawHost, cookies } = req.body || {};
 
-  if (!host || !cookies) {
+  if (!rawHost || !cookies) {
     res.status(400).json({ error: "host and cookies required" });
+    return;
+  }
+  const host = resolveAllowedD2LHost(rawHost);
+  if (!host) {
+    res.status(400).json({ error: "Unsupported D2L host" });
     return;
   }
 
   const correlationId = `cookie-${Date.now()}-${Math.random().toString(36).substring(7)}`;
 
   try {
+    // Snapshot the existing row so a failed verification can roll back
+    // instead of wiping working credentials.
+    const previous = await snapshotD2LCreds(supabase, userId);
+
     // Store cookies in user_credentials table as the 'token'
     // Store cookies as token (cookie-based auth)
     const { error } = await supabase
@@ -812,12 +1060,11 @@ router.post("/d2l/connect-cookie", async (req: Request, res: Response) => {
     } catch (verifyError) {
       console.error(`[API] [${correlationId}] Cookie verification failed:`, verifyError);
 
-      // Delete invalid credentials
-      const { error: deleteError } = await supabase
-        .from("user_credentials")
-        .delete()
-        .eq("user_id", userId)
-        .eq("service", "d2l");
+      // Roll back to the previous token/host (saved username/password are untouched)
+      const restoreError = await restoreD2LCreds(supabase, userId, previous, ["host", "token", "updated_at"], { column: "token", value: cookies });
+      if (restoreError) {
+        console.error(`[API] [${correlationId}] Failed to restore previous credentials:`, restoreError);
+      }
 
       res.status(400).json({
         error: "Invalid or expired cookies. Please try logging in again.",
@@ -838,16 +1085,23 @@ router.post("/d2l/connect-cookie", async (req: Request, res: Response) => {
 /** POST /api/d2l/token — Store D2L token directly (from WebView login) */
 router.post("/d2l/token", async (req: Request, res: Response) => {
   const userId = req.userId!;
-  const { host, token } = req.body || {};
+  const { host: rawHost, token } = req.body || {};
 
-  if (!host || !token) {
+  if (!rawHost || !token) {
     res.status(400).json({ error: "host and token required" });
+    return;
+  }
+  const host = resolveAllowedD2LHost(rawHost);
+  if (!host) {
+    res.status(400).json({ error: "Unsupported D2L host" });
     return;
   }
 
   const correlationId = `token-${Date.now()}-${Math.random().toString(36).substring(7)}`;
 
   try {
+    const previous = await snapshotD2LCreds(supabase, userId);
+
     // Store token in user_credentials table
     const { error } = await supabase
       .from("user_credentials")
@@ -888,18 +1142,12 @@ router.post("/d2l/token", async (req: Request, res: Response) => {
     } catch (verifyError) {
       console.error(`[API] [${correlationId}] Token verification failed:`, verifyError);
 
-      // Delete invalid token from database
-      const { error: deleteError } = await supabase
-        .from("user_credentials")
-        .delete()
-        .eq("user_id", userId)
-        .eq("service", "d2l")
-        .eq("token", token); // Only delete this specific token
-
-      if (deleteError) {
-        console.error(`[API] [${correlationId}] Failed to delete invalid token:`, deleteError);
+      // Roll back to the previous token/host (saved username/password are untouched)
+      const restoreError = await restoreD2LCreds(supabase, userId, previous, ["host", "token", "updated_at"], { column: "token", value: token });
+      if (restoreError) {
+        console.error(`[API] [${correlationId}] Failed to restore previous token:`, restoreError);
       } else {
-        console.error(`[API] [${correlationId}] Deleted invalid token from database`);
+        console.error(`[API] [${correlationId}] Rolled back invalid token`);
       }
 
       res.status(400).json({
@@ -920,14 +1168,21 @@ router.post("/d2l/token", async (req: Request, res: Response) => {
 
 router.post("/d2l/connect", async (req: Request, res: Response) => {
   const userId = req.userId!;
-  const { host, username, password } = req.body || {};
+  const { host: rawHost, username, password } = req.body || {};
 
-  if (!host || !username || !password) {
+  if (!rawHost || !username || !password) {
     res.status(400).json({ error: "host, username, and password required" });
+    return;
+  }
+  const host = resolveAllowedD2LHost(rawHost);
+  if (!host) {
+    res.status(400).json({ error: "Unsupported D2L host" });
     return;
   }
 
   try {
+    const previous = await snapshotD2LCreds(supabase, userId);
+
     // First, verify credentials by attempting to authenticate
     // Store credentials with KMS-encrypted password, bound to this user (AAD)
     const encryptedPassword = await encryptPassword(password, d2lPasswordContext(userId));
@@ -961,12 +1216,36 @@ router.post("/d2l/connect", async (req: Request, res: Response) => {
       return { success: true };
     })();
     
-    const timeoutPromise = new Promise((_, reject) => 
-      setTimeout(() => reject(new Error("Authentication timeout - the login process is taking too long. This may be due to 2FA or additional verification steps.")), authTimeout)
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        reject(new Error("Authentication timeout - the login process is taking too long. This may be due to 2FA or additional verification steps."));
+      }, authTimeout);
+    });
+    const rollback = async () => {
+      const restoreError = await restoreD2LCreds(supabase, userId, previous, ["host", "username", "password", "updated_at"], { column: "password", value: encryptedPassword });
+      if (restoreError) {
+        console.error("[API] d2l/connect failed to restore previous credentials:", restoreError);
+      }
+    };
+    // The D2L login can't be cancelled. If the timeout wins, defer the rollback
+    // until the attempt actually settles: rolling back now would let a late
+    // success persist a session token for the new credentials next to the
+    // restored old ones. Late success → keep the (proven) new credentials;
+    // late failure → roll back as usual.
+    authPromise.then(
+      () => { if (timedOut) console.error("[API] d2l/connect: authentication succeeded after timeout; keeping new credentials"); },
+      async () => { if (timedOut) await rollback().catch(() => {}); },
     );
 
     try {
-      await Promise.race([authPromise, timeoutPromise]);
+      try {
+        await Promise.race([authPromise, timeoutPromise]);
+      } finally {
+        clearTimeout(timeoutTimer);
+      }
 
       // If we get here, authentication succeeded
       res.json({
@@ -974,12 +1253,10 @@ router.post("/d2l/connect", async (req: Request, res: Response) => {
         message: "D2L credentials verified and stored successfully"
       });
     } catch (authError) {
-      // Authentication failed - remove the credentials we just stored
-      const deleteResult = await supabase
-        .from("user_credentials")
-        .delete()
-        .eq("user_id", userId)
-        .eq("service", "d2l");
+      // Authentication failed - roll back to whatever was stored before this
+      // attempt (previous username/password/token are kept, not deleted).
+      // On timeout the rollback is deferred until the attempt settles (above).
+      if (!timedOut) await rollback();
 
       console.error("[API] d2l/connect authentication failed:", authError);
       const errorMessage = authError instanceof Error ? authError.message : String(authError);
@@ -1485,7 +1762,13 @@ router.get("/d2l/courses/:courseId/file", async (req: Request, res: Response) =>
       return;
     }
 
-    const fullUrl = resolveD2LFileUrl(fileUrl, creds.host);
+    const d2lHost = resolveAllowedD2LHost(creds.host || DEFAULT_D2L_HOST);
+    if (!d2lHost) {
+      res.status(400).json({ error: "Unsupported D2L host" });
+      return;
+    }
+
+    const fullUrl = resolveD2LFileUrl(fileUrl, d2lHost);
     if (!fullUrl) {
       res.status(400).json({ error: "Only files hosted on your D2L site can be proxied. Open external links directly." });
       return;
@@ -1494,22 +1777,18 @@ router.get("/d2l/courses/:courseId/file", async (req: Request, res: Response) =>
     // Fetch with session cookies
     const { getToken } = await import("../auth.js");
     const token = await getToken(userId);
-    let cookieHeader = token;
-    try {
-      const parsed = JSON.parse(token);
-      if (parsed.d2lSessionVal && parsed.d2lSecureSessionVal) {
-        cookieHeader = `d2lSessionVal=${parsed.d2lSessionVal}; d2lSecureSessionVal=${parsed.d2lSecureSessionVal}`;
-      }
-    } catch {}
+    const cookieHeader = d2lCookieHeader(token);
 
-    const fetchResp = await fetch(fullUrl, {
-      headers: { Cookie: cookieHeader },
-      redirect: "follow", // undici drops Cookie on cross-origin redirects
-      signal: AbortSignal.timeout(60_000),
-    });
+    const { resp: fetchResp, controller } = await fetchD2LFileSafely(fullUrl, d2lHost, cookieHeader);
 
     if (!fetchResp.ok) {
+      try { await fetchResp.body?.cancel(); } catch { /* ignore */ }
       res.status(fetchResp.status).json({ error: `D2L returned ${fetchResp.status}` });
+      return;
+    }
+    if (exceedsMaxSize(fetchResp)) {
+      try { await fetchResp.body?.cancel(); } catch { /* ignore */ }
+      res.status(413).json({ error: "File too large to proxy" });
       return;
     }
 
@@ -1519,20 +1798,56 @@ router.get("/d2l/courses/:courseId/file", async (req: Request, res: Response) =>
     // smuggle additional header directives (CR/LF, quotes, backslashes).
     const filename = rawName.replace(/[\r\n"\\]/g, "_").slice(0, 200) || "file.pdf";
 
+    // Only PDFs render inline; anything else (HTML, SVG, ...) is forced to
+    // download so D2L-hosted content can't run script on our origin.
+    const isPdf = /^application\/(x-)?pdf\b/i.test(contentType);
     res.setHeader("Content-Type", contentType);
-    res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Disposition", `${isPdf ? "inline" : "attachment"}; filename="${filename}"`);
     res.setHeader("Cache-Control", "private, max-age=3600");
 
-    // Stream response body
-    const body = fetchResp.body as any;
-    if (body && body.pipe) {
-      body.pipe(res);
-    } else {
-      const buffer = await fetchResp.arrayBuffer();
-      res.send(Buffer.from(buffer));
+    // Stream response body, cutting it off if it grows past the size cap or
+    // stalls. pipeline() tears everything down (incl. the upstream fetch) on
+    // error or client disconnect.
+    if (!fetchResp.body) {
+      res.end();
+      return;
     }
+    let streamed = 0;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const limiter = new Transform({
+      transform(chunk: Buffer, _enc, cb) {
+        armIdle();
+        streamed += chunk.length;
+        if (streamed > MAX_D2L_FILE_BYTES) {
+          cb(new D2LFileFetchError(413, "File too large to proxy"));
+          return;
+        }
+        cb(null, chunk);
+      },
+      flush(cb) { clearTimeout(idleTimer); cb(); },
+    });
+    function armIdle() {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => limiter.destroy(new D2LFileFetchError(504, "D2L stopped sending data")), D2L_BODY_IDLE_MS);
+    }
+    armIdle();
+    pipeline(Readable.fromWeb(fetchResp.body as any), limiter, res, (err) => {
+      clearTimeout(idleTimer);
+      if (!err) return;
+      controller.abort();
+      if ((err as any)?.code !== "ERR_STREAM_PREMATURE_CLOSE") {
+        console.error("[API] d2l file proxy stream error:", err);
+      }
+      if (!res.headersSent) res.status(502).json({ error: "Failed to proxy file" });
+      else res.destroy();
+    });
   } catch (e: any) {
     console.error("[API] d2l file proxy error:", e);
+    if (e instanceof D2LFileFetchError) {
+      res.status(e.status).json({ error: e.message });
+      return;
+    }
     res.status(500).json({ error: "Failed to proxy file", details: e.message });
   }
 });
@@ -1567,7 +1882,13 @@ router.post("/d2l/courses/:courseId/file/save", async (req: Request, res: Respon
       return;
     }
 
-    const fullUrl = resolveD2LFileUrl(fileUrl, creds.host);
+    const d2lHost = resolveAllowedD2LHost(creds.host || DEFAULT_D2L_HOST);
+    if (!d2lHost) {
+      res.status(400).json({ error: "Unsupported D2L host" });
+      return;
+    }
+
+    const fullUrl = resolveD2LFileUrl(fileUrl, d2lHost);
     if (!fullUrl) {
       res.status(400).json({ error: "Only files hosted on your D2L site can be proxied. Open external links directly." });
       return;
@@ -1575,28 +1896,28 @@ router.post("/d2l/courses/:courseId/file/save", async (req: Request, res: Respon
 
     const { getToken } = await import("../auth.js");
     const token2 = await getToken(userId);
-    let cookieHeader = token2;
-    try {
-      const parsed = JSON.parse(token2);
-      if (parsed.d2lSessionVal && parsed.d2lSecureSessionVal) {
-        cookieHeader = `d2lSessionVal=${parsed.d2lSessionVal}; d2lSecureSessionVal=${parsed.d2lSecureSessionVal}`;
-      }
-    } catch {}
+    const cookieHeader = d2lCookieHeader(token2);
 
     // Download PDF buffer
     console.error(`[API] Downloading D2L file: ${fullUrl}`);
-    const fetchResp = await fetch(fullUrl, {
-      headers: { Cookie: cookieHeader },
-      redirect: "follow", // undici drops Cookie on cross-origin redirects
-      signal: AbortSignal.timeout(60_000),
-    });
+    const { resp: fetchResp } = await fetchD2LFileSafely(fullUrl, d2lHost, cookieHeader);
 
     if (!fetchResp.ok) {
+      try { await fetchResp.body?.cancel(); } catch { /* ignore */ }
       res.status(fetchResp.status).json({ error: `D2L returned ${fetchResp.status}` });
       return;
     }
+    if (exceedsMaxSize(fetchResp)) {
+      try { await fetchResp.body?.cancel(); } catch { /* ignore */ }
+      res.status(413).json({ error: "File too large to save" });
+      return;
+    }
 
-    const buffer = Buffer.from(await fetchResp.arrayBuffer());
+    const buffer = await readBodyWithLimit(fetchResp);
+    if (!looksLikePdf(fetchResp.headers.get("content-type"), buffer)) {
+      res.status(415).json({ error: "Only PDF files can be saved as notes" });
+      return;
+    }
     const safeTitle = title.replace(/[^a-zA-Z0-9-_ ]/g, "").trim() || "document";
     const noteId = crypto.randomUUID();
     const s3Key = `users/${userId}/notes/${noteId}-${safeTitle.replace(/ /g, "_")}.pdf`;
@@ -1629,18 +1950,34 @@ router.post("/d2l/courses/:courseId/file/save", async (req: Request, res: Respon
     // Process PDF
     const { ingestPdfBuffer } = await import("../study/src/notes.js");
     const s3Url = `s3://${getBucket()}/${s3Key}`;
-    const { chunkCount, pageCount } = await ingestPdfBuffer(userId, buffer, {
-      noteId: note.id,
-      courseId: courseId || "default",
-      title: safeTitle,
-      url: s3Url,
-    });
+    let chunkCount = 0;
+    let pageCount = 0;
+    try {
+      ({ chunkCount, pageCount } = await ingestPdfBuffer(userId, buffer, {
+        noteId: note.id,
+        courseId: courseId || "default",
+        title: safeTitle,
+        url: s3Url,
+      }));
+    } catch (ingestError) {
+      // Don't leave the note stuck in "processing" (same as /notes/process)
+      try {
+        await supabase.from("notes").update({ status: "error" }).eq("id", note.id).eq("user_id", userId);
+      } catch (updateErr) {
+        console.error("[API] Failed to update note status to error:", updateErr);
+      }
+      throw ingestError;
+    }
 
     await supabase.from("notes").update({ status: "ready", page_count: pageCount }).eq("id", note.id).eq("user_id", userId);
 
     res.json({ noteId: note.id, status: "ready", chunkCount, pageCount, s3Key });
   } catch (e: any) {
     console.error("[API] d2l file save error:", e);
+    if (e instanceof D2LFileFetchError) {
+      res.status(e.status).json({ error: e.message });
+      return;
+    }
     res.status(500).json({ error: "Failed to save file as note", details: e.message });
   }
 });
@@ -1701,7 +2038,11 @@ router.post("/d2l/save-credentials", async (req: Request, res: Response) => {
     const sbUrl = process.env.SUPABASE_URL;
     const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
     if (!sbUrl || !sbKey) throw new Error("Missing Supabase config");
-    const d2lHost = host || process.env.D2L_HOST || "learn.uwaterloo.ca";
+    const d2lHost = resolveAllowedD2LHost(host || DEFAULT_D2L_HOST);
+    if (!d2lHost) {
+      res.status(400).json({ error: "Unsupported D2L host" });
+      return;
+    }
 
     const encryptedPassword = await encryptPassword(password, d2lPasswordContext(userId));
     await logCredentialAccess(userId, "d2l_password", "write", "POST /d2l/save-credentials");
@@ -2359,11 +2700,27 @@ router.get("/api-keys", async (req: Request, res: Response) => {
 router.delete("/api-keys/:id", async (req: Request, res: Response) => {
   const userId = req.userId!;
   const { id } = req.params;
-  await supabase
+  const { data, error } = await supabase
     .from("api_keys")
     .update({ revoked: true })
     .eq("id", id)
-    .eq("user_id", userId);
+    .eq("user_id", userId)
+    .select("id");
+
+  if (error && error.code === "22P02") {
+    // Malformed id (not a uuid) can't match any key
+    res.status(404).json({ error: "API key not found" });
+    return;
+  }
+  if (error) {
+    console.error("[API] api-keys revoke error:", error);
+    res.status(500).json({ error: "Failed to revoke API key" });
+    return;
+  }
+  if (!data || data.length === 0) {
+    res.status(404).json({ error: "API key not found" });
+    return;
+  }
 
   res.json({ status: "revoked" });
 });
@@ -2391,6 +2748,9 @@ router.post("/outline/connect", async (req: Request, res: Response) => {
         host: "outline.uwaterloo.ca",
         username,
         password: encryptedPassword,
+        // New credentials from the user lift outlineAuth's headless Duo hard stop.
+        duo_required_at: null,
+        notification_sent_at: null,
         updated_at: new Date().toISOString(),
       }, { onConflict: "user_id,service" });
 
@@ -2467,6 +2827,9 @@ router.post("/outline/connect-cookie", async (req: Request, res: Response) => {
       service: "outline",
       host: "outline.uwaterloo.ca",
       token: JSON.stringify({ sessionid }),
+      // Validated cookie from the user — clear any Duo hard stop.
+      duo_required_at: null,
+      notification_sent_at: null,
       updated_at: new Date().toISOString(),
     }, { onConflict: "user_id,service" });
 
@@ -2526,60 +2889,6 @@ router.get("/crowdmark/status", async (req: Request, res: Response) => {
     res.json({ connected, lastUpdated: data?.updated_at || null });
   } catch {
     res.json({ connected: false, lastUpdated: null });
-  }
-});
-
-/** GET /api/outline/status — Is Outline cookie stored? */
-router.get("/outline/status", async (req: Request, res: Response) => {
-  const userId = req.userId!;
-  try {
-    const sbUrl = process.env.SUPABASE_URL;
-    const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!sbUrl || !sbKey) { res.json({ connected: false }); return; }
-    const r = await fetch(`${sbUrl}/rest/v1/user_credentials?user_id=eq.${userId}&service=eq.outline&select=token,updated_at&limit=1`, {
-      headers: { apikey: sbKey, Authorization: `Bearer ${sbKey}` },
-    });
-    const rows = await r.json() as Array<{ token: string; updated_at: string }>;
-    const connected = Array.isArray(rows) && rows.length > 0 && !!rows[0].token;
-    res.json({ connected, lastUpdated: rows[0]?.updated_at || null });
-  } catch {
-    res.json({ connected: false, lastUpdated: null });
-  }
-});
-
-/** POST /api/outline/connect — Store Outline sessionid cookie */
-router.post("/outline/connect", async (req: Request, res: Response) => {
-  const userId = req.userId!;
-  const { cookie } = req.body || {};
-  if (!cookie || typeof cookie !== "string") {
-    res.status(400).json({ error: "cookie required (value of sessionid from browser DevTools)" });
-    return;
-  }
-  try {
-    // Validate the cookie works before storing
-    const sessionid = cookie.includes("sessionid=") ? cookie.split("sessionid=")[1].split(";")[0] : cookie;
-    const testRes = await fetch("https://outline.uwaterloo.ca/viewer/org/uwaterloo/", {
-      headers: { Cookie: `sessionid=${sessionid}` },
-      redirect: "manual",
-      signal: AbortSignal.timeout(8_000),
-    }).catch(() => null);
-    if (testRes && (testRes.status === 302 || testRes.status === 301)) {
-      res.status(400).json({ error: "Outline cookie invalid or expired — session was redirected to login. Please copy a fresh sessionid." });
-      return;
-    }
-    const { error } = await supabase
-      .from("user_credentials")
-      .upsert({
-        user_id: userId,
-        service: "outline",
-        token: JSON.stringify({ sessionid }),
-        updated_at: new Date().toISOString(),
-      }, { onConflict: "user_id,service" });
-    if (error) { res.status(500).json({ error: "Failed to store cookie" }); return; }
-    res.json({ success: true, message: "Course outlines connected." });
-  } catch (e) {
-    console.error("[API] outline/connect error:", e);
-    res.status(500).json({ error: "Unexpected error" });
   }
 });
 
@@ -2661,8 +2970,9 @@ router.get("/notion/oauth-url", async (req: Request, res: Response) => {
     return;
   }
 
-  const state = Buffer.from(JSON.stringify({ userId, ts: Date.now() })).toString("base64url");
-  const url = `https://api.notion.com/v1/oauth/authorize?client_id=${encodeURIComponent(clientId)}&response_type=code&owner=user&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}`;
+  // Must be HMAC-signed: the public callback rejects unsigned state (verifyNotionState).
+  const state = signNotionState(userId);
+  const url = `https://api.notion.com/v1/oauth/authorize?client_id=${encodeURIComponent(clientId)}&response_type=code&owner=user&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}`;
   res.json({ url });
 });
 

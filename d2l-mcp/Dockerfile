@@ -68,6 +68,7 @@ ENV MCP_TRANSPORT=http
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 EXPOSE 3000
-EXPOSE 6080-6129
+# VNC/websockify ports (6080+) bind to 127.0.0.1 and are reached only via the
+# Express /vnc/<id>/websockify proxy, so they are intentionally not exposed.
 
 CMD ["node", "dist/index.js"]

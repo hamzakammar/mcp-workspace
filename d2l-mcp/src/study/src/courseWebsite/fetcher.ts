@@ -63,12 +63,41 @@ const DEFAULTS = {
   lookupFn: ((host: string) => lookup(host, { all: true })) as LookupFn,
 };
 
+/** Expand an IPv6 literal to 8 numeric hextets, or null if it can't be parsed. */
+function expandIPv6(ip: string): number[] | null {
+  let s = ip.toLowerCase();
+  const zone = s.indexOf("%");
+  if (zone !== -1) s = s.slice(0, zone);
+  // Trailing dotted IPv4 (e.g. ::ffff:1.2.3.4) → two hextets.
+  const v4 = s.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (v4) {
+    const p = v4[2].split(".").map(Number);
+    if (p.length !== 4 || p.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return null;
+    s = v4[1] + ((p[0] << 8) | p[1]).toString(16) + ":" + ((p[2] << 8) | p[3]).toString(16);
+  }
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  let parts: string[];
+  if (halves.length === 2) {
+    const fill = 8 - head.length - tail.length;
+    if (fill < 1) return null;
+    parts = [...head, ...Array(fill).fill("0"), ...tail];
+  } else {
+    parts = head;
+  }
+  if (parts.length !== 8) return null;
+  const out = parts.map((h) => (/^[0-9a-f]{1,4}$/.test(h) ? parseInt(h, 16) : NaN));
+  return out.some((n) => Number.isNaN(n)) ? null : out;
+}
+
 /** True if an IP literal is in a private / loopback / link-local / reserved range. */
 export function isPrivateIp(ip: string): boolean {
   if (net.isIPv4(ip)) {
     const p = ip.split(".").map(Number);
     if (p.length !== 4 || p.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true;
-    const [a, b] = p;
+    const [a, b, c] = p;
     if (a === 10) return true;                       // 10.0.0.0/8
     if (a === 127) return true;                      // loopback
     if (a === 0) return true;                        // 0.0.0.0/8
@@ -76,17 +105,41 @@ export function isPrivateIp(ip: string): boolean {
     if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
     if (a === 192 && b === 168) return true;         // 192.168.0.0/16
     if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64.0.0/10
+    if (a === 192 && b === 0 && c === 0) return true; // IETF protocol assignments 192.0.0.0/24
+    if (a === 192 && b === 0 && c === 2) return true; // TEST-NET-1 192.0.2.0/24
+    if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking 198.18.0.0/15
+    if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2
+    if (a === 203 && b === 0 && c === 113) return true;  // TEST-NET-3
     if (a >= 224) return true;                       // multicast/reserved 224+
     return false;
   }
   if (net.isIPv6(ip)) {
-    const lc = ip.toLowerCase();
-    if (lc === "::1" || lc === "::") return true;    // loopback / unspecified
-    if (lc.startsWith("fe80")) return true;          // link-local
-    if (lc.startsWith("fc") || lc.startsWith("fd")) return true; // unique-local fc00::/7
-    // IPv4-mapped ::ffff:a.b.c.d
-    const m = lc.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    if (m) return isPrivateIp(m[1]);
+    const h = expandIPv6(ip);
+    if (!h) return true; // unparseable → unsafe
+    const embedded = (hi: number, lo: number) =>
+      `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+    const zeros = (from: number, to: number) => h.slice(from, to).every((x) => x === 0);
+
+    if (zeros(0, 8)) return true;                                  // :: unspecified
+    if (zeros(0, 7) && h[7] === 1) return true;                    // ::1 loopback
+    if ((h[0] & 0xffc0) === 0xfe80) return true;                   // fe80::/10 link-local
+    if ((h[0] & 0xffc0) === 0xfec0) return true;                   // fec0::/10 site-local (deprecated)
+    if ((h[0] & 0xfe00) === 0xfc00) return true;                   // fc00::/7 unique-local
+    if ((h[0] & 0xff00) === 0xff00) return true;                   // ff00::/8 multicast
+    if (h[0] === 0x2001 && h[1] === 0x0db8) return true;           // 2001:db8::/32 documentation
+    if (h[0] === 0x2001 && h[1] === 0x0000) return true;           // 2001:0::/32 Teredo (embeds arbitrary IPv4)
+    // IPv4-mapped ::ffff:a.b.c.d (also hex form ::ffff:7f00:1)
+    if (zeros(0, 5) && h[5] === 0xffff) return isPrivateIp(embedded(h[6], h[7]));
+    // IPv4-translated ::ffff:0:a.b.c.d
+    if (zeros(0, 4) && h[4] === 0xffff && h[5] === 0) return isPrivateIp(embedded(h[6], h[7]));
+    // Deprecated IPv4-compatible ::a.b.c.d
+    if (zeros(0, 6)) return isPrivateIp(embedded(h[6], h[7]));
+    // NAT64 well-known prefix 64:ff9b::/96 → check the embedded IPv4
+    if (h[0] === 0x64 && h[1] === 0xff9b && zeros(2, 6)) return isPrivateIp(embedded(h[6], h[7]));
+    // NAT64 local-use prefix 64:ff9b:1::/48 → always internal
+    if (h[0] === 0x64 && h[1] === 0xff9b && h[2] === 1) return true;
+    // 6to4 2002::/16 embeds an IPv4 in hextets 1-2
+    if (h[0] === 0x2002) return isPrivateIp(embedded(h[1], h[2]));
     return false;
   }
   return true; // not a valid IP literal → treat as unsafe
@@ -146,9 +199,11 @@ export function assertUrlAllowed(
  * over HTTPS under a trusted hostname, which is the property this connector relies on.
  */
 async function assertHostResolvesPublic(host: string, lookupFn: LookupFn): Promise<void> {
-  // A bare IP literal host is checked directly.
-  if (net.isIP(host)) {
-    if (isPrivateIp(host)) throw new Error("blocked:private-ip");
+  // A bare IP literal host is checked directly. URL.hostname keeps IPv6 literals
+  // bracketed ("[::ffff:7f00:1]"), so strip brackets before testing.
+  const bare = host.replace(/^\[(.*)\]$/, "$1");
+  if (net.isIP(bare)) {
+    if (isPrivateIp(bare)) throw new Error("blocked:private-ip");
     return;
   }
   let addrs: Array<{ address: string }>;

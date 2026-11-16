@@ -1,7 +1,7 @@
-import { apiClient } from '../config/api';
+import { apiClient, API_ORIGIN } from '../config/api';
 
 // Health lives at the server root, not under BASE_URL (which ends in /api)
-const HEALTH_URL = 'https://horizon.hamzaammar.ca/health';
+const HEALTH_URL = `${API_ORIGIN}/health`;
 
 // NOTE: apiClient's BASE_URL already ends in /api, so paths here must NOT start with /api.
 // apiClient throws ApiError ({ status, data }) for non-2xx responses.
@@ -63,7 +63,7 @@ export class D2LService {
       const isHealthy = await this.checkBackendHealth();
       if (!isHealthy) {
         throw new Error('Cannot reach backend server. Please make sure the backend is running on ' +
-          (process.env.EXPO_PUBLIC_API_BASE_URL || 'https://horizon.hamzaammar.ca'));
+          API_ORIGIN);
       }
 
       await apiClient.post('/d2l/token', credentials);
@@ -94,7 +94,7 @@ export class D2LService {
       const isHealthy = await this.checkBackendHealth();
       if (!isHealthy) {
         throw new Error('Cannot reach backend server. Please make sure the backend is running on ' +
-          (process.env.EXPO_PUBLIC_API_BASE_URL || 'https://horizon.hamzaammar.ca'));
+          API_ORIGIN);
       }
 
       await apiClient.post('/d2l/connect-cookie', payload);
@@ -126,7 +126,7 @@ export class D2LService {
       const isHealthy = await this.checkBackendHealth();
       if (!isHealthy) {
         throw new Error('Cannot reach backend server. Please make sure the backend is running on ' +
-          (process.env.EXPO_PUBLIC_API_BASE_URL || 'https://horizon.hamzaammar.ca'));
+          API_ORIGIN);
       }
 
       await apiClient.post('/d2l/connect', credentials);

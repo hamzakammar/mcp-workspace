@@ -7,6 +7,7 @@
 
 import type { Request, Response, NextFunction } from "express";
 import { createHmac, createVerify } from "crypto";
+import { safeEqual } from "./oauth/crypto.js";
 
 const SKIP = process.env.SKIP_JWT_AUTH === "1" || process.env.SKIP_JWT_AUTH === "true";
 const USER_POOL_ID = process.env.COGNITO_USER_POOL_ID;
@@ -90,7 +91,7 @@ function verifyHS256(token: string, secret: string): { sub: string; [key: string
     .update(`${headerB64}.${payloadB64}`)
     .digest("base64url");
 
-  if (signatureB64 !== expectedSig) throw new Error("JWT signature verification failed");
+  if (!safeEqual(signatureB64, expectedSig)) throw new Error("JWT signature verification failed");
 
   const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
   if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) throw new Error("JWT expired");

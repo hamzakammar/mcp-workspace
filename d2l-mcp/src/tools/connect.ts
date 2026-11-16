@@ -99,7 +99,12 @@ export const connectTools = {
       }
 
       try {
-        await upsertCredential(userId, 'outline', { token: JSON.stringify({ sessionid }) });
+        // A fresh cookie clears any pending Outline Duo hard stop / notification.
+        await upsertCredential(userId, 'outline', {
+          token: JSON.stringify({ sessionid }),
+          duo_required_at: null,
+          notification_sent_at: null,
+        });
         return JSON.stringify({ success: true, message: 'Course outlines connected. You can now use get_course_outline and get_my_course_outlines.' });
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);

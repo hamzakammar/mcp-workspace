@@ -61,14 +61,28 @@ export function isValidRedirectUriForRegistration(uri: string): boolean {
   }
   if (u.hash) return false;
   if (u.protocol === "https:") return true;
-  if (u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "::1")) {
+  if (u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]" || u.hostname === "::1")) {
     return true;
   }
+  // Schemes that execute script, embed content, or touch local resources in
+  // the browser can never be legitimate redirect targets.
+  if (DENIED_REDIRECT_SCHEMES.has(u.protocol.toLowerCase())) return false;
   // Custom/private-use URI schemes (e.g. "com.example.app:/cb") are allowed for
   // native clients as long as they carry a scheme and no fragment.
   if (u.protocol && u.protocol !== "http:" && u.protocol !== "https:") return true;
   return false;
 }
+
+const DENIED_REDIRECT_SCHEMES = new Set([
+  "javascript:",
+  "data:",
+  "file:",
+  "vbscript:",
+  "blob:",
+  "about:",
+  "filesystem:",
+  "view-source:",
+]);
 
 // ── Interim authorization-request signing (login page → consent POST) ───────
 // We avoid server-side pending state by carrying the (validated) authorization

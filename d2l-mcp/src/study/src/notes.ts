@@ -127,7 +127,19 @@ export async function generateEmbedding(text: string): Promise<number[]> {
 	return response.data[0].embedding;
 }
 
-function calculateLexicalScore(section: any, queryWords: string[]): number {
+/** Count non-overlapping literal occurrences of `needle` in `haystack` (no regex, so query text can't throw or ReDoS). */
+function countOccurrences(haystack: string, needle: string): number {
+	if (!needle) return 0;
+	let count = 0;
+	let idx = haystack.indexOf(needle);
+	while (idx !== -1) {
+		count++;
+		idx = haystack.indexOf(needle, idx + needle.length);
+	}
+	return count;
+}
+
+export function calculateLexicalScore(section: any, queryWords: string[]): number {
 	let score = 0;
 
 	// +10 if word appears in title
@@ -144,7 +156,7 @@ function calculateLexicalScore(section: any, queryWords: string[]): number {
 	// +2 per occurrence in text, +5 bonus if in first 300 chars
 	for (const word of queryWords) {
 		const textLower = searchText.toLowerCase();
-		const matches = (textLower.match(new RegExp(word, "g")) || []).length;
+		const matches = countOccurrences(textLower, word);
 		score += matches * 2;
 
 		if (firstChars.toLowerCase().includes(word)) {
@@ -244,7 +256,7 @@ export async function ingestPdfBuffer(
 	try {
 		console.error(`[INGEST] Embedding ${chunks.length} chunks into note_chunks...`);
 		// Delete any previously stored chunks for this note to avoid duplicates
-		await deleteNoteChunks(noteId);
+		await deleteNoteChunks(noteId, userId);
 		// Use smaller RAG chunk size (500 chars) for better semantic precision
 		const ragChunks = ragChunkText(text, 500, 50);
 		const embeddings = await embedChunks(ragChunks);
@@ -567,25 +579,66 @@ export const NotesTools = {
 		},
 		handler: async ({ courseId, limit = 100, minChars = 200, userId }: { courseId?: string; limit?: number; minChars?: number; userId: string }): Promise<string> => {
 			try {
-				// Fetch rows with null embeddings
-				let query = supabase
-					.from("note_sections")
-					.select("id, content, preview")
-					.eq("user_id", userId)
-					.is("embedding", null)
-					.limit(limit);
+				// Page through rows with null embeddings using an id cursor. Rows that are
+				// skipped (too short / embed failure) keep a null embedding, so a plain
+				// `.is(null).limit(n)` would re-select them forever and stall progress.
+				const PAGE_SIZE = Math.max(limit, 100);
+				const MAX_PAGES = 50;
+				let lastId: string | null = null;
+				let scanned = 0;
+				let embedded = 0;
+				let skipped = 0;
+				const updates: Array<{ id: string; embedding: number[] }> = [];
 
-				if (courseId) {
-					query = query.eq("course_id", courseId);
+				for (let page = 0; page < MAX_PAGES && updates.length < limit; page++) {
+					let query = supabase
+						.from("note_sections")
+						.select("id, content, preview")
+						.eq("user_id", userId)
+						.is("embedding", null);
+
+					if (courseId) {
+						query = query.eq("course_id", courseId);
+					}
+					if (lastId !== null) {
+						query = query.gt("id", lastId);
+					}
+
+					const { data: rows, error } = await query.order("id", { ascending: true }).limit(PAGE_SIZE);
+
+					if (error) {
+						return JSON.stringify({ success: false, error: error.message }, null, 2);
+					}
+					if (!rows || rows.length === 0) break;
+					scanned += rows.length;
+
+					for (const row of rows) {
+						lastId = row.id;
+						if (updates.length >= limit) break;
+						const text = row.content || row.preview || "";
+
+						// Skip if too short
+						if (text.length < minChars) {
+							skipped++;
+							continue;
+						}
+
+						try {
+							// Generate embedding
+							const embedding = await generateEmbedding(text);
+							updates.push({ id: row.id, embedding });
+							embedded++;
+							console.error(`[EMBED] Generated embedding for row ${row.id}`);
+						} catch (embedError) {
+							console.error(`[EMBED] Failed to embed row ${row.id}:`, embedError);
+							skipped++;
+						}
+					}
+
+					if (rows.length < PAGE_SIZE) break;
 				}
 
-				const { data: rows, error } = await query;
-
-				if (error) {
-					return JSON.stringify({ success: false, error: error.message }, null, 2);
-				}
-
-				if (!rows || rows.length === 0) {
+				if (scanned === 0) {
 					return JSON.stringify({
 						success: true,
 						embedded: 0,
@@ -595,39 +648,14 @@ export const NotesTools = {
 					}, null, 2);
 				}
 
-				let embedded = 0;
-				let skipped = 0;
-				const updates: Array<{ id: string; embedding: number[] }> = [];
-
-				// Process each row
-				for (const row of rows) {
-					const text = row.content || row.preview || "";
-
-					// Skip if too short
-					if (text.length < minChars) {
-						skipped++;
-						continue;
-					}
-
-					try {
-						// Generate embedding
-						const embedding = await generateEmbedding(text);
-						updates.push({ id: row.id, embedding });
-						embedded++;
-						console.error(`[EMBED] Generated embedding for row ${row.id}`);
-					} catch (embedError) {
-						console.error(`[EMBED] Failed to embed row ${row.id}:`, embedError);
-						skipped++;
-					}
-				}
-
 				// Batch update rows with embeddings
 				if (updates.length > 0) {
 					for (const update of updates) {
 						const { error: updateError } = await supabase
 							.from("note_sections")
 							.update({ embedding: update.embedding })
-							.eq("id", update.id);
+							.eq("id", update.id)
+							.eq("user_id", userId);
 
 						if (updateError) {
 							console.error(`[EMBED] Update error for row ${update.id}:`, updateError);

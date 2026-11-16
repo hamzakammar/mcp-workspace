@@ -21,12 +21,9 @@ import { spawn, ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
 import { existsSync } from "fs";
 import net from "net";
-import path from "path";
-import fs from "fs/promises";
-import os from "os";
 import { supabase } from "../utils/supabase.js";
 import { clearDuoRequired, markSessionValidated } from "../auth.js";
-import { loadStorageStateFromS3, saveStorageStateToS3 } from "../utils/s3Storage.js";
+import { loadStorageStateObjectFromS3, saveStorageStateToS3 } from "../utils/s3Storage.js";
 
 const SESSIONS_BASE = process.env.SESSIONS_PATH || "/tmp/sessions";
 const SESSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -147,7 +144,7 @@ async function waitForXvfb(displayNum: number, proc: ChildProcess, timeoutMs = 5
 export const NOVNC_ASSET_PATH = "/vnc/assets";
 
 // S3 storage state helpers are imported from utils/s3Storage.ts
-// (loadStorageStateFromS3, saveStorageStateToS3) — encrypted + TTL-aware
+// (loadStorageStateObjectFromS3, saveStorageStateToS3) — encrypted + TTL-aware
 
 export class BrowserSessionManager {
 
@@ -168,9 +165,10 @@ export class BrowserSessionManager {
     if (existingId) await BrowserSessionManager.closeSession(existingId);
 
     const sessionId = randomUUID();
-    const displayNum = allocateDisplay();
-    const vncPort = allocatePort(VNC_BASE_PORT);
-    const wsPort = allocatePort(WS_BASE_PORT);
+    // Allocated inside the try so a later allocation failure releases the earlier ones.
+    let displayNum: number | undefined;
+    let vncPort: number | undefined;
+    let wsPort: number | undefined;
 
     let xvfbProc: ChildProcess | undefined;
     let x11vncProc: ChildProcess | undefined;
@@ -179,12 +177,16 @@ export class BrowserSessionManager {
 
     // Fetch saved storage state from S3 concurrently with display startup
     // (service-specific key — skips Duo if still valid).
-    const storageStatePromise = loadStorageStateFromS3(userId, sessionType).catch((e) => {
+    const storageStatePromise = loadStorageStateObjectFromS3(userId, sessionType).catch((e) => {
       console.error(`[VNC] Failed to load storage state for user ${userId}: ${e?.message}`);
       return undefined;
     });
 
     try {
+      displayNum = allocateDisplay();
+      vncPort = allocatePort(VNC_BASE_PORT);
+      wsPort = allocatePort(WS_BASE_PORT);
+
       // 1. Start Xvfb virtual display
       xvfbProc = spawn("Xvfb", [
         `:${displayNum}`, "-screen", "0", "1280x800x24", "-ac", "-nolisten", "tcp",
@@ -220,7 +222,9 @@ export class BrowserSessionManager {
       // 4. Start websockify (WebSocket ⇄ VNC bridge). The noVNC client itself is
       //    served as static files by Express, so websockify only carries the stream.
       // --heartbeat: WS pings keep an idle stream alive past the ALB's 60s idle timeout.
-      websockifyProc = spawn("websockify", ["--heartbeat", "25", String(wsPort), `localhost:${vncPort}`], {
+      // Bind to loopback only: x11vnc runs -nopw, so the bridge must not be reachable
+      // from outside the container. Express proxies /vnc/<id>/websockify to it.
+      websockifyProc = spawn("websockify", ["--heartbeat", "25", `127.0.0.1:${wsPort}`, `127.0.0.1:${vncPort}`], {
         stdio: ["ignore", "ignore", "pipe"],
       });
       websockifyProc.stderr?.on("data", (d: Buffer) => {
@@ -233,12 +237,11 @@ export class BrowserSessionManager {
 
       // 5. Browser context with restored state
       browser = await browserPromise;
-      const storageStatePath = await storageStatePromise;
+      const storageState = await storageStatePromise;
       const context = await browser.newContext({
-        storageState: storageStatePath,
+        storageState,
         viewport: { width: 1280, height: 800 },
       });
-      if (storageStatePath) await fs.unlink(storageStatePath).catch(() => {});
       const page = await context.newPage();
 
       // Navigate in the background — the user can watch the page load over VNC.
@@ -274,11 +277,9 @@ export class BrowserSessionManager {
       try { await browser?.close(); } catch {}
       await Promise.all([killAndWait(websockifyProc), killAndWait(x11vncProc)]);
       await killAndWait(xvfbProc);
-      releasePort(vncPort);
-      releasePort(wsPort);
-      usedDisplays.delete(displayNum);
-      const statePath = await storageStatePromise;
-      if (statePath) await fs.unlink(statePath).catch(() => {});
+      if (vncPort !== undefined) releasePort(vncPort);
+      if (wsPort !== undefined) releasePort(wsPort);
+      if (displayNum !== undefined) usedDisplays.delete(displayNum);
       throw err;
     }
   }
@@ -416,10 +417,8 @@ export class BrowserSessionManager {
       }
 
       // Save full IdP storage state to S3 (service='outline' key, may help skip Duo next time)
-      const tmpStatePath = path.join(os.tmpdir(), `outline-state-${sessionId}.json`);
-      await context.storageState({ path: tmpStatePath });
-      await saveStorageStateToS3(userId, tmpStatePath, undefined, 'outline');
-      await fs.unlink(tmpStatePath).catch(() => {});
+      // Pass the state object directly — no plaintext temp file on disk.
+      await saveStorageStateToS3(userId, await context.storageState(), undefined, 'outline');
 
       // Store sessionid in Supabase under service='outline'
       const sbUrl = process.env.SUPABASE_URL;
@@ -437,6 +436,9 @@ export class BrowserSessionManager {
             user_id: userId,
             service: "outline",
             token: JSON.stringify({ sessionid: sessionidValue }),
+            // Manual login succeeded — lift outlineAuth's headless Duo hard stop.
+            duo_required_at: null,
+            notification_sent_at: null,
             updated_at: new Date().toISOString(),
           }),
         });
@@ -576,10 +578,8 @@ export class BrowserSessionManager {
 
       // Save full storage state to S3 so headless re-auth can restore the SSO session
       try {
-        const tmpStatePath = path.join(os.tmpdir(), `crowdmark-state-${sessionId}.json`);
-        await context.storageState({ path: tmpStatePath });
-        await saveStorageStateToS3(userId, tmpStatePath, undefined, 'crowdmark');
-        await fs.unlink(tmpStatePath).catch(() => {});
+        // Pass the state object directly — no plaintext temp file on disk.
+        await saveStorageStateToS3(userId, await context.storageState(), undefined, 'crowdmark');
         console.error(`[VNC] Saved Crowdmark browser state to S3 for user ${userId}`);
       } catch (stateErr: any) {
         console.error(`[VNC] Failed to save Crowdmark S3 state for user ${userId}: ${stateErr?.message}`);
@@ -653,10 +653,8 @@ export class BrowserSessionManager {
       }
 
       // Save FULL storage state (all cookies incl. ADFS) to S3 for session resumption
-      const tmpStatePath = path.join(os.tmpdir(), `storage-state-${sessionId}.json`);
-      await context.storageState({ path: tmpStatePath });
-      await saveStorageStateToS3(userId, tmpStatePath);
-      await fs.unlink(tmpStatePath).catch(() => {});
+      // Pass the state object directly — no plaintext temp file on disk.
+      await saveStorageStateToS3(userId, await context.storageState());
 
       // Store D2L session token in Supabase for MCP tool use
       // Use direct REST API — Supabase JS client has known issues in ECS

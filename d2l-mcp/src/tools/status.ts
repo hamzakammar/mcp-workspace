@@ -2,6 +2,7 @@ import { getD2LToken, isDuoRequired } from '../auth.js';
 import { getUserId } from '../utils/userContext.js';
 import { supabase } from '../utils/supabase.js';
 import { D2LClient } from '../client.js';
+import { isCourseOfferingEnrollment } from '../utils/marshal.js';
 
 const STORAGE_STATE_TTL_DAYS = 25;
 
@@ -23,8 +24,12 @@ async function getPiazzaConnected(userId: string): Promise<boolean> {
 async function getCoursesAccessible(userId: string, host: string): Promise<number> {
   try {
     const d2lClient = new D2LClient(userId, host);
+    // getMyEnrollments follows bookmark paging; count only course offerings
+    // (not departments, semesters, etc.).
     const enrollments = (await d2lClient.getMyEnrollments()) as { Items?: unknown[] };
-    return Array.isArray(enrollments.Items) ? enrollments.Items.length : 0;
+    return Array.isArray(enrollments.Items)
+      ? enrollments.Items.filter((e) => isCourseOfferingEnrollment(e as Parameters<typeof isCourseOfferingEnrollment>[0])).length
+      : 0;
   } catch {
     return 0;
   }

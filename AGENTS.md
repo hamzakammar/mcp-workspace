@@ -15,11 +15,11 @@ mcp-workspace is a personal MCP (Model Context Protocol) server workspace that g
 | Path | Purpose |
 |---|---|
 | `d2l-mcp/` | D2L Brightspace + Piazza MCP server (primary MCP) |
-| `setup/` | Setup scripts and utilities |
-| `tests/` | Test suite (vitest) |
+| `d2l-mcp/tests/` | Test suite (vitest): unit tests in `tests/unit/`, live D2L tests in `*.integration.test.ts` (`npm run test:integration` from `d2l-mcp/`) |
+| `supabase/` | Supabase migrations and edge functions |
+| `study-mcp-app/` | Expo mobile app |
 | `ecosystem.config.cjs` | PM2 process config for all MCPs |
 | `package.json` | Workspace-level scripts (build-all, start-all, etc.) |
-| `SETUP.md` | Quickstart for local dev and EC2 deployment |
 | `docs/` | Architecture, debt log, ADRs, and plans — **start here for context** |
 | `AGENTS.md` | This file |
 
@@ -30,8 +30,8 @@ mcp-workspace is a personal MCP (Model Context Protocol) server workspace that g
 - **TypeScript everywhere.** All new MCP tool files must be `.ts`. Build to `dist/` before deploying.
 - **Each MCP gets its own directory and port.** Do not co-locate two MCP servers in the same directory. Add new MCPs as sibling directories alongside `d2l-mcp/`.
 - **PM2 is the process manager.** All servers are defined in `ecosystem.config.cjs`. Do not start servers manually in production.
-- **Sessions are managed locally and synced.** D2L and Piazza session files live in `~/.d2l-session/` and `~/.piazza-session/`. They must be synced to EC2 via `npm run sync-sessions` after re-authentication.
-- **Private mapping files are gitignored.** `notes_map.json` and `piazza_map.json` are never committed. Document their schema in `docs/architecture.md` if it changes.
+- **Sessions are managed locally and synced.** D2L and Piazza session files live in `~/.d2l-session/` and `~/.piazza-session/`. They must be synced to EC2 via `EC2_HOST=<host> npm run sync-sessions` after re-authentication.
+- **Private mapping files are gitignored.** `notes_map.json` and `piazza_map.json` (in `d2l-mcp/src/study/db/`) are meant to stay out of git, but are currently tracked because they are statically imported by the build. Document their schema in `docs/architecture.md` if it changes.
 - **No secrets in source.** Credentials and keys live in each MCP's `.env` (gitignored). Use environment variables only.
 
 ---
@@ -73,10 +73,10 @@ npm run status
 For local D2L auth (required before session sync):
 ```bash
 cd d2l-mcp
-npm run auth-d2l
+npm run build && npm run auth
 ```
 
-For full setup and deployment instructions, see `SETUP.md`.
+For full setup and deployment instructions, see `README.md` and `DEPLOYMENT_CHECKLIST.md`.
 
 ---
 

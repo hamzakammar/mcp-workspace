@@ -89,11 +89,14 @@ export async function semanticSearch(
 /**
  * Deletes all chunks associated with a specific note (cleanup on re-ingest or deletion).
  */
-export async function deleteNoteChunks(noteId: string): Promise<void> {
-  const { error } = await supabase
+export async function deleteNoteChunks(noteId: string, userId?: string): Promise<void> {
+  let query = supabase
     .from("note_chunks")
     .delete()
     .eq("note_id", noteId);
+  // Defense in depth: scope the delete to the owning user when known.
+  if (userId) query = query.eq("user_id", userId);
+  const { error } = await query;
 
   if (error) {
     throw new Error(`Failed to delete note_chunks for noteId ${noteId}: ${error.message}`);

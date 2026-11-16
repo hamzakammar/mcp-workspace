@@ -43,7 +43,10 @@ export const assignmentTools = {
       assignmentId: z.number().describe('The assignment Id from get_assignments. Example: 37812'),
     },
     handler: async ({ orgUnitId, assignmentId }: { orgUnitId?: number; assignmentId: number }) => {
-      const submissions = await client.getDropboxSubmissions(getOrgUnitId(orgUnitId), assignmentId) as RawSubmission[];
+      // mysubmissions returns only the caller's own EntityDropbox entries; the plain
+      // submissions/ route is staff-only (403 for students).
+      const raw = await client.getMySubmissions(getOrgUnitId(orgUnitId), assignmentId) as RawSubmission[] | RawSubmission;
+      const submissions: RawSubmission[] = Array.isArray(raw) ? raw : raw ? [raw] : [];
       return JSON.stringify(marshalSubmissions(submissions), null, 2);
     },
   },

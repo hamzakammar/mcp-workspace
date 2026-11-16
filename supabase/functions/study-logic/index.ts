@@ -318,9 +318,23 @@ router.post("/d2l/connect-cookie", authMiddleware, async (req) => {
   });
 });
 
-router.post("/notes/process", async (req: any) => {
+router.post("/notes/process", authMiddleware, async (req: any) => {
   const { supabase, user } = req;
   const { storagePath, title, courseId } = await req.json();
+  // storagePath is downloaded with the service-role client, so it must be
+  // confined to the caller's own folder in the "notes" bucket.
+  // Reject encoded/escaped forms and any empty, "." or ".." path segment.
+  if (
+    typeof storagePath !== "string" ||
+    !storagePath.startsWith(`${user.id}/`) ||
+    /[%\\\u0000-\u001f]/.test(storagePath) ||
+    storagePath.split("/").some((seg) => seg === "" || seg === "." || seg === "..")
+  ) {
+    return new Response(JSON.stringify({ error: "Forbidden storagePath" }), {
+      status: 403,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
   const { data: note } = await supabase.from("notes").insert({
     user_id: user.id, storage_path: storagePath, title, course_id: courseId, status: "processing",
   }).select("id").single();
@@ -468,7 +482,7 @@ router.get("/d2l/courses", authMiddleware, async (req: any) => {
   }
 });
 // Piazza Sync Logic
-router.post("/piazza/sync", async (req: any) => {
+router.post("/piazza/sync", authMiddleware, async (req: any) => {
   const { supabase, user } = req;
   const body: PiazzaSyncRequestBody = await req.json();
   try {

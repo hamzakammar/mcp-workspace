@@ -7,8 +7,8 @@ node_modules/
 dist/
 *.tar.gz
 logs/
-src/study/db/notes_map.json
-src/study/db/piazza_map.json
+d2l-mcp/src/study/db/notes_map.json
+d2l-mcp/src/study/db/piazza_map.json
 .mcp-sessions.json
 *.bak
 
@@ -25,3 +25,9 @@ study-mcp-bastion-key.pem
 
 # Setup agent (separate project)
 setup-agent-mac/
+
+# Supabase CLI local state
+supabase/.temp/
+
+# Prometheus bearer token for the gateway /metrics endpoint
+d2l-mcp/observability/metrics_token

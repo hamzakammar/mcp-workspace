@@ -18,6 +18,21 @@ import { clearSessionValidation } from "../auth.js";
 
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // run daily
 
+/** Warn users this many days into the STORAGE_STATE_MAX_AGE_DAYS window. */
+export const STORAGE_STATE_WARN_DAYS = 20;
+
+/**
+ * Whether a storage state of this age should get the one-off "re-auth soon"
+ * warning. The window is one day wide (the job runs daily), so each captured
+ * state is warned about once, without needing a DB flag (notification_sent_at
+ * is cleared by every token refresh, so it can't dedupe this).
+ */
+export function shouldWarnStorageStateAge(ageDays: number): boolean {
+  return ageDays >= STORAGE_STATE_WARN_DAYS &&
+    ageDays < STORAGE_STATE_WARN_DAYS + 1 &&
+    ageDays < STORAGE_STATE_MAX_AGE_DAYS;
+}
+
 /** Fetch all unique user_ids from user_credentials table. */
 async function getAllCredentialUserIds(): Promise<string[]> {
   const sbUrl = process.env.SUPABASE_URL;
@@ -122,6 +137,16 @@ export async function runStorageStateTTLCheck(): Promise<void> {
         );
         await markDuoRequired(userId);
         expiredCount++;
+      } else if (shouldWarnStorageStateAge(ageDays)) {
+        console.error(`[TTL] User ${userId}: storage state is ${ageDays.toFixed(1)} days old — sending re-auth warning`);
+        await sendPushToUser(
+          userId,
+          "D2L Re-authentication Needed Soon",
+          "Your D2L session will expire in the next few days. Open Horizon to reconnect before it fails.",
+          { type: "reauth_warning" }
+        ).catch((e: Error) =>
+          console.error(`[TTL] Warning push failed for ${userId}: ${e.message}`)
+        );
       }
     } catch (e: any) {
       console.error(`[TTL] Error checking user ${userId}: ${e?.message}`);

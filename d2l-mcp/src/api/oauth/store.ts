@@ -185,7 +185,11 @@ export async function saveRefreshToken(rec: {
   rotated_from: string | null;
   expires_at: string; // ISO
 }): Promise<void> {
-  const { error } = await supabase.from("oauth_refresh_tokens").insert({ ...rec, revoked: false });
+  // created_at is set explicitly (the column also defaults to now()) so the
+  // refresh-reuse grace window works the same against every backend.
+  const { error } = await supabase
+    .from("oauth_refresh_tokens")
+    .insert({ ...rec, revoked: false, created_at: new Date().toISOString() });
   if (error) throw error;
 }
 
@@ -214,5 +218,80 @@ export async function revokeRefreshToken(tokenHash: string): Promise<void> {
     .from("oauth_refresh_tokens")
     .update({ revoked: true })
     .eq("token_hash", tokenHash);
+  if (error) throw error;
+}
+
+/**
+ * Atomically consume a refresh token (single-use rotation). Flips
+ * revoked=false → true and returns the row only if it was still unrevoked.
+ * Concurrent refreshes with the same token: exactly one gets the row; the
+ * others get null. Mirrors consumeAuthCode (works with the pg wrapper too:
+ * update().eq().eq().select()).
+ */
+export async function consumeRefreshToken(tokenHash: string): Promise<RefreshTokenRow | null> {
+  const { data, error } = await supabase
+    .from("oauth_refresh_tokens")
+    .update({ revoked: true })
+    .eq("token_hash", tokenHash)
+    .eq("revoked", false)
+    .select("*");
+  if (error) throw error;
+  const row = data?.[0];
+  if (!row) return null;
+  return row as RefreshTokenRow;
+}
+
+/**
+ * Revoke every still-active refresh and access token for a user+client pair.
+ * Used for refresh-token reuse detection (RFC 6819 §5.2.2.3 / OAuth 2.1
+ * §4.3.1) and when a refresh token is explicitly revoked (RFC 7009 §2.1).
+ */
+export async function revokeTokenFamily(userId: string, clientId: string): Promise<void> {
+  const r1 = await supabase
+    .from("oauth_refresh_tokens")
+    .update({ revoked: true })
+    .eq("user_id", userId)
+    .eq("client_id", clientId)
+    .eq("revoked", false)
+    .select("token_hash");
+  if (r1.error) throw r1.error;
+  const r2 = await supabase
+    .from("oauth_access_tokens")
+    .update({ revoked: true })
+    .eq("user_id", userId)
+    .eq("client_id", clientId)
+    .eq("revoked", false)
+    .select("token_hash");
+  if (r2.error) throw r2.error;
+}
+
+/** The refresh token that replaced `tokenHash` during rotation (or null).
+ * Its created_at tells us when `tokenHash` was rotated. */
+export async function getRotatedChild(
+  tokenHash: string
+): Promise<{ token_hash: string; created_at: string | null } | null> {
+  const { data, error } = await supabase
+    .from("oauth_refresh_tokens")
+    .select("token_hash, created_at")
+    .eq("rotated_from", tokenHash)
+    .limit(1);
+  if (error) throw error;
+  const row = data?.[0];
+  if (!row) return null;
+  return { token_hash: row.token_hash, created_at: row.created_at ? String(row.created_at) : null };
+}
+
+/**
+ * Undo consumeRefreshToken after a failed rotation (token issuance failed), so
+ * a transient DB error doesn't log the user out. Callers must first check
+ * that no rotated child exists.
+ */
+export async function unconsumeRefreshToken(tokenHash: string): Promise<void> {
+  const { error } = await supabase
+    .from("oauth_refresh_tokens")
+    .update({ revoked: false })
+    .eq("token_hash", tokenHash)
+    .eq("revoked", true)
+    .select("token_hash");
   if (error) throw error;
 }
