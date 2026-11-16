@@ -7,3 +7,8 @@ scrape_configs:
     static_configs:
       - targets: ["gateway:8080"]
     metrics_path: /metrics
+    # The gateway only serves /metrics to "Authorization: Bearer $METRICS_TOKEN".
+    # Mount a file containing that token (no trailing newline needed) here.
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics_token

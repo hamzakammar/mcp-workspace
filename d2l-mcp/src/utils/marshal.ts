@@ -41,12 +41,26 @@ export function formatDate(isoDate: string | null | undefined): string | null {
 }
 
 // Format date relative to now
+// Calendar date (YYYY-MM-DD) of an instant in Toronto local time.
+const torontoDateFmt = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'America/Toronto',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+function torontoDayNumber(date: Date): number {
+  // en-CA formats as YYYY-MM-DD; parse it as a UTC midnight to get a day index.
+  return Math.round(Date.parse(`${torontoDateFmt.format(date)}T00:00:00Z`) / 86_400_000);
+}
+
+// Format date relative to now, by calendar day in Toronto time ("tomorrow"
+// means the next local calendar date, not "rounds to 24h from now").
 export function formatRelativeDate(isoDate: string | null | undefined): string | null {
   if (!isoDate) return null;
   const date = new Date(isoDate);
-  const now = new Date();
-  const diffMs = date.getTime() - now.getTime();
-  const diffDays = Math.round(diffMs / (1000 * 60 * 60 * 24));
+  if (isNaN(date.getTime())) return null;
+  const diffDays = torontoDayNumber(date) - torontoDayNumber(new Date());
 
   if (diffDays === 0) return 'today';
   if (diffDays === 1) return 'tomorrow';
@@ -203,6 +217,7 @@ export function marshalCalendarEvents(response: { Objects: RawCalendarEvent[] })
       confidence: classification.confidence,
       rawSnippet: classification.snippet,
       assignmentId: e.AssociatedEntity?.AssociatedEntityId || null,
+      entityType: entityType || null,
     };
   });
 
@@ -245,7 +260,7 @@ export function marshalCalendarEvents(response: { Objects: RawCalendarEvent[] })
 export interface RawEnrollment {
   OrgUnit: {
     Id: number;
-    Type: { Code: string; Name: string };
+    Type: { Id?: number; Code: string; Name: string };
     Name: string;
     Code: string;
     HomeUrl: string;
@@ -268,9 +283,17 @@ export interface MarshalledCourse {
   lastAccessed: string | null;
 }
 
+// D2L org unit type id 3 is "Course Offering"; also accept the type code (what
+// the rest of the codebase historically checked) for payloads that omit the id.
+export function isCourseOfferingEnrollment(e: { OrgUnit?: { Type?: { Id?: number; Code?: string } } } | null | undefined): boolean {
+  const type = e?.OrgUnit?.Type;
+  if (!type) return false;
+  return type.Id === 3 || type.Code === 'Course Offering';
+}
+
 export function marshalEnrollments(response: { Items: RawEnrollment[] }): MarshalledCourse[] {
-  return response.Items
-    .filter((e) => e.OrgUnit.Type.Code === 'Course Offering')
+  return (response.Items || [])
+    .filter((e) => isCourseOfferingEnrollment(e))
     .map((e) => removeEmpty({
       id: e.OrgUnit.Id,
       name: e.OrgUnit.Name,
@@ -372,12 +395,20 @@ export interface MarshalledSubmission {
   feedback: string | null;
 }
 
+// EntityDropbox status: 0 Unsubmitted, 1 Submitted, 2 Draft, 3 Published (feedback
+// published — the work was submitted). Any recorded Submissions[] entry also counts.
+export function isEntityDropboxSubmitted(s: unknown): boolean {
+  if (!s || typeof s !== 'object') return false;
+  const e = s as { Status?: number; Submissions?: unknown[] };
+  return e.Status === 1 || e.Status === 3 || (Array.isArray(e.Submissions) && e.Submissions.length > 0);
+}
+
 export function marshalSubmissions(submissions: RawSubmission[]): MarshalledSubmission[] {
   return submissions.map((s) => {
     const latestSubmission = s.Submissions?.[0];
     return removeEmpty({
-      submitted: s.Status === 1,
-      submittedBy: s.Entity.DisplayName,
+      submitted: isEntityDropboxSubmitted(s),
+      submittedBy: s.Entity?.DisplayName,
       submissionDate: formatDate(latestSubmission?.SubmissionDate),
       submissionDateRelative: formatRelativeDate(latestSubmission?.SubmissionDate),
       files: latestSubmission?.Files?.map((f) => ({
@@ -478,4 +509,55 @@ export function marshalTopic(t: RawTopic): MarshalledTopicDetail {
     url: t.Url || null,
     type: t.TypeIdentifier || null,
   }) as MarshalledTopicDetail;
+}
+
+// ============= QUIZ ATTEMPTS / ERRORS =============
+
+/** True when `err` is a D2L 404 (D2LApiError status, or the error message). */
+export function isD2LNotFound(err: unknown): boolean {
+  const e = err as { status?: unknown; message?: unknown } | null | undefined;
+  if (typeof e?.status === 'number') return e.status === 404;
+  return /D2L API error 404\b/.test(String(e?.message ?? ''));
+}
+
+/** D2L quiz attempt (QuizAttemptData). Older code also looked at IsCompleted. */
+export interface RawQuizAttempt {
+  AttemptId?: number;
+  UserId?: number;
+  AttemptNumber?: number;
+  Score?: number | null;
+  Started?: string | null;
+  Completed?: string | null;
+  IsCompleted?: boolean;
+}
+
+/** An attempt is finished when Valence's `Completed` timestamp is set. */
+export function isQuizAttemptCompleted(a: RawQuizAttempt | null | undefined): boolean {
+  if (!a) return false;
+  return (a.Completed != null && a.Completed !== '') || a.IsCompleted === true;
+}
+
+export interface QuizAttemptSummary {
+  attempts: RawQuizAttempt[];
+  completed: number;
+  /** True when the attempts lookup failed with something other than 404. */
+  unknown: boolean;
+}
+
+/**
+ * Load a quiz's attempts for the current user. A 404 means "no attempts";
+ * any other failure is reported as unknown rather than silently claiming 0.
+ */
+export async function loadQuizAttemptSummary(
+  fetchAttempts: () => Promise<unknown>,
+): Promise<QuizAttemptSummary> {
+  try {
+    const raw = (await fetchAttempts()) as { Objects?: RawQuizAttempt[] } | RawQuizAttempt[] | null;
+    const attempts: RawQuizAttempt[] = Array.isArray(raw) ? raw : raw?.Objects || [];
+    return { attempts, completed: attempts.filter(isQuizAttemptCompleted).length, unknown: false };
+  } catch (err) {
+    if (isD2LNotFound(err)) return { attempts: [], completed: 0, unknown: false };
+    console.error('[QUIZ] attempts lookup failed:', (err as Error)?.message ?? err);
+    return { attempts: [], completed: 0, unknown: true };
+  }
 }

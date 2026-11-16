@@ -11,20 +11,15 @@
  */
 
 import { chromium } from "playwright";
-import path from "path";
-import os from "os";
-import fs from "fs/promises";
 import { supabase } from "../utils/supabase.js";
-import { loadStorageStateFromS3, saveStorageStateToS3 } from "../utils/s3Storage.js";
+import { loadStorageStateObjectFromS3, saveStorageStateToS3, type StorageStateObject } from "../utils/s3Storage.js";
 import { sendPushToUser } from "../api/push.js";
-import { getD2LCredentials } from "../auth.js";
+import { getD2LCredentials, resolveHeadlessLoginHost, withHeadlessLoginLock, closeBrowserOnAbort } from "../auth.js";
+import { DEFAULT_D2L_HOST } from "../utils/d2lHost.js";
 
 const CHROMIUM_PATH = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium";
 const REFRESH_INTERVAL_MS = 30 * 60 * 1000; // check every 30 min
 const STALE_THRESHOLD_MS = 12 * 60 * 60 * 1000; // refresh if token older than 12h
-// S3 browser state TTL is 25 days — warn users at 20 days so they can re-auth before expiry
-const S3_STATE_WARN_DAYS = 20;
-const S3_STATE_WARN_MS = S3_STATE_WARN_DAYS * 24 * 60 * 60 * 1000;
 const NAV_TIMEOUT_MS = 30_000; // 30s page load timeout
 
 export interface RefreshResult {
@@ -37,13 +32,14 @@ export interface RefreshResult {
  * Attempt a headless credential-based D2L login for a user.
  * Used as a fallback when ADFS browser state is absent or expired.
  * On success: upserts token to DB, saves new browser state to S3, clears duo_required_at.
- * Returns { token, storageStatePath } on success, null if Duo wall hit or no creds stored.
+ * Returns { token } on success, null if Duo wall hit or no creds stored.
  */
 async function attemptCredentialLogin(
   userId: string,
   d2lHost: string,
-  storageStatePath?: string
-): Promise<{ token: string; storageStatePath: string } | null> {
+  storageState?: StorageStateObject,
+  signal?: AbortSignal
+): Promise<{ token: string } | null> {
   const creds = await getD2LCredentials(userId);
   if (!creds?.username || !creds?.password) {
     console.error(`[REFRESH] No stored credentials for user ${userId} — cannot attempt credential login`);
@@ -64,11 +60,12 @@ async function attemptCredentialLogin(
         "--disable-gpu",
       ],
     });
+    closeBrowserOnAbort(signal, browser);
 
     // Use S3 storage state so the Duo "remember this device" cookie is present.
     // Without it, Duo sees a fresh browser and requires a new challenge every time.
     const context = await browser.newContext(
-      storageStatePath ? { storageState: storageStatePath } : {}
+      storageState ? { storageState } : {}
     );
     const page = await context.newPage();
 
@@ -104,7 +101,7 @@ async function attemptCredentialLogin(
       console.error(`[REFRESH] Filling credentials for user ${userId}`);
       // UWaterloo ADFS requires full UPN format (user@uwaterloo.ca)
       const loginUsername = creds.username.includes('@') ? creds.username : `${creds.username}@uwaterloo.ca`;
-      console.error(`[REFRESH] Using login username: ${loginUsername} (stored: ${creds.username})`);
+      console.error(`[REFRESH] Using UPN-format login username for user ${userId}`);
       await page.fill('input[type="text"], input[name="UserName"], input[name="username"]', loginUsername).catch(() => {});
 
       // If password field is already visible (single-page ADFS form), skip the "Next" step.
@@ -197,10 +194,8 @@ async function attemptCredentialLogin(
       const token = JSON.stringify({ d2lSessionVal: postSessionVal, d2lSecureSessionVal: postSecureVal });
 
       // Save browser storage state to S3
-      const tmpStatePath = path.join(os.tmpdir(), `cred-login-state-${userId}.json`);
-      await context.storageState({ path: tmpStatePath });
-      await saveStorageStateToS3(userId, tmpStatePath);
-      await fs.unlink(tmpStatePath).catch(() => {});
+      // Pass the state object directly — no plaintext temp file on disk.
+      await saveStorageStateToS3(userId, await context.storageState());
 
       // Upsert fresh token and clear duo_required_at
       const { error } = await supabase.from("user_credentials").upsert({
@@ -219,7 +214,7 @@ async function attemptCredentialLogin(
 
       await browser.close();
       console.error(`[REFRESH] Credential login succeeded for user ${userId}`);
-      return { token, storageStatePath: tmpStatePath };
+      return { token };
     }
 
     // If we landed directly on D2L (S3 state had valid D2L cookies), extract them
@@ -235,10 +230,8 @@ async function attemptCredentialLogin(
     }
 
     // Save browser storage state to S3
-    const tmpStatePath = path.join(os.tmpdir(), `cred-login-state-${userId}.json`);
-    await context.storageState({ path: tmpStatePath });
-    await saveStorageStateToS3(userId, tmpStatePath);
-    await fs.unlink(tmpStatePath).catch(() => {});
+    // Pass the state object directly — no plaintext temp file on disk.
+    await saveStorageStateToS3(userId, await context.storageState());
 
     const token = JSON.stringify({ d2lSessionVal: sessionVal, d2lSecureSessionVal: secureVal });
 
@@ -259,7 +252,7 @@ async function attemptCredentialLogin(
 
     await browser.close();
     console.error(`[REFRESH] Credential login succeeded for user ${userId}`);
-    return { token, storageStatePath: tmpStatePath };
+    return { token };
 
   } catch (err: any) {
     console.error(`[REFRESH] Credential login error for user ${userId}:`, err?.message);
@@ -302,7 +295,11 @@ export async function pingD2LSession(
 
     // Session alive — check for rotated cookies in Set-Cookie response header
     const setCookie = pingResp.headers.get("set-cookie");
-    console.error(`[REFRESH] Ping 200 for user ${userId} — Set-Cookie: ${setCookie ? setCookie.substring(0, 120) : "none"}`);
+    // Log cookie NAMES only — values are live session credentials.
+    const setCookieNames = setCookie
+      ? setCookie.split(/,\s*(?=[^;]+=)/).map(p => p.match(/^([^=\s]+)=/)?.[1]).filter(Boolean).join(", ")
+      : "";
+    console.error(`[REFRESH] Ping 200 for user ${userId} — Set-Cookie names: ${setCookieNames || "none"}`);
     if (setCookie && existingCookies) {
       let newSessionVal: string | undefined;
       let newSecureVal: string | undefined;
@@ -335,13 +332,21 @@ export async function pingD2LSession(
  * First tries a lightweight API ping — if the session is still alive, just update updated_at.
  * Falls back to headless browser with S3 ADFS state, then credential login.
  * No VNC, no Xvfb — fully headless.
+ *
+ * Holds the per-user headless-login lock shared with auth.ts silent re-login,
+ * so a scheduled refresh and an on-demand re-login never run concurrently.
  */
-export async function refreshD2LSession(userId: string): Promise<RefreshResult> {
+export function refreshD2LSession(userId: string): Promise<RefreshResult> {
+  return withHeadlessLoginLock(userId, (_waited, signal) => refreshD2LSessionUnlocked(userId, signal))
+    .catch((e: any) => ({ success: false, reason: "error" as const, error: e?.message }));
+}
+
+async function refreshD2LSessionUnlocked(userId: string, signal?: AbortSignal): Promise<RefreshResult> {
   const startTime = Date.now();
   console.error(`[REFRESH] Starting headless refresh for user ${userId}`);
 
   // 1. Load current credentials from DB (host + token + duo_required_at)
-  let d2lHost = process.env.D2L_HOST || "learn.uwaterloo.ca";
+  let d2lHost = DEFAULT_D2L_HOST;
   let currentToken: string | null = null;
   try {
     const sbUrl = process.env.SUPABASE_URL;
@@ -368,6 +373,11 @@ export async function refreshD2LSession(userId: string): Promise<RefreshResult> 
     console.error("[REFRESH] Error fetching D2L credentials:", e);
   }
 
+  // Never ping or drive a headless login against a host outside the allowlist.
+  const allowedHost = resolveHeadlessLoginHost(d2lHost, userId);
+  if (!allowedHost) return { success: false, reason: "error", error: "D2L host is not allowed" };
+  d2lHost = allowedHost;
+
   // 2. API ping — if the stored session cookies still work, no browser needed
   if (currentToken) {
     const pingedToken = await pingD2LSession(userId, d2lHost, currentToken);
@@ -393,14 +403,14 @@ export async function refreshD2LSession(userId: string): Promise<RefreshResult> 
   // rejectIfLegacy=true: legacy (unencrypted) states are old enough that ADFS is almost
   // certainly expired, so using them in a headless browser would trigger a real Duo push
   // on the user's phone. Skip straight to credential login instead.
-  const storageStatePath = await loadStorageStateFromS3(userId, undefined, { rejectIfLegacy: true });
-  if (!storageStatePath) {
+  const storageState = await loadStorageStateObjectFromS3(userId, undefined, { rejectIfLegacy: true });
+  if (!storageState) {
     // Legacy state was rejected for headless navigation, but it may still contain a valid
     // Duo "remember this device" cookie needed for credential login to bypass Duo.
     // Load it without legacy/expiry restrictions for the credential login path only.
-    const legacyStatePath = await loadStorageStateFromS3(userId, undefined, { ignoreExpiry: true });
-    console.error(`[REFRESH] No usable browser state for user ${userId} — trying credential login${legacyStatePath ? ' (with legacy Duo cookie)' : ''}`);
-    const credResult = await attemptCredentialLogin(userId, d2lHost, legacyStatePath);
+    const legacyState = await loadStorageStateObjectFromS3(userId, undefined, { ignoreExpiry: true });
+    console.error(`[REFRESH] No usable browser state for user ${userId} — trying credential login${legacyState ? ' (with legacy Duo cookie)' : ''}`);
+    const credResult = await attemptCredentialLogin(userId, d2lHost, legacyState, signal);
     if (credResult) {
       console.error(`[REFRESH] Credential login succeeded for user ${userId} (no prior S3 state)`);
       return { success: true };
@@ -422,9 +432,10 @@ export async function refreshD2LSession(userId: string): Promise<RefreshResult> 
         "--disable-gpu",
       ],
     });
+    closeBrowserOnAbort(signal, browser);
 
     const context = await browser.newContext({
-      storageState: storageStatePath,
+      storageState,
     });
 
     const page = await context.newPage();
@@ -459,7 +470,7 @@ export async function refreshD2LSession(userId: string): Promise<RefreshResult> 
       console.error(`[REFRESH] ADFS session expired for user ${userId} — trying credential login with S3 state (Duo cookie)`);
       await browser.close();
       browser = undefined;
-      const credResult = await attemptCredentialLogin(userId, d2lHost, storageStatePath);
+      const credResult = await attemptCredentialLogin(userId, d2lHost, storageState, signal);
       if (credResult) {
         console.error(`[REFRESH] Credential login succeeded for user ${userId} (ADFS state expired)`);
         return { success: true };
@@ -480,10 +491,8 @@ export async function refreshD2LSession(userId: string): Promise<RefreshResult> 
     }
 
     // 7. Save refreshed storage state back to S3 (extends ADFS lifetime)
-    const tmpStatePath = path.join(os.tmpdir(), `refresh-state-${userId}.json`);
-    await context.storageState({ path: tmpStatePath });
-    await saveStorageStateToS3(userId, tmpStatePath);
-    await fs.unlink(tmpStatePath).catch(() => {});
+    // Pass the state object directly — no plaintext temp file on disk.
+    await saveStorageStateToS3(userId, await context.storageState());
 
     // 8. Upsert fresh D2L token into database (clear duo_required_at if set)
     const token = JSON.stringify({ d2lSessionVal: sessionVal, d2lSecureSessionVal: secureVal });
@@ -579,37 +588,10 @@ export function startSessionRefreshScheduler(): void {
         }
       }
 
-      // Proactive S3 state expiry warning: sessions updated 20+ days ago are approaching
-      // the 25-day S3 browser state TTL. Warn before the session actually fails.
-      const warnCutoff = new Date(Date.now() - S3_STATE_WARN_MS).toISOString();
-      const { data: agingUsers, error: warnError } = await supabase
-        .from("user_credentials")
-        .select("user_id, updated_at")
-        .eq("service", "d2l")
-        .lt("updated_at", warnCutoff)
-        .is("duo_required_at", null)
-        .is("notification_sent_at", null);
-
-      if (warnError) {
-        console.error("[REFRESH] Failed to query aging sessions:", warnError.message);
-      } else if (agingUsers && agingUsers.length > 0) {
-        console.error(`[REFRESH] Found ${agingUsers.length} session(s) approaching S3 state expiry — sending proactive warnings`);
-        for (const user of agingUsers) {
-          sendPushToUser(
-            user.user_id,
-            "D2L Re-authentication Needed Soon",
-            "Your D2L session will expire in the next few days. Open Horizon to reconnect before it fails.",
-            { type: "reauth_warning" }
-          ).catch(err => {
-            console.error(`[REFRESH] Failed to send proactive warning to user ${user.user_id}:`, err?.message);
-          });
-
-          // Mark warning sent so we don't spam the user every 30 min
-          await supabase.from("user_credentials").update({
-            notification_sent_at: new Date().toISOString(),
-          }).eq("user_id", user.user_id).eq("service", "d2l");
-        }
-      }
+      // The proactive "re-auth needed soon" warning lives in jobs/storageStateTTL.ts:
+      // it keys on the S3 storage state's captured_at (the clock the 25-day TTL
+      // actually uses). Keying on user_credentials.updated_at here never fired,
+      // because the API-ping path above bumps updated_at on every successful ping.
     } catch (err: any) {
       console.error("[REFRESH] Scheduler cycle error:", err?.message);
     } finally {

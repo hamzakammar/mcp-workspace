@@ -17,68 +17,24 @@
  */
 
 import { chromium } from "playwright";
-import path from "path";
-import os from "os";
-import fs from "fs/promises";
 import { supabase } from "../utils/supabase.js";
 import { decryptPassword } from "../utils/kms.js";
 import { sendPushToUser } from "../api/push.js";
+import { loadStorageStateObjectFromS3, saveStorageStateToS3 } from "../utils/s3Storage.js";
 
 const CHROMIUM_PATH = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium";
 const OUTLINE_HOST = "outline.uwaterloo.ca";
-const S3_STATE_KEY_PREFIX = "browser-state";
 const NAV_TIMEOUT_MS = 30_000;
 const DUO_WAIT_MS = 35_000;
 
-// ─── S3 helpers (outline-specific key) ───────────────────────────────────────
-
-async function loadOutlineStateFromS3(userId: string): Promise<string | undefined> {
-  try {
-    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
-    const s3 = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
-    const key = `${S3_STATE_KEY_PREFIX}/${userId}/outline-storage-state.json`;
-    const res = await s3.send(new GetObjectCommand({
-      Bucket: process.env.S3_BUCKET || "study-mcp-notes",
-      Key: key,
-    }));
-    const body = await res.Body?.transformToString();
-    if (!body) return undefined;
-    const tmpPath = path.join(os.tmpdir(), `outline-state-${userId}.json`);
-    await fs.writeFile(tmpPath, body);
-    console.error(`[OUTLINE_AUTH] Loaded outline browser state for user ${userId}`);
-    return tmpPath;
-  } catch (e: any) {
-    if (e?.name !== "NoSuchKey") {
-      console.error(`[OUTLINE_AUTH] Failed to load outline browser state: ${e?.message}`);
-    }
-    return undefined;
-  }
-}
-
-async function saveOutlineStateToS3(userId: string, statePath: string): Promise<void> {
-  try {
-    const { S3Client, PutObjectCommand } = await import("@aws-sdk/client-s3");
-    const s3 = new S3Client({ region: process.env.AWS_REGION || "us-east-1" });
-    const key = `${S3_STATE_KEY_PREFIX}/${userId}/outline-storage-state.json`;
-    const body = await fs.readFile(statePath, "utf-8");
-    await s3.send(new PutObjectCommand({
-      Bucket: process.env.S3_BUCKET || "study-mcp-notes",
-      Key: key,
-      Body: body,
-      ContentType: "application/json",
-    }));
-    console.error(`[OUTLINE_AUTH] Saved outline browser state for user ${userId}`);
-  } catch (e: any) {
-    console.error(`[OUTLINE_AUTH] Failed to save outline browser state: ${e?.message}`);
-  }
-}
-
 // ─── Credential retrieval ─────────────────────────────────────────────────────
 
-async function getOutlineCredentials(userId: string): Promise<{ username: string; password: string } | null> {
+async function getOutlineCredentials(
+  userId: string
+): Promise<{ username: string; password: string; duoRequiredAt: string | null } | null> {
   const { data, error } = await supabase
     .from("user_credentials")
-    .select("username, password")
+    .select("username, password, duo_required_at")
     .eq("user_id", userId)
     .eq("service", "outline")
     .single();
@@ -86,7 +42,7 @@ async function getOutlineCredentials(userId: string): Promise<{ username: string
   if (error || !data?.username || !data?.password) return null;
   try {
     const password = await decryptPassword(data.password);
-    return { username: data.username, password };
+    return { username: data.username, password, duoRequiredAt: data.duo_required_at ?? null };
   } catch (e: any) {
     console.error(`[OUTLINE_AUTH] Failed to decrypt password for user ${userId}: ${e?.message}`);
     return null;
@@ -182,9 +138,17 @@ export async function loginToOutline(userId: string): Promise<string | null> {
     return null;
   }
 
+  // Hard stop: once Duo is flagged, a headless attempt just hits the Duo wall
+  // again and sends another push. Wait for the user to reconnect via the app.
+  if (creds.duoRequiredAt) {
+    console.error(`[OUTLINE_AUTH] Skipping headless login for user ${userId} — duo_required_at already set`);
+    return null;
+  }
+
   console.error(`[OUTLINE_AUTH] Starting headless outline login for user ${userId}`);
 
-  const storageStatePath = await loadOutlineStateFromS3(userId);
+  // Same encrypted, TTL-aware S3 object the VNC flow writes (service='outline').
+  const storageState = await loadStorageStateObjectFromS3(userId, "outline");
   let browser;
 
   try {
@@ -200,7 +164,7 @@ export async function loginToOutline(userId: string): Promise<string | null> {
     });
 
     const context = await browser.newContext(
-      storageStatePath ? { storageState: storageStatePath } : {}
+      storageState ? { storageState } : {}
     );
     const page = await context.newPage();
 
@@ -348,10 +312,12 @@ export async function loginToOutline(userId: string): Promise<string | null> {
     }
 
     // Save browser state to S3 (outline-specific key)
-    const tmpStatePath = path.join(os.tmpdir(), `outline-state-${uid}.json`);
-    await context.storageState({ path: tmpStatePath });
-    await saveOutlineStateToS3(uid, tmpStatePath);
-    await fs.unlink(tmpStatePath).catch(() => {});
+    try {
+      // Pass the state object directly — no plaintext temp file on disk.
+      await saveStorageStateToS3(uid, await context.storageState(), undefined, "outline");
+    } catch (e: any) {
+      console.error(`[OUTLINE_AUTH] Failed to save outline browser state: ${e?.message}`);
+    }
 
     // Upsert sessionid token to DB
     const { error } = await supabase.from("user_credentials").upsert({
@@ -397,7 +363,19 @@ async function markDuoRequired(userId: string): Promise<void> {
  * Tries DB first, falls back to headless login if expired/missing.
  * Returns cookie string (e.g. "sessionid=abc123") or throws if auth fails.
  */
-export async function getOrRefreshOutlineCookies(userId: string): Promise<string> {
+// One in-flight cookie refresh per user: concurrent tool calls share one
+// headless login instead of launching several (each could trigger a Duo push).
+const outlineRefreshInFlight = new Map<string, Promise<string>>();
+
+export function getOrRefreshOutlineCookies(userId: string): Promise<string> {
+  const existing = outlineRefreshInFlight.get(userId);
+  if (existing) return existing;
+  const run = getOrRefreshOutlineCookiesOnce(userId).finally(() => outlineRefreshInFlight.delete(userId));
+  outlineRefreshInFlight.set(userId, run);
+  return run;
+}
+
+async function getOrRefreshOutlineCookiesOnce(userId: string): Promise<string> {
   const stored = await getOutlineCookies(userId);
   if (stored) return stored;
 

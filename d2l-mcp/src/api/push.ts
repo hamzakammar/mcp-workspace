@@ -122,6 +122,23 @@ export async function sendPushToUser(
  * Check for D2L updates and send notifications
  * This should be called periodically (e.g., via cron)
  */
+/**
+ * Decide which dropbox folders are new since the last check, given the set of
+ * folder ids already notified for that course. On first sight of a course
+ * (`prevIds` undefined) nothing is pushed — the current folders just seed the
+ * set — so existing assignments aren't announced as "new" on every sync.
+ */
+export function diffNotifiedFolders(
+  prevIds: unknown,
+  folders: Array<{ Id?: unknown }>
+): { toNotify: any[]; nextIds: string[] } {
+  const ids = folders.map((f) => String(f?.Id)).filter((id) => id && id !== "undefined");
+  if (!Array.isArray(prevIds)) return { toNotify: [], nextIds: ids };
+  const seen = new Set(prevIds.map(String));
+  const toNotify = folders.filter((f) => f?.Id != null && !seen.has(String(f.Id)));
+  return { toNotify, nextIds: ids };
+}
+
 export async function checkAndNotifyUpdates(userId: string): Promise<{
   announcements: number;
   grades: number;
@@ -162,15 +179,31 @@ export async function checkAndNotifyUpdates(userId: string): Promise<{
     // Get last sync state
     const { data: syncState } = await supabase
       .from("sync_state")
-      .select("last_sync_at, cursor")
+      .select("id, last_sync_at, cursor")
       .eq("user_id", userId)
       .eq("source", "learn")
+      .is("course_id", null)
+      .order("last_sync_at", { ascending: false })
       .limit(1)
-      .single();
+      .maybeSingle();
 
     const lastSyncTime = syncState?.last_sync_at
       ? new Date(syncState.last_sync_at).getTime()
       : Date.now() - 24 * 60 * 60 * 1000; // Default to 24 hours ago
+
+    // Per-course dropbox folder ids already notified, kept in the sync_state
+    // cursor so each assignment is pushed once (not on every sync until due).
+    const prevCursor = syncState?.cursor && typeof syncState.cursor === "object" && !Array.isArray(syncState.cursor)
+      ? syncState.cursor as Record<string, any>
+      : {};
+    const prevNotified: Record<string, unknown> =
+      prevCursor.notifiedAssignments && typeof prevCursor.notifiedAssignments === "object"
+        ? prevCursor.notifiedAssignments
+        : {};
+    const nextNotified: Record<string, string[]> = {};
+    for (const [k, v] of Object.entries(prevNotified)) {
+      if (Array.isArray(v)) nextNotified[k] = v.map(String);
+    }
 
     // Check each course for updates
     for (const course of courses) {
@@ -207,12 +240,10 @@ export async function checkAndNotifyUpdates(userId: string): Promise<{
         // For now, we'll rely on the sync process to detect grade changes
 
         // Check for new assignments
-        const { assignmentTools } = await import("../tools/dropbox.js");
         const folders = await client.getDropboxFolders(orgUnitId) as any[];
-        const newAssignments = folders.filter((folder: any) => {
-          const folderDate = folder.DueDate ? new Date(folder.DueDate).getTime() : 0;
-          return folderDate > lastSyncTime;
-        });
+        const courseKey = String(orgUnitId);
+        const { toNotify: newAssignments, nextIds } = diffNotifiedFolders(prevNotified[courseKey], folders ?? []);
+        nextNotified[courseKey] = nextIds;
 
         if (newAssignments.length > 0) {
           for (const assignment of newAssignments.slice(0, 3)) {
@@ -238,20 +269,18 @@ export async function checkAndNotifyUpdates(userId: string): Promise<{
       }
     }
 
-    // Update sync state
-    await supabase
-      .from("sync_state")
-      .upsert(
-        {
-          user_id: userId,
-          source: "learn",
-          course_id: null,
-          last_sync_at: new Date().toISOString(),
-        },
-        {
-          onConflict: "user_id,source,course_id",
-        }
-      );
+    // Update sync state. Update the existing row by id rather than upserting:
+    // with course_id = null an ON CONFLICT upsert only matches if the unique
+    // constraint is NULLS NOT DISTINCT, which older schemas lack — it would
+    // insert a fresh row every run and the notified set would never persist.
+    const syncRow = {
+      last_sync_at: new Date().toISOString(),
+      cursor: { ...prevCursor, notifiedAssignments: nextNotified },
+    };
+    const { error: syncErr } = syncState?.id
+      ? await supabase.from("sync_state").update(syncRow).eq("id", syncState.id).eq("user_id", userId)
+      : await supabase.from("sync_state").insert({ user_id: userId, source: "learn", course_id: null, ...syncRow });
+    if (syncErr) console.error("[PUSH] Failed to save sync state:", syncErr);
   } catch (error) {
     console.error("[PUSH] Error checking updates:", error);
   }

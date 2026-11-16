@@ -15,7 +15,12 @@ vi.mock('../../src/utils/supabase.js', () => ({
     from: () => ({ select: () => ({ eq: () => ({ eq: () => ({ single: async () => ({ data: null, error: null }) }) }) }), upsert: async () => ({ error: null }) }),
   },
 }));
-vi.mock('../../src/auth.js', () => ({ getD2LCredentials: async () => null }));
+vi.mock('../../src/auth.js', () => ({
+  getD2LCredentials: async () => null,
+  resolveHeadlessLoginHost: (h: string | undefined) => h || 'learn.uwaterloo.ca',
+  withHeadlessLoginLock: (_u: string, fn: (waited: boolean, signal: AbortSignal) => Promise<unknown>) => fn(false, new AbortController().signal),
+  closeBrowserOnAbort: () => {},
+}));
 
 import { pingD2LSession } from '../../src/jobs/sessionRefresher.js';
 
@@ -135,5 +140,21 @@ describe('pingD2LSession — cookie rotation', () => {
     const parsed = JSON.parse(result!);
     expect(parsed).toHaveProperty('d2lSessionVal');
     expect(parsed).toHaveProperty('d2lSecureSessionVal');
+  });
+});
+
+// ─── Secrets in logs ──────────────────────────────────────────────────────────
+
+describe('pingD2LSession — logging', () => {
+  it('logs Set-Cookie names but never cookie values', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockPingResponse(200, 'd2lSessionVal=SECRET_ROTATED_1; Path=/; HttpOnly, d2lSecureSessionVal=SECRET_ROTATED_2; Path=/; Secure');
+    await pingD2LSession('user-1', 'learn.uwaterloo.ca', VALID_TOKEN);
+    const logged = errSpy.mock.calls.map(c => c.join(' ')).join('\n');
+    errSpy.mockRestore();
+    expect(logged).toContain('d2lSessionVal');
+    expect(logged).toContain('d2lSecureSessionVal');
+    expect(logged).not.toContain('SECRET_ROTATED_1');
+    expect(logged).not.toContain('SECRET_ROTATED_2');
   });
 });

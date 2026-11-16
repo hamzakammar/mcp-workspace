@@ -95,7 +95,7 @@ func RateLimit(limiter *RateLimiter) func(http.Handler) http.Handler {
 			if uid, ok := r.Context().Value(UserIDKey).(string); ok && uid != "" {
 				key = "user:" + uid
 			} else {
-				key = "ip:" + r.RemoteAddr
+				key = "ip:" + ClientIPOf(r)
 			}
 
 			if !limiter.Allow(key) {
@@ -105,6 +105,56 @@ func RateLimit(limiter *RateLimiter) func(http.Handler) http.Handler {
 				return
 			}
 
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// authEndpointLimit classifies a request for AuthEndpointRateLimit: "strict"
+// for password checks and /metrics token guesses, "loose" for dynamic client
+// registration, "" for everything else. /token is intentionally left to the
+// general limiter: hosted MCP connectors (e.g. Claude.ai) refresh tokens from
+// shared egress IPs. OPTIONS is always exempt.
+func authEndpointLimit(r *http.Request) string {
+	if r.Method == http.MethodOptions {
+		return ""
+	}
+	switch r.URL.Path {
+	case "/authorize", "/auth/signin":
+		if r.Method == http.MethodPost {
+			return "strict"
+		}
+	case "/metrics":
+		return "strict"
+	case "/register":
+		return "loose"
+	}
+	return ""
+}
+
+// AuthEndpointRateLimit applies per-IP limits to credential-checking endpoints
+// (see authEndpointLimit). It must be mounted BEFORE Auth so that failed
+// attempts are counted too.
+func AuthEndpointRateLimit(strict, loose *RateLimiter) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var limiter *RateLimiter
+			switch authEndpointLimit(r) {
+			case "strict":
+				limiter = strict
+			case "loose":
+				limiter = loose
+			default:
+				next.ServeHTTP(w, r)
+				return
+			}
+			key := "authip:" + r.URL.Path + ":" + ClientIPOf(r)
+			if !limiter.Allow(key) {
+				fmt.Printf("[RATELIMIT] Auth endpoint rate limit exceeded for %s\n", key)
+				w.Header().Set("Retry-After", "60")
+				http.Error(w, `{"error":"rate limit exceeded"}`, http.StatusTooManyRequests)
+				return
+			}
 			next.ServeHTTP(w, r)
 		})
 	}

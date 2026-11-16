@@ -101,6 +101,46 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const NOTION_MAX_ATTEMPTS = 4;
+const NOTION_BASE_BACKOFF_MS = 500;
+const NOTION_MAX_RETRY_AFTER_MS = 30_000;
+
+/**
+ * fetch wrapper for every Notion API call. Retries 429 (rate limited — the request
+ * was not processed, so it is always safe to retry) honouring `Retry-After` seconds,
+ * and 5xx with exponential backoff, up to NOTION_MAX_ATTEMPTS total attempts.
+ *
+ * 5xx is only retried when `idempotent` is true: a non-idempotent call (create page,
+ * append children) that 5xx's may still have been applied server-side, and retrying
+ * it could create a duplicate page / callout. Returns the final Response (which may
+ * still be non-OK); callers keep their own error handling.
+ */
+async function notionFetch(
+  url: string,
+  init: RequestInit,
+  opts: { idempotent?: boolean } = {},
+): Promise<Response> {
+  const idempotent = opts.idempotent ?? true;
+  let attempt = 0;
+  for (;;) {
+    attempt++;
+    const resp = await fetch(url, init);
+    const retryable = resp.status === 429 || (idempotent && resp.status >= 500 && resp.status <= 599);
+    if (!retryable || attempt >= NOTION_MAX_ATTEMPTS) return resp;
+    // Release the unread body before retrying so the connection can be reused.
+    try { await resp.body?.cancel(); } catch { /* ignore */ }
+
+    let waitMs = NOTION_BASE_BACKOFF_MS * 2 ** (attempt - 1);
+    const retryAfter = resp.headers?.get?.('retry-after');
+    if (retryAfter) {
+      const secs = Number(retryAfter);
+      if (Number.isFinite(secs) && secs >= 0) waitMs = Math.min(secs * 1000, NOTION_MAX_RETRY_AFTER_MS);
+    }
+    console.error(`[NOTION] ${resp.status} from Notion; retrying in ${waitMs}ms (attempt ${attempt + 1}/${NOTION_MAX_ATTEMPTS})`);
+    await delay(waitMs);
+  }
+}
+
 /** Format a date in Eastern Time for display */
 function formatDateET(isoDate: string, includeTime = true): string {
   const opts: Intl.DateTimeFormatOptions = {
@@ -338,8 +378,12 @@ async function fetchAllChildren(token: string, blockId: string): Promise<NotionB
   do {
     const url = `${NOTION_BASE}/blocks/${blockId}/children?page_size=100` +
       (cursor ? `&start_cursor=${encodeURIComponent(cursor)}` : '');
-    const resp = await fetch(url, { headers: notionHeaders(token) });
-    if (!resp.ok) break;
+    const resp = await notionFetch(url, { headers: notionHeaders(token) });
+    if (!resp.ok) {
+      // Never return a partial child list: callers use it to find the managed
+      // callout, and a truncated list would cause a duplicate callout to be appended.
+      throw new Error(`Notion list block children failed (${resp.status}) for block ${blockId}`);
+    }
     const data = await resp.json() as { results?: NotionBlock[]; has_more?: boolean; next_cursor?: string | null };
     all.push(...(data.results || []));
     cursor = data.has_more ? (data.next_cursor || undefined) : undefined;
@@ -366,7 +410,7 @@ export async function ensureDatabaseSchema(token: string, databaseId: string): P
     'Assignments': { number: {} },
   };
 
-  const resp = await fetch(`${NOTION_BASE}/databases/${databaseId}`, {
+  const resp = await notionFetch(`${NOTION_BASE}/databases/${databaseId}`, {
     method: 'PATCH',
     headers: notionHeaders(token),
     body: JSON.stringify({ properties: requiredProperties }),
@@ -380,7 +424,7 @@ export async function ensureDatabaseSchema(token: string, databaseId: string): P
 
 export async function validateNotionToken(token: string): Promise<boolean> {
   try {
-    const resp = await fetch(`${NOTION_BASE}/users/me`, {
+    const resp = await notionFetch(`${NOTION_BASE}/users/me`, {
       headers: notionHeaders(token),
     });
     return resp.status === 200;
@@ -402,7 +446,7 @@ export async function queryAllPages(token: string, databaseId: string): Promise<
     const body: Record<string, unknown> = { page_size: 100 };
     if (cursor) body['start_cursor'] = cursor;
 
-    const resp = await fetch(`${NOTION_BASE}/databases/${databaseId}/query`, {
+    const resp = await notionFetch(`${NOTION_BASE}/databases/${databaseId}/query`, {
       method: 'POST',
       headers: notionHeaders(token),
       body: JSON.stringify(body),
@@ -461,11 +505,11 @@ export async function createCoursePage(
     children: [buildManagedCallout(managedBody)],
   };
 
-  const resp = await fetch(`${NOTION_BASE}/pages`, {
+  const resp = await notionFetch(`${NOTION_BASE}/pages`, {
     method: 'POST',
     headers: notionHeaders(token),
     body: JSON.stringify(body),
-  });
+  }, { idempotent: false });
 
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({})) as { message?: string };
@@ -508,7 +552,11 @@ async function readUserStatuses(token: string, pageId: string): Promise<Map<stri
         }
       }
     }
-  } catch { /* skip */ }
+  } catch (e) {
+    // Propagate: if we can't read the page we must not rewrite it, or user-set
+    // statuses (📤/✅) would be silently overwritten. syncCourses counts it as failed.
+    throw new Error(`Failed to read existing Notion page ${pageId}: ${e instanceof Error ? e.message : String(e)}`);
+  }
   return statuses;
 }
 
@@ -546,7 +594,7 @@ export async function updateCoursePage(
     if (course.grades.length === 0) delete properties['Grade'];
   }
 
-  const resp = await fetch(`${NOTION_BASE}/pages/${pageId}`, {
+  const resp = await notionFetch(`${NOTION_BASE}/pages/${pageId}`, {
     method: 'PATCH',
     headers: notionHeaders(token),
     body: JSON.stringify({ properties }),
@@ -592,11 +640,11 @@ export async function updateCoursePage(
 
   // Append fresh managed content inside a single marked callout — FIRST.
   const newBlocks = [buildManagedCallout(buildCourseBody(course).slice(0, 99))];
-  const appendResp = await fetch(`${NOTION_BASE}/blocks/${pageId}/children`, {
+  const appendResp = await notionFetch(`${NOTION_BASE}/blocks/${pageId}/children`, {
     method: 'PATCH',
     headers: notionHeaders(token),
     body: JSON.stringify({ children: newBlocks }),
-  });
+  }, { idempotent: false });
   if (!appendResp.ok) {
     const err = await appendResp.json().catch(() => ({})) as { message?: string };
     // Nothing was deleted yet — the existing managed body is intact.
@@ -607,7 +655,7 @@ export async function updateCoursePage(
   // fails, keep both callouts (recoverable duplicate) and report — never lose data.
   const deleteFailures: string[] = [];
   for (const id of oldManagedIds) {
-    const delResp = await fetch(`${NOTION_BASE}/blocks/${id}`, {
+    const delResp = await notionFetch(`${NOTION_BASE}/blocks/${id}`, {
       method: 'DELETE',
       headers: notionHeaders(token),
     });
@@ -675,7 +723,7 @@ export async function createAssignmentPage(
   databaseId: string,
   assignment: NotionAssignment,
 ): Promise<void> {
-  const resp = await fetch(`${NOTION_BASE}/pages`, {
+  const resp = await notionFetch(`${NOTION_BASE}/pages`, {
     method: 'POST',
     headers: notionHeaders(token),
     body: JSON.stringify({
@@ -689,7 +737,7 @@ export async function createAssignmentPage(
         'Type': { select: { name: assignment.type === 'quiz' ? 'Quiz' : 'Assignment' } },
       },
     }),
-  });
+  }, { idempotent: false });
   if (!resp.ok) {
     const err = await resp.json().catch(() => ({})) as { message?: string };
     throw new Error(`Notion create page failed (${resp.status}): ${err.message ?? 'unknown error'}`);
@@ -701,7 +749,7 @@ export async function updateAssignmentPage(
   pageId: string,
   assignment: NotionAssignment,
 ): Promise<void> {
-  const resp = await fetch(`${NOTION_BASE}/pages/${pageId}`, {
+  const resp = await notionFetch(`${NOTION_BASE}/pages/${pageId}`, {
     method: 'PATCH',
     headers: notionHeaders(token),
     body: JSON.stringify({

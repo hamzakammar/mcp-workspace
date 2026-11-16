@@ -10,8 +10,38 @@
 import express, { Router, Request, Response } from "express";
 import { BrowserSessionManager, NOVNC_ASSET_PATH } from "../browser/BrowserSessionManager.js";
 import { authMiddleware } from "./auth.js";
+import { resolveAllowedD2LHost, normalizeD2LHost, getAllowedD2LHosts, DEFAULT_D2L_HOST } from "../utils/d2lHost.js";
+import { OUTLINE_HOST_MAP } from "../config/outlineHosts.js";
 
 const router = Router();
+
+/** Outline hostnames we will drive a browser to: those mapped from an allowed D2L host. */
+function allowedOutlineHosts(): Map<string, string> {
+  const out = new Map<string, string>(); // outline host -> d2l host
+  for (const d2lHost of getAllowedD2LHosts()) {
+    const base = OUTLINE_HOST_MAP[d2lHost]?.outlineBase;
+    if (!base) continue;
+    try { out.set(new URL(base).hostname.toLowerCase(), d2lHost); } catch { /* bad config entry */ }
+  }
+  return out;
+}
+
+/**
+ * Resolve a user-supplied outline host to a canonical allowed hostname, or
+ * null. Missing input defaults to the outline site for DEFAULT_D2L_HOST.
+ * Prevents /auth/outline/start from steering the headless browser anywhere.
+ */
+export function resolveAllowedOutlineHost(raw: unknown): string | null {
+  const allowed = allowedOutlineHosts();
+  let candidate: unknown = raw;
+  if (candidate === undefined || candidate === null || candidate === "") {
+    const base = OUTLINE_HOST_MAP[DEFAULT_D2L_HOST]?.outlineBase;
+    if (!base) return null;
+    candidate = base;
+  }
+  const host = normalizeD2LHost(candidate);
+  return host !== null && allowed.has(host) ? host : null;
+}
 
 function resolvePublicHost(req: Request): string {
   // Explicit override for production launch hardening.
@@ -34,7 +64,11 @@ function resolvePublicHost(req: Request): string {
  */
 router.post("/auth/d2l/start", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.userId!;
-  const d2lHost = (req.body?.d2lHost as string) || process.env.D2L_HOST || "learn.uwaterloo.ca";
+  const d2lHost = resolveAllowedD2LHost(req.body?.d2lHost || DEFAULT_D2L_HOST);
+  if (!d2lHost) {
+    res.status(400).json({ error: "Unsupported D2L host" });
+    return;
+  }
 
   try {
     const reqHost = resolvePublicHost(req);
@@ -99,7 +133,11 @@ router.get("/auth/d2l/status/:sessionId", async (req: Request, res: Response) =>
  */
 router.post("/auth/outline/start", authMiddleware, async (req: Request, res: Response) => {
   const userId = req.userId!;
-  const outlineHost = (req.body?.outlineHost as string) || "outline.uwaterloo.ca";
+  const outlineHost = resolveAllowedOutlineHost(req.body?.outlineHost);
+  if (!outlineHost) {
+    res.status(400).json({ error: "Unsupported outline host" });
+    return;
+  }
 
   try {
     const reqHost = resolvePublicHost(req);

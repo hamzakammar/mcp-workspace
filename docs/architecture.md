@@ -82,13 +82,13 @@ src/
 Defines all MCP processes: name, script path, environment variables, restart policy. This is the canonical list of what runs in production.
 
 ### `tests/` — Test Suite
-Vitest-based unit and integration tests. Config in `vitest.config.ts` (unit) and `vitest.integration.config.ts` (integration; requires live credentials).
+Vitest-based unit and integration tests. Config in `d2l-mcp/vitest.config.ts` (unit) and `d2l-mcp/vitest.integration.config.ts` (integration; requires live credentials).
 
 ---
 
 ## Deployment Topology
 
-- **EC2 Instance:** `ec2-user@3.93.185.101` — runs all MCP servers via PM2.
+- **EC2 Instance:** `ec2-user@<EC2_HOST>` — runs all MCP servers via PM2.
 - **Local machine:** Used for D2L/Piazza 2FA authentication only. Session files are synced to EC2 after auth.
 - **Session files:** `~/.d2l-session/` and `~/.piazza-session/` — expire ~24 hours. Must be re-synced after expiry.
 - **Ports:** D2L MCP on 3000. Future MCPs increment from 3001.

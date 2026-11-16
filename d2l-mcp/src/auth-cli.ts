@@ -6,6 +6,7 @@ import "dotenv/config";
  * Usage: npm run auth
  */
 import { getToken, getTokenExpiry } from "./auth.js";
+import { DEFAULT_D2L_HOST } from "./utils/d2lHost.js";
 
 async function main() {
   // If D2L_TOKEN is provided, skip browser auth
@@ -47,7 +48,8 @@ async function main() {
     console.log(
       "Your session has been saved. The MCP server will use it automatically."
     );
-    console.log("Token (first 50 chars):", token.substring(0, 50) + "...");
+    // Never print token material — it is a live session credential.
+    console.log(`Token: present (length ${token.length})`);
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     // REAUTH_REQUIRED means Duo MFA is needed — exit cleanly so the server still
@@ -70,7 +72,7 @@ async function main() {
       console.error("D2L authentication is required. Please set:");
       console.error("  - D2L_USERNAME");
       console.error("  - D2L_PASSWORD");
-      console.error("  - D2L_HOST (optional, defaults to learn.ul.ie)");
+      console.error(`  - D2L_HOST (optional, defaults to ${DEFAULT_D2L_HOST})`);
     }
     process.exit(1);
   }

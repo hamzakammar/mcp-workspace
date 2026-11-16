@@ -8,8 +8,11 @@ import {
   assessmentKind,
   dueClause,
   connectorTasksToRecommendations,
+  hasDropboxSubmission,
+  filterOutSubmitted,
   type AssessmentKind,
 } from './priorityGlobal.js';
+import { isCourseOfferingEnrollment, loadQuizAttemptSummary } from '../utils/marshal.js';
 
 // ---- Raw D2L types ----
 
@@ -34,10 +37,6 @@ interface RawQuiz {
     IsUnlimited: boolean;
     NumberOfAttemptsAllowed: number | null;
   } | null;
-}
-
-interface RawAttempt {
-  IsCompleted: boolean;
 }
 
 // ---- Output types ----
@@ -203,42 +202,33 @@ export const priorityTools = {
           quizzes.map(async (quiz) => {
             if (!quiz.DueDate) return;
             const dueMs = new Date(quiz.DueDate).getTime();
-            if (dueMs > cutoff || dueMs < Date.now() - 7 * 24 * 60 * 60 * 1000)
-              return;
+            // Past-due quizzes are closed — not actionable, so never ranked.
+            if (dueMs > cutoff || dueMs <= Date.now()) return;
 
-            let attemptsUsed = 0;
             let attemptsAllowed: number | null = null;
-            try {
-              const attemptsRaw = (await client.getQuizAttempts(
-                orgUnitId,
-                quiz.QuizId
-              )) as { Objects: RawAttempt[] } | RawAttempt[];
-              const attempts: RawAttempt[] = Array.isArray(attemptsRaw)
-                ? attemptsRaw
-                : (attemptsRaw as { Objects: RawAttempt[] }).Objects || [];
-              attemptsUsed = attempts.filter((a) => a.IsCompleted).length;
-            } catch {
-              attemptsUsed = 0;
-            }
+            const { completed: attemptsUsed, unknown: attemptsUnknown } =
+              await loadQuizAttemptSummary(() => client.getQuizAttempts(orgUnitId, quiz.QuizId));
 
             if (!quiz.AttemptsAllowed?.IsUnlimited) {
               attemptsAllowed =
                 quiz.AttemptsAllowed?.NumberOfAttemptsAllowed ?? null;
             }
 
-            // Skip if all attempts used
+            // Skip if all attempts used (only when we actually know the count)
             if (
+              !attemptsUnknown &&
               attemptsAllowed !== null &&
               attemptsUsed >= attemptsAllowed
             )
               return;
 
-            const notStarted = attemptsUsed === 0;
+            const notStarted = !attemptsUnknown && attemptsUsed === 0;
             const score = urgencyScore(dueMs, null, notStarted);
-            const attemptsDesc =
-              attemptsAllowed !== null
-                ? `${attemptsUsed} of ${attemptsAllowed} attempts used`
-                : `${attemptsUsed} attempt${attemptsUsed !== 1 ? 's' : ''} used (unlimited)`;
+            const attemptsDesc = attemptsUnknown
+              ? 'attempt status unknown'
+              : attemptsAllowed !== null
+              ? `${attemptsUsed} of ${attemptsAllowed} attempts used`
+              : `${attemptsUsed} attempt${attemptsUsed !== 1 ? 's' : ''} used (unlimited)`;
 
             recommendations.push({
               type: 'quiz',
@@ -262,8 +252,10 @@ export const priorityTools = {
         const userId = getUserId();
         if (userId && userId !== 'legacy') {
           const enrollmentsRaw = (await client.getMyEnrollments()) as
-            | { Items: Array<{ OrgUnit: { Id: number; Code: string; Name: string } }> };
-          const match = (enrollmentsRaw.Items || []).find((e) => e.OrgUnit?.Id === orgUnitId);
+            | { Items: Array<{ OrgUnit: { Id: number; Code: string; Name: string; Type?: { Id?: number; Code?: string } } }> };
+          const match = (enrollmentsRaw.Items || []).find(
+            (e) => e.OrgUnit?.Id === orgUnitId && isCourseOfferingEnrollment(e),
+          );
           const code = match ? shortCode(match.OrgUnit.Code || match.OrgUnit.Name) : '';
           if (code) {
             const pastCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
@@ -280,38 +272,17 @@ export const priorityTools = {
         // connector tasks unavailable — fall back to D2L-only recommendations
       }
 
-      // Sort by urgency score descending, take top candidates
+      // Rank, then drop already-submitted assignments BEFORE taking the top 5
+      // (bounded to 3×5 submission checks).
       recommendations.sort((a, b) => b.urgencyScore - a.urgencyScore);
-      const candidates = recommendations.slice(0, 10);
-
-      // Filter out already-submitted assignments (check submissions only for top candidates)
-      const submissionChecks = await Promise.allSettled(
-        candidates
-          .filter((r) => r.type === 'assignment' && r._folderId != null)
-          .map(async (r) => {
-            try {
-              const raw = (await client.getMySubmissions(orgUnitId, r._folderId!)) as
-                | { HasSubmission?: boolean; Submissions?: unknown[] }
-                | unknown[];
-              const hasSubmission = Array.isArray(raw)
-                ? raw.length > 0
-                : !!(raw.HasSubmission || (raw.Submissions && (raw.Submissions as unknown[]).length > 0));
-              return { name: r.name, submitted: hasSubmission };
-            } catch {
-              return { name: r.name, submitted: false };
-            }
-          })
+      const unsubmitted = await filterOutSubmitted(recommendations, (r) =>
+        r.type === 'assignment' && r._folderId != null
+          ? client.getMySubmissions(orgUnitId, r._folderId).then(hasDropboxSubmission)
+          : null,
+        { limit: 5 },
       );
-      const submittedNames = new Set<string>();
-      for (const result of submissionChecks) {
-        if (result.status === 'fulfilled' && result.value.submitted) {
-          submittedNames.add(result.value.name);
-        }
-      }
 
-      const top = candidates
-        .filter((r) => !submittedNames.has(r.name))
-        .slice(0, 5)
+      const top = unsubmitted
         .map(({ _folderId: _f, ...rec }) => rec); // strip internal field
 
       let summary: string;

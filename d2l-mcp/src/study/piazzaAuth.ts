@@ -148,9 +148,16 @@ export async function getPiazzaAuthenticatedContext(userId?: string): Promise<Br
     }
   }
 
-  const page = await context.newPage();
-  console.error(`[PIAZZA_AUTH] Navigating to ${PIAZZA_HOME}`);
-  await page.goto(PIAZZA_HOME, { waitUntil: "networkidle" });
+  let page;
+  try {
+    page = await context.newPage();
+    console.error(`[PIAZZA_AUTH] Navigating to ${PIAZZA_HOME}`);
+    await page.goto(PIAZZA_HOME, { waitUntil: "networkidle" });
+  } catch (err) {
+    // Don't leak the persistent Chromium (and its profile lock) on navigation failure.
+    await context.close().catch(() => {});
+    throw err;
+  }
 
   // Check if we're actually logged in (not just on the homepage)
   const loggedIn = await isLoggedIn(page);
@@ -281,7 +288,7 @@ export async function getPiazzaCookieHeader(userId?: string): Promise<string> {
           if (rows.length > 0 && rows[0].email && rows[0].password) {
             const { decryptPassword } = await import("../utils/kms.js");
             const plainPassword = await decryptPassword(rows[0].password);
-            console.error(`[PIAZZA_AUTH] Attempting credential login for ${rows[0].email}`);
+            console.error(`[PIAZZA_AUTH] Attempting credential login for user ${userId}`);
 
             // Step 1: Get initial session cookie + CSRF token from login page
             const initResp = await fetch("https://piazza.com/account/login", {
@@ -313,8 +320,9 @@ export async function getPiazzaCookieHeader(userId?: string): Promise<string> {
 
             if (loginResp.ok) {
               // Check response body for session info
+              // Read once — the body stream can't be consumed twice.
               const loginBody = await loginResp.text();
-              console.error(`[PIAZZA_AUTH] Login response body (first 300): ${loginBody.slice(0, 300)}`);
+              console.error(`[PIAZZA_AUTH] Login response: ${summarizePiazzaLoginBody(loginBody)}`);
 
               // Extract session cookies from Set-Cookie headers
               let setCookies = loginResp.headers.getSetCookie?.() || [];
@@ -357,8 +365,7 @@ export async function getPiazzaCookieHeader(userId?: string): Promise<string> {
 
                 return newCookieHeader;
               } else {
-                const body = await loginResp.text();
-                console.error(`[PIAZZA_AUTH] Credential login response had no session cookie. Body: ${body.slice(0, 200)}`);
+                console.error(`[PIAZZA_AUTH] Credential login response had no session cookie (${summarizePiazzaLoginBody(loginBody)})`);
               }
             } else {
               console.error(`[PIAZZA_AUTH] Credential login failed with status ${loginResp.status}`);
@@ -383,5 +390,21 @@ export async function getPiazzaCookieHeader(userId?: string): Promise<string> {
     return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
   } finally {
     await context.close();
+  }
+}
+
+/**
+ * Describe a Piazza user.login response for logs without echoing it: the body
+ * can carry session identifiers or account details. Only the API's `result`
+ * and `error` status fields are surfaced.
+ */
+export function summarizePiazzaLoginBody(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { result?: unknown; error?: unknown };
+    const result = typeof parsed?.result === "string" ? parsed.result.slice(0, 40) : typeof parsed?.result;
+    const error = typeof parsed?.error === "string" ? parsed.error.slice(0, 100) : parsed?.error === null ? "null" : typeof parsed?.error;
+    return `result=${result} error=${error}`;
+  } catch {
+    return `non-JSON body (${body.length} bytes)`;
   }
 }

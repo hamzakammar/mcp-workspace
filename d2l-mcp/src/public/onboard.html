@@ -1647,7 +1647,8 @@
           p.value = ''; // don't leave the password sitting in the DOM longer than needed
           if (!cr.ok) {
             const ce = await cr.json().catch(() => ({}));
-            status.innerHTML = `<span style="color:var(--danger)">&#9888;</span> Couldn't save login (${ce.error || cr.status}). Continuing with manual login.`;
+            status.innerHTML = '<span style="color:var(--danger)">&#9888;</span> ';
+            status.append(`Couldn't save login (${ce.error || cr.status}). Continuing with manual login.`);
           }
         }
 
@@ -1690,7 +1691,8 @@
           } catch {}
         }, 2500);
       } catch (e) {
-        status.innerHTML = `<span style="color:var(--danger)">&#10005;</span> ${e.message}`;
+        status.innerHTML = '<span style="color:var(--danger)">&#10005;</span> ';
+        status.append(e.message || 'Failed');
         retryBtn.classList.remove('hidden');
       }
     }

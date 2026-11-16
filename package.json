@@ -9,6 +9,6 @@
     "start": "npm --prefix d2l-mcp start",
     "mcp:launch": "npm --prefix d2l-mcp run mcp:launch",
     "status": "pm2 status",
-    "sync-sessions": "rsync -avz ~/.d2l-session/ ec2-user@3.93.185.101:~/.d2l-session/ && rsync -avz ~/.piazza-session/ ec2-user@3.93.185.101:~/.piazza-session/"
+    "sync-sessions": ": \"${EC2_HOST:?Set EC2_HOST=<ec2-hostname-or-ip> (optionally EC2_USER, default ec2-user)}\" && rsync -avz ~/.d2l-session/ \"${EC2_USER:-ec2-user}@$EC2_HOST:~/.d2l-session/\" && rsync -avz ~/.piazza-session/ \"${EC2_USER:-ec2-user}@$EC2_HOST:~/.piazza-session/\""
   }
 }

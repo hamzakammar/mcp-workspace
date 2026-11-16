@@ -16,11 +16,8 @@
  */
 
 import { supabase } from '../utils/supabase.js';
-import { loadStorageStateFromS3, saveStorageStateToS3 } from '../utils/s3Storage.js';
+import { loadStorageStateObjectFromS3, saveStorageStateToS3 } from '../utils/s3Storage.js';
 import { chromium } from 'playwright';
-import path from 'path';
-import os from 'os';
-import fs from 'fs/promises';
 
 const CROWDMARK_BASE = 'https://app.crowdmark.com';
 const CROWDMARK_SERVICE = 'crowdmark';
@@ -61,8 +58,9 @@ export async function saveCrowdmarkCookie(userId: string, cookie: string): Promi
  * Returns a fresh cookie string on success, null if re-auth needs user action.
  */
 export async function refreshCrowdmarkSession(userId: string): Promise<string | null> {
-  const storageStatePath = await loadStorageStateFromS3(userId, 'crowdmark');
-  if (!storageStatePath) {
+  // Parsed in memory — decrypted state is never written to a shared temp file.
+  const storageState = await loadStorageStateObjectFromS3(userId, 'crowdmark');
+  if (!storageState) {
     console.error(`[CROWDMARK] No S3 browser state for user ${userId} — user must reconnect via VNC`);
     return null;
   }
@@ -76,7 +74,7 @@ export async function refreshCrowdmarkSession(userId: string): Promise<string | 
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
     });
 
-    const context = await browser.newContext({ storageState: storageStatePath });
+    const context = await browser.newContext({ storageState });
     const page = await context.newPage();
 
     await page.goto(`${CROWDMARK_BASE}/`, { waitUntil: 'domcontentloaded', timeout: 20_000 });
@@ -114,10 +112,8 @@ export async function refreshCrowdmarkSession(userId: string): Promise<string | 
     }
 
     // Save updated S3 state + store cookies
-    const tmpStatePath = path.join(os.tmpdir(), `crowdmark-refresh-${userId}.json`);
-    await context.storageState({ path: tmpStatePath });
-    await saveStorageStateToS3(userId, tmpStatePath, undefined, 'crowdmark');
-    await fs.unlink(tmpStatePath).catch(() => {});
+    // Pass the state object directly — no plaintext temp file on disk.
+    await saveStorageStateToS3(userId, await context.storageState(), undefined, 'crowdmark');
 
     await saveCrowdmarkCookie(userId, cookieHeader);
     console.error(`[CROWDMARK] Headless refresh succeeded for user ${userId} (${cookies.length} cookies)`);

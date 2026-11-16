@@ -43,7 +43,8 @@ export const SyncTools = {
 
         let totalAssignments = 0;
         let totalAdded = 0;
-        const results: Array<{ course: string; assignments: number; added: number }> = [];
+        let totalUpdated = 0;
+        const results: Array<{ course: string; assignments: number; added: number; updated: number }> = [];
 
         // For each course, get assignments and add to database
         for (const course of courses) {
@@ -60,24 +61,54 @@ export const SyncTools = {
 
             // Add each assignment to database
             let addedCount = 0;
+            let updatedCount = 0;
             for (const assignment of assignments) {
               console.log(`[SYNC] Processing assignment: ${assignment.name}, dueDate: ${assignment.dueDate}`);
               
               if (assignment.dueDate) {
                 // Use assignment ID as source_ref (unique identifier from D2L)
                 const sourceRef = `${orgUnitId}-${assignment.id}`;
+                // Prefer the raw ISO timestamp; `dueDate` is a human-formatted display string.
+                const dueAt = assignment.dueDateIso ?? assignment.dueDate;
                 
                 // Check if already exists by user_id + source_ref
                 const { data: existing, error: selectError } = await supabase
                   .from('tasks')
-                  .select('id')
+                  .select('id, title, due_at')
                   .eq('user_id', userId)
                   .eq('source_ref', sourceRef)
                   .maybeSingle();
 
                 console.log(`[SYNC] Existing check - found: ${!!existing}, error: ${selectError?.message}`);
 
-                if (!existing && !selectError) {
+                if (existing && !selectError) {
+                  // Propagate D2L title / due-date changes. Never touch status
+                  // (the user may have completed the task).
+                  const changes: Record<string, string> = {};
+                  if (existing.title !== assignment.name) changes.title = assignment.name;
+                  const existingDue = existing.due_at ? Date.parse(existing.due_at) : NaN;
+                  const newDue = Date.parse(dueAt);
+                  if (existingDue !== newDue && !(Number.isNaN(existingDue) && Number.isNaN(newDue))) {
+                    changes.due_at = dueAt;
+                  }
+                  if (Object.keys(changes).length > 0) {
+                    const { data: updatedRows, error: updateError } = await supabase
+                      .from('tasks')
+                      .update(changes)
+                      .eq('user_id', userId)
+                      .eq('source_ref', sourceRef)
+                      .select('id');
+                    if (updateError) {
+                      console.error(`[SYNC] Update error:`, updateError);
+                    } else if (!updatedRows || updatedRows.length === 0) {
+                      console.log(`[SYNC] Update matched no rows for ${sourceRef}`);
+                    } else {
+                      console.log(`[SYNC] Updated task ${sourceRef}: ${Object.keys(changes).join(', ')}`);
+                      updatedCount++;
+                      totalUpdated++;
+                    }
+                  }
+                } else if (!existing && !selectError) {
                   console.log(`[SYNC] Inserting new task: ${assignment.name} (source_ref: ${sourceRef})`);
                   const courseId = String(orgUnitId);
 
@@ -90,7 +121,7 @@ export const SyncTools = {
                       course_id: courseId,
                       source: `d2l-${orgUnitId}`,
                       source_ref: sourceRef,
-                      due_at: assignment.dueDate,
+                      due_at: dueAt,
                       status: 'open',
                     })
                     .select();
@@ -112,6 +143,7 @@ export const SyncTools = {
               course: courseName,
               assignments: assignments.length,
               added: addedCount,
+              updated: updatedCount,
             });
           } catch (error) {
             console.error(`[SYNC] Error syncing course ${courseName}:`, error);
@@ -119,6 +151,7 @@ export const SyncTools = {
               course: courseName,
               assignments: 0,
               added: 0,
+              updated: 0,
             });
           }
         }
@@ -128,6 +161,7 @@ export const SyncTools = {
           totalCourses: courses.length,
           totalAssignments,
           totalAdded,
+          totalUpdated,
           results,
         }, null, 2);
       } catch (error) {

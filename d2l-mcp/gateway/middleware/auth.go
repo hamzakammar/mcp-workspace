@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,16 +23,15 @@ const UserIDKey contextKey = "user_id"
 
 // publicRoutes are paths that do NOT require JWT authentication.
 var publicRoutes = map[string]bool{
-	"/health":                true,
-	"/metrics":               true,
-	"/onboard":               true,
-	"/admin/stats":           true,
-	"/auth/signup":           true,
-	"/auth/signin":           true,
-	"/auth/refresh":          true,
-	"/auth/notion/callback":  true,
-	"/auth/forgot-password":  true,
-	"/auth/reset-password":   true,
+	"/health":               true,
+	"/onboard":              true,
+	"/admin/stats":          true,
+	"/auth/signup":          true,
+	"/auth/signin":          true,
+	"/auth/refresh":         true,
+	"/auth/notion/callback": true,
+	"/auth/forgot-password": true,
+	"/auth/reset-password":  true,
 }
 
 func isPublicRoute(path string) bool {
@@ -57,6 +58,26 @@ func isPublicRoute(path string) bool {
 		return true
 	}
 	return false
+}
+
+// metricsAuthorized reports whether r may read /metrics: only when METRICS_TOKEN
+// is configured and the request presents "Authorization: Bearer <METRICS_TOKEN>".
+func metricsAuthorized(r *http.Request) bool {
+	want := os.Getenv("METRICS_TOKEN")
+	if want == "" {
+		return false
+	}
+	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// isMCPPath reports whether path is the MCP endpoint ("/mcp" or under "/mcp/"),
+// the only resource OAuth access tokens are scoped to.
+func isMCPPath(path string) bool {
+	return path == "/mcp" || strings.HasPrefix(path, "/mcp/")
 }
 
 // getPublicBaseURL returns the externally-visible base URL of this deployment,
@@ -89,7 +110,10 @@ func unauthorized(w http.ResponseWriter, r *http.Request, wwwErr, body string) {
 // resolveOAuthToken hashes an OAuth access token (hzn_at_...) and resolves it to
 // a Horizon user_id via the oauth_access_tokens table, rejecting revoked or
 // expired tokens. Mirrors resolveAPIKey but with expiry/revocation checks.
-func resolveOAuthToken(accessToken string) (string, error) {
+// It is a package variable so tests can stub the Supabase lookup.
+var resolveOAuthToken = resolveOAuthTokenSupabase
+
+func resolveOAuthTokenSupabase(accessToken string) (string, error) {
 	hash := sha256.Sum256([]byte(accessToken))
 	tokenHash := hex.EncodeToString(hash[:])
 
@@ -167,11 +191,18 @@ type supabaseSession struct {
 // tokenCacheEntry holds the result of a successful refresh token exchange.
 // Caching prevents single-use consumption: the same refresh token can be
 // presented on multiple consecutive requests without hitting Supabase again.
+//
+// Entries live until the original session expiry, but are revalidated every
+// tokenRevalidateInterval by exchanging the entry's LATEST refresh token, so a
+// revoked/logged-out session stops working within that window. mu guards the
+// mutable fields and serialises revalidation (refresh tokens are single-use).
 type tokenCacheEntry struct {
+	mu              sync.Mutex
 	accessToken     string
 	newRefreshToken string
 	userID          string
-	expiresAt       time.Time
+	expiresAt       time.Time // immutable after creation
+	validatedAt     time.Time
 }
 
 var (
@@ -195,6 +226,17 @@ func init() {
 	}()
 }
 
+// tokenRevalidateInterval is how long a cached refresh-token exchange is
+// trusted before it is revalidated against Supabase.
+const tokenRevalidateInterval = 5 * time.Minute
+
+// exchangeRefreshTokenFn is a package variable so tests can stub Supabase.
+var exchangeRefreshTokenFn = exchangeRefreshToken
+
+// errRefreshRejected marks a refresh exchange that Supabase explicitly
+// rejected (4xx), as opposed to a transient/network failure.
+var errRefreshRejected = errors.New("refresh token rejected")
+
 func cacheTokenExchange(oldRefresh string, session *supabaseSession) {
 	var expiresAt time.Time
 	if session.ExpiresAt > 0 {
@@ -208,6 +250,7 @@ func cacheTokenExchange(oldRefresh string, session *supabaseSession) {
 		newRefreshToken: session.RefreshToken,
 		userID:          session.User.ID,
 		expiresAt:       expiresAt,
+		validatedAt:     time.Now(),
 	}
 	tokenCacheMu.Lock()
 	defer tokenCacheMu.Unlock()
@@ -228,7 +271,64 @@ func lookupTokenCache(token string) *tokenCacheEntry {
 	return entry
 }
 
-func getSupabaseURL() string  { return os.Getenv("SUPABASE_URL") }
+// dropTokenCacheEntry removes every key that points at e.
+func dropTokenCacheEntry(e *tokenCacheEntry) {
+	tokenCacheMu.Lock()
+	defer tokenCacheMu.Unlock()
+	for k, v := range tokenCache {
+		if v == e {
+			delete(tokenCache, k)
+		}
+	}
+}
+
+// cachedSession is a consistent snapshot of a tokenCacheEntry.
+type cachedSession struct {
+	accessToken     string
+	newRefreshToken string
+	userID          string
+}
+
+// revalidateTokenCacheEntry returns a snapshot of e, first re-exchanging its
+// latest refresh token if it was last validated more than
+// tokenRevalidateInterval ago. The new session is stored under the new refresh
+// token as well (the old keys keep pointing at the same entry). If Supabase
+// rejects the exchange (revoked/logged out) the entry is dropped and
+// errRefreshRejected is returned; other errors leave the entry in place so a
+// later request can retry.
+func revalidateTokenCacheEntry(e *tokenCacheEntry) (cachedSession, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if time.Since(e.validatedAt) < tokenRevalidateInterval {
+		return cachedSession{e.accessToken, e.newRefreshToken, e.userID}, nil
+	}
+	if e.newRefreshToken == "" {
+		dropTokenCacheEntry(e)
+		return cachedSession{}, errRefreshRejected
+	}
+	session, err := exchangeRefreshTokenFn(e.newRefreshToken)
+	if err != nil {
+		if errors.Is(err, errRefreshRejected) {
+			dropTokenCacheEntry(e)
+		}
+		return cachedSession{}, err
+	}
+	if session.User.ID != e.userID {
+		dropTokenCacheEntry(e)
+		return cachedSession{}, errRefreshRejected
+	}
+	e.accessToken = session.AccessToken
+	if session.RefreshToken != "" {
+		e.newRefreshToken = session.RefreshToken
+		tokenCacheMu.Lock()
+		tokenCache[session.RefreshToken] = e
+		tokenCacheMu.Unlock()
+	}
+	e.validatedAt = time.Now()
+	return cachedSession{e.accessToken, e.newRefreshToken, e.userID}, nil
+}
+
+func getSupabaseURL() string { return os.Getenv("SUPABASE_URL") }
 func getAnonKey() string {
 	k := os.Getenv("SUPABASE_ANON_KEY")
 	if k == "" {
@@ -287,6 +387,9 @@ func exchangeRefreshToken(refreshToken string) (*supabaseSession, error) {
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 {
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			return nil, fmt.Errorf("%w (status %d): %s", errRefreshRejected, resp.StatusCode, string(respBody))
+		}
 		return nil, fmt.Errorf("refresh failed (status %d): %s", resp.StatusCode, string(respBody))
 	}
 
@@ -357,6 +460,18 @@ func Auth(_ string) func(http.Handler) http.Handler {
 			// The landing page is public, but only for GET/HEAD: an MCP client pointed at
 			// the bare origin must still get the 401 + WWW-Authenticate discovery hint.
 			isLanding := r.URL.Path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead)
+
+			// /metrics is not public: it requires METRICS_TOKEN as a bearer token.
+			// Respond 404 otherwise so the endpoint is not advertised.
+			if r.URL.Path == "/metrics" {
+				if !metricsAuthorized(r) {
+					http.NotFound(w, r)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			if isLanding || isPublicRoute(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
@@ -388,6 +503,12 @@ func Auth(_ string) func(http.Handler) http.Handler {
 				oauthTok = apiKey
 			}
 			if oauthTok != "" {
+				// OAuth access tokens are scoped to the MCP resource only.
+				if !isMCPPath(r.URL.Path) {
+					w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope"`)
+					http.Error(w, `{"error":"insufficient_scope"}`, http.StatusForbidden)
+					return
+				}
 				uid, oauthErr := resolveOAuthToken(oauthTok)
 				if oauthErr != nil {
 					fmt.Printf("[AUTH] OAuth token validation failed: %v\n", oauthErr)
@@ -432,7 +553,17 @@ func Auth(_ string) func(http.Handler) http.Handler {
 				// twice invalidates it after the first call. We cache the exchange result
 				// so subsequent requests with the same refresh token reuse the cached
 				// access token instead of calling Supabase again.
-				if cached := lookupTokenCache(tokenStr); cached != nil {
+				if entry := lookupTokenCache(tokenStr); entry != nil {
+					cached, revalErr := revalidateTokenCacheEntry(entry)
+					if revalErr != nil {
+						fmt.Printf("[AUTH] Cached refresh token revalidation failed: %v\n", revalErr)
+						if errors.Is(revalErr, errRefreshRejected) {
+							unauthorized(w, r, "invalid_token", `{"error":"invalid or expired token"}`)
+						} else {
+							http.Error(w, `{"error":"auth upstream unavailable"}`, http.StatusServiceUnavailable)
+						}
+						return
+					}
 					fmt.Printf("[AUTH] Refresh token cache hit, userId=%s\n", cached.userID)
 					r.Header.Set("Authorization", "Bearer "+cached.accessToken)
 					// Advertise the rotated refresh token so clients can update their store.
@@ -446,7 +577,7 @@ func Auth(_ string) func(http.Handler) http.Handler {
 
 				// Cache miss — exchange the refresh token (this consumes it at Supabase).
 				fmt.Printf("[AUTH] Refresh token detected, exchanging for access token\n")
-				session, refreshErr := exchangeRefreshToken(tokenStr)
+				session, refreshErr := exchangeRefreshTokenFn(tokenStr)
 				if refreshErr != nil {
 					fmt.Printf("[AUTH] Refresh token exchange failed: %v\n", refreshErr)
 					unauthorized(w, r, "invalid_token", `{"error":"invalid or expired token"}`)

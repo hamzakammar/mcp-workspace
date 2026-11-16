@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { client } from '../client.js';
 import { getUserId } from '../utils/userContext.js';
 import { loadUpcomingConnectorTasks } from '../study/src/courseWebsite/store.js';
+import { isCourseOfferingEnrollment, isEntityDropboxSubmitted, loadQuizAttemptSummary } from '../utils/marshal.js';
 
 // Short course code ("CS 241 …" / "CS241_1269" → "CS241") for matching a live-D2L
 // course to a website task's normalized course_id.
@@ -84,18 +85,57 @@ export function connectorTasksToRecommendations(
   return out;
 }
 
-// True when a D2L dropbox `mysubmissions` response shows at least one submission.
+// True when a D2L dropbox `mysubmissions` response (an array of EntityDropbox)
+// shows real submitted work: an entry with Submissions[] or Status Submitted(1)
+// / Published(3). An Unsubmitted/Draft entity with no files is NOT a submission.
 export function hasDropboxSubmission(raw: unknown): boolean {
-  if (Array.isArray(raw)) return raw.length > 0;
+  if (Array.isArray(raw)) return raw.some(isEntityDropboxSubmitted);
   if (!raw || typeof raw !== 'object') return false;
-  const r = raw as { HasSubmission?: boolean; Submissions?: unknown[] };
-  return !!(r.HasSubmission || (Array.isArray(r.Submissions) && r.Submissions.length > 0));
+  if ((raw as { HasSubmission?: boolean }).HasSubmission === true) return true;
+  return isEntityDropboxSubmitted(raw);
+}
+
+/**
+ * Walk `recs` (already sorted best-first) and return up to `limit` items whose
+ * submission check doesn't say "already submitted". Checks run before the top-N
+ * cut, so submitted work can't crowd out real to-dos, but at most `maxChecks`
+ * checks are made (default 3×limit) to bound mysubmissions calls; items past
+ * that budget are kept unchecked. Items without a check (non-assignments) pass
+ * through; a failed check keeps the item.
+ */
+export async function filterOutSubmitted<T>(
+  recs: T[],
+  check: (r: T) => Promise<boolean> | null,
+  opts: { limit?: number; maxChecks?: number; concurrency?: number } = {},
+): Promise<T[]> {
+  const limit = opts.limit ?? Infinity;
+  const maxChecks = opts.maxChecks ?? (Number.isFinite(limit) ? limit * 3 : Infinity);
+  const concurrency = opts.concurrency ?? 8;
+  const out: T[] = [];
+  let checksUsed = 0;
+  for (let i = 0; i < recs.length && out.length < limit; i += concurrency) {
+    const batch = recs.slice(i, i + concurrency);
+    const results = await Promise.allSettled(
+      batch.map((r) => {
+        if (checksUsed >= maxChecks) return Promise.resolve(false);
+        const p = check(r);
+        if (!p) return Promise.resolve(false);
+        checksUsed++;
+        return p;
+      }),
+    );
+    results.forEach((res, j) => {
+      const submitted = res.status === 'fulfilled' && res.value;
+      if (!submitted && out.length < limit) out.push(batch[j]);
+    });
+  }
+  return out;
 }
 
 // ---- Raw D2L types ----
 
 interface RawEnrollment {
-  OrgUnit: { Id: number; Name: string; Code: string; Type: { Code: string } };
+  OrgUnit: { Id: number; Name: string; Code: string; Type: { Id?: number; Code: string } };
   Access: { IsActive: boolean; CanAccess: boolean; StartDate: string | null; EndDate: string | null };
 }
 
@@ -114,10 +154,6 @@ interface RawQuiz {
     IsUnlimited: boolean;
     NumberOfAttemptsAllowed: number | null;
   } | null;
-}
-
-interface RawAttempt {
-  IsCompleted: boolean;
 }
 
 export interface RawGradeObject {
@@ -259,28 +295,23 @@ async function getCourseRecommendations(
     await Promise.all(quizzes.map(async (quiz) => {
       if (!quiz.DueDate) return;
       const dueMs = new Date(quiz.DueDate).getTime();
-      if (dueMs > cutoff || dueMs < pastCutoff) return;
+      // Past-due quizzes are closed — not actionable, so never ranked.
+      if (dueMs > cutoff || dueMs <= now) return;
 
-      let attemptsUsed = 0;
       let attemptsAllowed: number | null = null;
-      try {
-        const attemptsRaw = (await client.getQuizAttempts(orgUnitId, quiz.QuizId)) as
-          | { Objects: RawAttempt[] } | RawAttempt[];
-        const attempts: RawAttempt[] = Array.isArray(attemptsRaw)
-          ? attemptsRaw
-          : (attemptsRaw as { Objects: RawAttempt[] }).Objects || [];
-        attemptsUsed = attempts.filter((a) => a.IsCompleted).length;
-      } catch {
-        attemptsUsed = 0;
-      }
+      const { completed: attemptsUsed, unknown: attemptsUnknown } = await loadQuizAttemptSummary(
+        () => client.getQuizAttempts(orgUnitId, quiz.QuizId),
+      );
 
       if (!quiz.AttemptsAllowed?.IsUnlimited) {
         attemptsAllowed = quiz.AttemptsAllowed?.NumberOfAttemptsAllowed ?? null;
       }
-      if (attemptsAllowed !== null && attemptsUsed >= attemptsAllowed) return;
+      if (!attemptsUnknown && attemptsAllowed !== null && attemptsUsed >= attemptsAllowed) return;
 
-      const notStarted = attemptsUsed === 0;
-      const attemptsDesc = attemptsAllowed !== null
+      const notStarted = !attemptsUnknown && attemptsUsed === 0;
+      const attemptsDesc = attemptsUnknown
+        ? 'attempt status unknown'
+        : attemptsAllowed !== null
         ? `${attemptsUsed} of ${attemptsAllowed} attempts used`
         : `${attemptsUsed} attempt${attemptsUsed !== 1 ? 's' : ''} used (unlimited)`;
 
@@ -321,7 +352,7 @@ export const priorityGlobalTools = {
       const eightMonthsAgo = new Date(now.getTime() - 8 * 30 * 24 * 60 * 60 * 1000);
 
       const activeCourses = (enrollmentsRaw.Items || []).filter((e) => {
-        if (e.OrgUnit?.Type?.Code !== 'Course Offering') return false;
+        if (!isCourseOfferingEnrollment(e)) return false;
         if (!e.Access?.IsActive || !e.Access?.CanAccess) return false;
         // Keep courses that started within the last 8 months or haven't ended yet
         const startDate = e.Access.StartDate ? new Date(e.Access.StartDate) : null;
@@ -396,33 +427,17 @@ export const priorityGlobalTools = {
         // website tasks unavailable — fall back to D2L-only recommendations
       }
 
+      // Rank, then drop already-submitted assignments BEFORE taking the top 10
+      // (bounded to 3×10 submission checks).
       all.sort((a, b) => b.urgencyScore - a.urgencyScore);
-      const candidates = all.slice(0, 20); // check submissions for top 20 candidates
-
-      // Filter out already-submitted assignments (only check assignments in top candidates)
-      const submissionChecks = await Promise.allSettled(
-        candidates
-          .filter((r) => r.type === 'assignment' && r._orgUnitId != null && r._folderId != null)
-          .map(async (r) => {
-            try {
-              const raw = await client.getMySubmissions(r._orgUnitId!, r._folderId!);
-              const hasSubmission = hasDropboxSubmission(raw);
-              return { name: r.name, courseName: r.courseName, submitted: hasSubmission };
-            } catch {
-              return { name: r.name, courseName: r.courseName, submitted: false };
-            }
-          })
+      const unsubmitted = await filterOutSubmitted(all, (r) =>
+        r.type === 'assignment' && r._orgUnitId != null && r._folderId != null
+          ? client.getMySubmissions(r._orgUnitId, r._folderId).then(hasDropboxSubmission)
+          : null,
+        { limit: 10 },
       );
-      const submittedKeys = new Set<string>();
-      for (const result of submissionChecks) {
-        if (result.status === 'fulfilled' && result.value.submitted) {
-          submittedKeys.add(`${result.value.courseName}::${result.value.name}`);
-        }
-      }
 
-      const top = candidates
-        .filter((r) => !submittedKeys.has(`${r.courseName}::${r.name}`))
-        .slice(0, 10)
+      const top = unsubmitted
         .map(({ _orgUnitId: _o, _folderId: _f, ...rec }) => rec); // strip internal fields
 
       let summary: string;

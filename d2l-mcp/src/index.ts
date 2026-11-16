@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import "dotenv/config";
-import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import express from "express";
@@ -49,6 +48,22 @@ import publicAuthRoutes from "./api/publicAuthRoutes.js";
 import oauthRoutes from "./api/oauth/index.js";
 import { BrowserSessionManager } from "./browser/BrowserSessionManager.js";
 import { fileURLToPath } from "url";
+import {
+  BoundedTtlCache,
+  SerializedFileWriter,
+  generateSessionId,
+  resolveSessionOwnership,
+  resolveSessionSecret,
+  dedupeInFlight,
+  parseContentRangeTotal,
+  parsePersistedSessions,
+  pickEvictions,
+  pruneSessions,
+  serializeSessions,
+  sortByDueAt,
+  truncateForToolResult,
+  type SessionMap,
+} from "./utils/mcpSessions.js";
 
 /**
  * Redact credential-bearing headers before logging. Prevents access tokens,
@@ -67,11 +82,8 @@ function redactHeaders(headers: Record<string, unknown>): Record<string, unknown
 
 // ---- Urgency surfacing cache (Task 6) ----
 // Caches upcoming-deadline check results per user+course for 15 minutes.
-const urgencyCache: Record<
-  string,
-  { items: UrgentReminder[]; cachedAt: number }
-> = {};
 const URGENCY_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
+const urgencyCache = new BoundedTtlCache<UrgentReminder[]>(URGENCY_CACHE_TTL, 5000);
 
 interface UrgentReminder {
   title: string;
@@ -93,9 +105,9 @@ async function getUrgentReminders(
   orgUnitId: number
 ): Promise<UrgentReminder[]> {
   const cacheKey = `${userId}:${orgUnitId}`;
-  const cached = urgencyCache[cacheKey];
-  if (cached && Date.now() - cached.cachedAt < URGENCY_CACHE_TTL) {
-    return cached.items;
+  const cached = urgencyCache.get(cacheKey);
+  if (cached) {
+    return cached;
   }
   try {
     const now = new Date();
@@ -115,7 +127,7 @@ async function getUrgentReminders(
         : 'event';
       return { title: e.Title, dueIn: formatDueIn(e.EndDateTime), type };
     });
-    urgencyCache[cacheKey] = { items, cachedAt: Date.now() };
+    urgencyCache.set(cacheKey, items);
     return items;
   } catch {
     return [];
@@ -128,15 +140,17 @@ interface GlobalDeadline {
   course: string;
   dueIn: string;
   dueDate: string;
+  /** Raw ISO due timestamp (used for sorting). */
+  dueAt: string;
 }
 
-const globalDeadlineCache: Record<string, { items: GlobalDeadline[]; cachedAt: number }> = {};
 const GLOBAL_DEADLINE_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+const globalDeadlineCache = new BoundedTtlCache<GlobalDeadline[]>(GLOBAL_DEADLINE_CACHE_TTL, 2000);
 
 async function getGlobalDeadlines(userId: string): Promise<GlobalDeadline[]> {
-  const cached = globalDeadlineCache[userId];
-  if (cached && Date.now() - cached.cachedAt < GLOBAL_DEADLINE_CACHE_TTL) {
-    return cached.items;
+  const cached = globalDeadlineCache.get(userId);
+  if (cached) {
+    return cached;
   }
 
   try {
@@ -173,19 +187,16 @@ async function getGlobalDeadlines(userId: string): Promise<GlobalDeadline[]> {
               timeZone: 'America/Toronto',
               month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
             }),
+            dueAt: e.EndDateTime,
           });
         }
       } catch { /* skip courses that fail */ }
     }));
 
-    // Sort by urgency
-    items.sort((a, b) => {
-      const aMs = a.dueIn === 'overdue' ? -1 : parseInt(a.dueIn);
-      const bMs = b.dueIn === 'overdue' ? -1 : parseInt(b.dueIn);
-      return aMs - bMs;
-    });
+    // Sort by urgency (raw timestamp — "5h"/"2d" strings don't compare numerically)
+    sortByDueAt(items);
 
-    globalDeadlineCache[userId] = { items, cachedAt: Date.now() };
+    globalDeadlineCache.set(userId, items);
     return items;
   } catch {
     return [];
@@ -500,7 +511,7 @@ function createServer(): McpServer {
       let text = `Downloaded: ${result.filename}\nPath: ${result.path}\nSize: ${sizeKB} KB\nType: ${result.contentType}`;
 
       if (result.content) {
-        text += `\n\n--- File Content ---\n${result.content}`;
+        text += `\n\n--- File Content ---\n${truncateForToolResult(result.content)}`;
       }
 
       return text;
@@ -523,7 +534,7 @@ function createServer(): McpServer {
       let text = `File: ${result.filename}\nPath: ${result.path}\nSize: ${sizeKB} KB\nType: ${result.contentType}`;
 
       if (result.content) {
-        text += `\n\n--- File Content ---\n${result.content}`;
+        text += `\n\n--- File Content ---\n${truncateForToolResult(result.content)}`;
       } else {
         text += `\n\nNote: Could not extract text content from this file type. The file may be binary or unsupported.`;
       }
@@ -895,9 +906,11 @@ function createServer(): McpServer {
       const summary = [
         `Supabase credentials: ${result.deleted.supabaseCredentials ? "✓ deleted" : "✗ failed"}`,
         `Supabase API key:     ${result.deleted.supabaseApiKey ? "✓ deleted" : "✗ failed"}`,
+        `OAuth tokens:         ${result.deleted.oauthTokens ? "✓ deleted" : "✗ failed"}`,
         `S3 browser state:     ${result.deleted.s3State ? "✓ deleted" : "✗ failed"}`,
         `D2L disk session:     ${result.deleted.diskD2lSession ? "✓ deleted" : "✗ failed"}`,
         `Piazza disk session:  ${result.deleted.diskPiazzaSession ? "✓ deleted" : "✗ failed"}`,
+        `Temporary files:      ${result.deleted.tmpFiles ? "✓ deleted" : "✗ failed"}`,
       ].join("\n");
 
       const errorsSection = result.errors.length > 0
@@ -987,10 +1000,17 @@ async function main() {
       try {
         import("crypto").then(({ createHash }) => {
           const raw = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "";
-          const ip_hash = createHash("sha256").update(raw.split(",")[0].trim()).digest("hex").slice(0, 16);
+          // Right-most X-Forwarded-For entry is the one appended by our own proxy
+          // (left-most is client-controlled); matches the gateway's choice.
+          const parts = raw.split(",").map((p) => p.trim()).filter(Boolean);
+          const clientIp = parts.length > 0 ? parts[parts.length - 1] : "";
+          const ip_hash = createHash("sha256").update(clientIp).digest("hex").slice(0, 16);
           const sbUrl = process.env.SUPABASE_URL;
-          const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
-          if (sbUrl && sbKey) {
+          // page_views has RLS with anon/authenticated revoked: service role only.
+          const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+          if (!sbKey) {
+            console.error("[ONBOARD] SUPABASE_SERVICE_ROLE_KEY not set; skipping page view record");
+          } else if (sbUrl) {
             fetch(`${sbUrl}/rest/v1/page_views`, {
               method: "POST",
               headers: { "apikey": sbKey, "Authorization": `Bearer ${sbKey}`, "Content-Type": "application/json", "Prefer": "return=minimal" },
@@ -1004,28 +1024,53 @@ async function main() {
     // Page view stats (no auth — internal use)
     app.get("/admin/stats", async (_req, res) => {
       const sbUrl = process.env.SUPABASE_URL;
-      const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
-      if (!sbUrl || !sbKey) return res.status(500).json({ error: "No Supabase config" });
+      // page_views has RLS with anon/authenticated revoked: service role only.
+      const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+      if (!sbUrl) return res.status(500).json({ error: "No Supabase config" });
+      if (!sbKey) {
+        console.error("[ADMIN] /admin/stats unavailable: SUPABASE_SERVICE_ROLE_KEY not set");
+        return res.status(503).json({ error: "Stats unavailable" });
+      }
       const headers = { "apikey": sbKey, "Authorization": `Bearer ${sbKey}` };
 
-      const [todayResp, weekResp, totalResp, uniqueResp] = await Promise.all([
-        fetch(`${sbUrl}/rest/v1/page_views?path=eq./onboard&created_at=gte.${new Date(new Date().setHours(0,0,0,0)).toISOString()}&select=id`, { headers }),
-        fetch(`${sbUrl}/rest/v1/page_views?path=eq./onboard&created_at=gte.${new Date(Date.now()-7*86400000).toISOString()}&select=id`, { headers }),
-        fetch(`${sbUrl}/rest/v1/page_views?path=eq./onboard&select=id`, { headers }),
-        fetch(`${sbUrl}/rest/v1/page_views?path=eq./onboard&select=ip_hash`, { headers }),
-      ]);
+      try {
+        // Exact counts via PostgREST Content-Range instead of `.length` of a
+        // (server-capped) row list.
+        const countFor = async (filter: string): Promise<number> => {
+          const r = await fetch(`${sbUrl}/rest/v1/page_views?path=eq./onboard${filter}&select=id`, {
+            method: "HEAD",
+            headers: { ...headers, "Prefer": "count=exact" },
+          });
+          const total = parseContentRangeTotal(r.headers.get("content-range"));
+          if (!r.ok || total === null) throw new Error(`page_views count failed (HTTP ${r.status})`);
+          return total;
+        };
 
-      const [today, week, total, unique] = await Promise.all([todayResp.json(), weekResp.json(), totalResp.json(), uniqueResp.json()]) as [any[], any[], any[], any[]];
-      const uniqueVisitors = new Set(unique.map((r: any) => r.ip_hash)).size;
+        const [today, last7days, allTime, uniqueResp] = await Promise.all([
+          countFor(`&created_at=gte.${new Date(new Date().setHours(0,0,0,0)).toISOString()}`),
+          countFor(`&created_at=gte.${new Date(Date.now()-7*86400000).toISOString()}`),
+          countFor(""),
+          // NOTE: no distinct-count RPC exists, so unique visitors are computed
+          // client-side from the returned rows. PostgREST caps responses
+          // (max-rows, default 1000), so this undercounts beyond that limit.
+          fetch(`${sbUrl}/rest/v1/page_views?path=eq./onboard&select=ip_hash`, { headers }),
+        ]);
+        if (!uniqueResp.ok) throw new Error(`page_views ip_hash fetch failed (HTTP ${uniqueResp.status})`);
+        const unique = (await uniqueResp.json()) as Array<{ ip_hash?: string }>;
+        const uniqueVisitors = new Set(unique.map((r) => r.ip_hash)).size;
 
-      res.json({
-        onboard: {
-          today: today.length,
-          last7days: week.length,
-          allTime: total.length,
-          uniqueVisitors,
-        }
-      });
+        res.json({
+          onboard: {
+            today,
+            last7days,
+            allTime,
+            uniqueVisitors,
+          }
+        });
+      } catch (error) {
+        console.error("[ADMIN] /admin/stats failed:", error);
+        if (!res.headersSent) res.status(500).json({ error: "Failed to load stats" });
+      }
     });
 
     // OAuth 2.1 authorization server (discovery, DCR, authorize, token, revoke).
@@ -1048,50 +1093,174 @@ async function main() {
 
     // Clients rarely send DELETE, so transports (each with a full McpServer) were
     // never released — hundreds accumulated per week. Evict idle ones; a client
-    // that comes back is transparently restored by the "silently restoring" path.
+    // that comes back is transparently restored by the "silently restoring" path
+    // (only for the user the session was issued to).
     const transportLastSeen = new Map<string, number>();
     const TRANSPORT_IDLE_MS = 2 * 60 * 60 * 1000;
-    setInterval(() => {
-      const cutoff = Date.now() - TRANSPORT_IDLE_MS;
-      for (const [sid, transport] of Object.entries(transports)) {
-        if ((transportLastSeen.get(sid) ?? 0) >= cutoff) continue;
-        delete transports[sid];
-        transportLastSeen.delete(sid);
-        transport.close().catch(() => {});
-      }
-      for (const sid of transportLastSeen.keys()) if (!transports[sid]) transportLastSeen.delete(sid);
-      console.error(`[MCP] Idle sweep — ${Object.keys(transports).length} live transport(s)`);
-    }, 10 * 60 * 1000).unref();
-    
-    // Session persistence
+    // Persisted session ids not used for this long are forgotten; the client
+    // then gets a 404 and re-initializes.
+    const SESSION_PERSIST_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+    // Upper bound on live transports (each a full McpServer) per user.
+    const MAX_TRANSPORTS_PER_USER = 20;
+
+    // Session persistence: sessionId -> owning userId
     const SESSION_FILE = path.join(process.cwd(), '.mcp-sessions.json');
-    const validSessionIds = new Set<string>();
-    
+    const sessionOwners: SessionMap = new Map();
+    const sessionWriter = new SerializedFileWriter(SESSION_FILE);
+    // Concurrent requests restoring the same session share one transport.
+    const restoresInFlight = new Map<string, Promise<StreamableHTTPServerTransport>>();
+    // New session ids are HMAC-bound to the user so ownership survives deploys
+    // (ECS tasks have no persistent disk); the file is a secondary store.
+    const sessionSecret = resolveSessionSecret();
+    if (!sessionSecret) {
+      console.error('[SESSION] No MCP_SESSION_SECRET/OAUTH_SESSION_SECRET/STUDY_MCP_TOKEN — session ids are unsigned; ownership relies on the session file');
+    }
+    // In-flight requests / open SSE streams per session (protects them from cap eviction).
+    const activeRequests = new Map<string, number>();
+    function trackActive(sid: string, res: express.Response) {
+      activeRequests.set(sid, (activeRequests.get(sid) ?? 0) + 1);
+      res.once("close", () => {
+        const n = (activeRequests.get(sid) ?? 1) - 1;
+        if (n <= 0) activeRequests.delete(sid);
+        else activeRequests.set(sid, n);
+      });
+    }
+
+    // Is this session id usable by this user? Persists any ownership change.
+    function checkSessionOwnership(sid: string, userId: string): boolean {
+      const r = resolveSessionOwnership(sessionOwners, sid, userId, sessionSecret);
+      if (r.changed) void saveSessions();
+      return r.ok;
+    }
+
+    // Live transport for an owned session, restoring it if needed (deduped).
+    async function getOrRestoreTransport(sid: string, userId: string): Promise<StreamableHTTPServerTransport> {
+      if (transports[sid]) return transports[sid];
+      return dedupeInFlight(restoresInFlight, sid, () => restoreTransport(sid, userId));
+    }
+
+    // Save sessions to disk (writes are serialized and atomic: temp + rename)
+    function saveSessions(): Promise<void> {
+      return sessionWriter.write(serializeSessions(sessionOwners));
+    }
+
     // Load persisted sessions on startup
     async function loadSessions() {
       try {
         const data = await fs.readFile(SESSION_FILE, 'utf-8');
-        const sessions = JSON.parse(data);
-        sessions.forEach((id: string) => validSessionIds.add(id));
-        console.error(`[SESSION] Loaded ${validSessionIds.size} persisted session(s)`);
+        const { sessions, migratedLegacy } = parsePersistedSessions(JSON.parse(data));
+        for (const [sid, s] of sessions) sessionOwners.set(sid, s);
+        console.error(`[SESSION] Loaded ${sessionOwners.size} persisted session(s)`);
+        if (migratedLegacy > 0) {
+          console.error(`[SESSION] Migrated ${migratedLegacy} legacy session id(s); each is bound to the first user that presents it`);
+          void saveSessions();
+        }
       } catch {
         console.error('[SESSION] No existing sessions file found, starting fresh');
       }
     }
-    
-    // Save sessions to disk
-    async function saveSessions() {
-      try {
-        const sessions = Array.from(validSessionIds);
-        await fs.writeFile(SESSION_FILE, JSON.stringify(sessions, null, 2));
-        console.error(`[SESSION] Saved ${sessions.length} session(s) to disk`);
-      } catch (error) {
-        console.error('[SESSION] Failed to save sessions:', error);
+
+    function touchSession(sid: string) {
+      const now = Date.now();
+      transportLastSeen.set(sid, now);
+      const owner = sessionOwners.get(sid);
+      if (owner) owner.lastSeen = now;
+    }
+
+    // Release a live transport but keep its persisted owner so it can be restored.
+    function closeTransport(sid: string) {
+      const transport = transports[sid];
+      delete transports[sid];
+      transportLastSeen.delete(sid);
+      transport?.close().catch(() => {});
+    }
+
+    // Make room for one more transport for this user (evict oldest idle).
+    function enforceUserTransportCap(userId: string) {
+      const live = Object.keys(transports).filter((sid) => sessionOwners.get(sid)?.userId === userId);
+      const evict = pickEvictions(
+        live,
+        (sid) => transportLastSeen.get(sid) ?? 0,
+        MAX_TRANSPORTS_PER_USER,
+        (sid) => (activeRequests.get(sid) ?? 0) > 0
+      );
+      for (const sid of evict) {
+        console.error(`[MCP] User transport cap reached — evicting idle session ${sid}`);
+        closeTransport(sid);
       }
     }
-    
+
+    function sendSessionNotFound(res: express.Response) {
+      // Per the MCP spec, 404 tells the client to start a new session.
+      res.status(404).json({
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Session not found" },
+        id: null,
+      });
+    }
+
+    setInterval(() => {
+      const now = Date.now();
+      const cutoff = now - TRANSPORT_IDLE_MS;
+      for (const sid of Object.keys(transports)) {
+        if ((transportLastSeen.get(sid) ?? 0) >= cutoff) continue;
+        closeTransport(sid);
+      }
+      for (const sid of transportLastSeen.keys()) if (!transports[sid]) transportLastSeen.delete(sid);
+      const pruned = pruneSessions(sessionOwners, now, SESSION_PERSIST_TTL_MS, (sid) => !!transports[sid]);
+      // Always save: persists updated lastSeen values as well as pruning.
+      void saveSessions();
+      console.error(`[MCP] Idle sweep — ${Object.keys(transports).length} live transport(s), ${sessionOwners.size} persisted session(s), pruned ${pruned}`);
+    }, 10 * 60 * 1000).unref();
+
     // Load sessions on startup
     await loadSessions();
+
+    // Recreate a transport for a persisted session (server restart / idle eviction).
+    async function restoreTransport(
+      sessionId: string,
+      userId: string
+    ): Promise<StreamableHTTPServerTransport> {
+      console.error(`[MCP] Silently restoring session ${sessionId}`);
+      enforceUserTransportCap(userId);
+
+      const initStartTime = Date.now();
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => sessionId, // Reuse the persisted session ID
+        onsessioninitialized: (sid: string) => {
+          const initTime = Date.now() - initStartTime;
+          console.error(`[MCP] Session silently restored: ${sid} (${initTime}ms)`);
+        },
+        onsessionclosed: (sid: string) => {
+          console.error(`[MCP] Session closed: ${sid}`);
+          delete transports[sid];
+          transportLastSeen.delete(sid);
+          sessionOwners.delete(sid);
+          void saveSessions();
+        },
+      });
+
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid && transports[sid] === transport) {
+          console.error(`[MCP] Transport closed for session ${sid}`);
+          delete transports[sid];
+        }
+      };
+
+      // Connect server to transport
+      const server = createServer();
+      await server.connect(transport);
+
+      // IMPORTANT: Manually set the sessionId and mark as initialized
+      // This bypasses the normal initialize handshake
+      (transport as any).sessionId = sessionId;
+      (transport as any)._initialized = true;
+
+      transports[sessionId] = transport;
+      transportLastSeen.set(sessionId, Date.now());
+      return transport;
+    }
 
     // MCP POST endpoint
     const mcpPostHandler = async (
@@ -1135,68 +1304,27 @@ async function main() {
 
       try {
         let transport: StreamableHTTPServerTransport;
-        if (sessionId) transportLastSeen.set(sessionId, Date.now());
 
-        if (sessionId && transports[sessionId]) {
-          // Reuse existing transport
-          console.error(
-            `[MCP] Reusing existing transport for session: ${sessionId}`
-          );
-          transport = transports[sessionId];
-        } else if (sessionId) {
-          // Session ID provided but no transport in memory (server restarted or new container)
-          // Silently restore the session regardless of whether we've seen it before
-          console.error(
-            `[MCP] Silently restoring session ${sessionId} after server restart`
-          );
-          
-          const initStartTime = Date.now();
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => sessionId, // Reuse the persisted session ID
-            onsessioninitialized: (sid: string) => {
-              const initTime = Date.now() - initStartTime;
-              console.error(`[MCP] Session silently restored: ${sid} (${initTime}ms)`);
-              // Don't wait - already setting transports[sid] below
-            },
-            onsessionclosed: (sid: string) => {
-              console.error(`[MCP] Session closed: ${sid}`);
-              delete transports[sid];
-              validSessionIds.delete(sid);
-              void saveSessions();
-            },
-          });
-          
-          transport.onclose = () => {
-            const sid = transport.sessionId;
-            if (sid && transports[sid]) {
-              console.error(`[MCP] Transport closed for session ${sid}`);
-              delete transports[sid];
-            }
-          };
-
-          // Connect server to transport
-          const server = createServer();
-          await server.connect(transport);
-          
-          // IMPORTANT: Manually set the sessionId and mark as initialized
-          // This bypasses the normal initialize handshake
-          (transport as any).sessionId = sessionId;
-          (transport as any)._initialized = true;
-          
-          // Store transport immediately
-          transports[sessionId] = transport;
-          
-          // Now handle the actual request through the restored transport
-          await transport.handleRequest(req, res, req.body);
-          const totalTime = Date.now() - requestStartTime;
-          console.error(`[MCP] Session restored and request handled (${totalTime}ms)`);
-          return;
-        } else if (!sessionId && isInitializeRequest(req.body)) {
+        if (sessionId) {
+          // A session id is only honoured for the user it was issued to —
+          // whether its transport is live or must be restored.
+          if (!checkSessionOwnership(sessionId, requestUserId)) {
+            console.error(`[MCP] Unknown session ${sessionId} for this user — returning 404`);
+            sendSessionNotFound(res);
+            return;
+          }
+          touchSession(sessionId);
+          // Reuse the live transport, or restore it (server restarted, new
+          // container, or idle eviction). Concurrent restores are deduped.
+          transport = await getOrRestoreTransport(sessionId, requestUserId);
+          trackActive(sessionId, res);
+        } else if (isInitializeRequest(req.body)) {
           // New initialization request
           const initStartTime = Date.now();
           console.error(`[MCP] Creating new transport for initialization`);
+          enforceUserTransportCap(requestUserId);
           transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
+            sessionIdGenerator: () => generateSessionId(requestUserId, sessionSecret),
             onsessioninitialized: (sessionId: string) => {
               const initTime = Date.now() - initStartTime;
               console.error(
@@ -1204,13 +1332,14 @@ async function main() {
               );
               transports[sessionId] = transport;
               transportLastSeen.set(sessionId, Date.now());
-              validSessionIds.add(sessionId);
+              sessionOwners.set(sessionId, { userId: requestUserId, lastSeen: Date.now() });
               void saveSessions();
             },
             onsessionclosed: (sessionId: string) => {
               console.error(`[MCP] Session closed: ${sessionId}`);
               delete transports[sessionId];
-              validSessionIds.delete(sessionId);
+              transportLastSeen.delete(sessionId);
+              sessionOwners.delete(sessionId);
               void saveSessions();
             },
           });
@@ -1218,7 +1347,7 @@ async function main() {
           // Set up onclose handler to clean up transport when closed
           transport.onclose = () => {
             const sid = transport.sessionId;
-            if (sid && transports[sid]) {
+            if (sid && transports[sid] === transport) {
               console.error(
                 `[MCP] Transport closed for session ${sid}, removing from transports map`
               );
@@ -1234,15 +1363,6 @@ async function main() {
           console.error(
             `[MCP] Server connected to transport (${connectTime}ms)`
           );
-
-          const handleStartTime = Date.now();
-          await transport.handleRequest(req, res, req.body);
-          const handleTime = Date.now() - handleStartTime;
-          const totalTime = Date.now() - requestStartTime;
-          console.error(
-            `[MCP] Request handled (${handleTime}ms, total: ${totalTime}ms)`
-          );
-          return; // Already handled
         } else {
           // Invalid request - no session ID or not initialization request
           const totalTime = Date.now() - requestStartTime;
@@ -1260,7 +1380,7 @@ async function main() {
           return;
         }
 
-        // Handle the request with existing transport
+        // Handle the request with the selected transport
         const handleStartTime = Date.now();
         await transport.handleRequest(req, res, req.body);
         const handleTime = Date.now() - handleStartTime;
@@ -1303,38 +1423,53 @@ async function main() {
         res.status(401).json({ error: "Unauthorized" });
         return;
       }
+      const requestUserId = (req.headers["x-user-id"] as string) || "legacy";
       const requestStartTime = Date.now();
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
       console.error(`[MCP] GET request received`);
       console.error(`[MCP] Session ID: ${sessionId || "none"}`);
 
-      if (!sessionId || !transports[sessionId]) {
+      try {
+        if (!sessionId) {
+          console.error(`[MCP] Missing session ID`);
+          res.status(400).send("Missing session ID");
+          return;
+        }
+        if (!checkSessionOwnership(sessionId, requestUserId)) {
+          console.error(`[MCP] GET for unknown/unowned session ${sessionId} — returning 404`);
+          sendSessionNotFound(res);
+          return;
+        }
+        touchSession(sessionId);
+        const transport = await getOrRestoreTransport(sessionId, requestUserId);
+        trackActive(sessionId, res);
+
+        const lastEventId = req.headers["last-event-id"] as string | undefined;
+        if (lastEventId) {
+          console.error(
+            `[MCP] Client reconnecting with Last-Event-ID: ${lastEventId}`
+          );
+        } else {
+          console.error(
+            `[MCP] Establishing new SSE stream for session ${sessionId}`
+          );
+        }
+
+        const handleStartTime = Date.now();
+        await transport.handleRequest(req, res);
+        const handleTime = Date.now() - handleStartTime;
         const totalTime = Date.now() - requestStartTime;
-        console.error(`[MCP] Invalid or missing session ID (${totalTime}ms)`);
-        res.status(400).send("Invalid or missing session ID");
-        return;
-      }
-
-      const lastEventId = req.headers["last-event-id"] as string | undefined;
-      if (lastEventId) {
         console.error(
-          `[MCP] Client reconnecting with Last-Event-ID: ${lastEventId}`
+          `[MCP] GET request handled (${handleTime}ms, total: ${totalTime}ms)`
         );
-      } else {
-        console.error(
-          `[MCP] Establishing new SSE stream for session ${sessionId}`
-        );
+      } catch (error) {
+        const totalTime = Date.now() - requestStartTime;
+        console.error(`[MCP] Error handling GET request (${totalTime}ms):`, error);
+        if (!res.headersSent) {
+          res.status(500).send("Error processing SSE request");
+        }
       }
-
-      const transport = transports[sessionId];
-      const handleStartTime = Date.now();
-      await transport.handleRequest(req, res);
-      const handleTime = Date.now() - handleStartTime;
-      const totalTime = Date.now() - requestStartTime;
-      console.error(
-        `[MCP] GET request handled (${handleTime}ms, total: ${totalTime}ms)`
-      );
     };
 
     app.get("/mcp", mcpGetHandler);
@@ -1352,16 +1487,30 @@ async function main() {
         res.status(401).json({ error: "Unauthorized" });
         return;
       }
+      const requestUserId = (req.headers["x-user-id"] as string) || "legacy";
       const requestStartTime = Date.now();
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
       console.error(`[MCP] DELETE request received`);
       console.error(`[MCP] Session ID: ${sessionId || "none"}`);
 
-      if (!sessionId || !transports[sessionId]) {
-        const totalTime = Date.now() - requestStartTime;
-        console.error(`[MCP] Invalid or missing session ID (${totalTime}ms)`);
-        res.status(400).send("Invalid or missing session ID");
+      if (!sessionId) {
+        console.error(`[MCP] Missing session ID`);
+        res.status(400).send("Missing session ID");
+        return;
+      }
+      if (!checkSessionOwnership(sessionId, requestUserId)) {
+        console.error(`[MCP] DELETE for unknown/unowned session ${sessionId} — returning 404`);
+        sendSessionNotFound(res);
+        return;
+      }
+      if (!transports[sessionId]) {
+        // Owned but not live (evicted / other task / restarted): just forget it.
+        console.error(`[MCP] DELETE for non-live session ${sessionId} — forgetting it`);
+        sessionOwners.delete(sessionId);
+        transportLastSeen.delete(sessionId);
+        void saveSessions();
+        res.status(200).end();
         return;
       }
 
@@ -1408,7 +1557,7 @@ async function main() {
         const session = BrowserSessionManager.getLiveSession(sessionId);
         if (session) {
           const wsProxy = createProxyMiddleware({
-            target: `http://localhost:${session.wsPort}`,
+            target: `http://127.0.0.1:${session.wsPort}`, // websockify binds 127.0.0.1 only
             ws: true,
             changeOrigin: true,
             pathRewrite: { [`^/vnc/${sessionId}/websockify`]: "/" },

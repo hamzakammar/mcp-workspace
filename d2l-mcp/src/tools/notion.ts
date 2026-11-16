@@ -16,6 +16,18 @@ import { loadWebsiteAssessmentsForCourse, upsertOutlineTasks } from '../study/sr
 import { getSourceConfig } from '../study/src/courseWebsite/sources.js';
 import { zonedWallTimeToUtcIso } from '../study/src/courseWebsite/timezone.js';
 import { hasDropboxSubmission } from './priorityGlobal.js';
+import { loadQuizAttemptSummary } from '../utils/marshal.js';
+import { DEFAULT_D2L_HOST } from '../utils/d2lHost.js';
+
+/** The current user's (allowlisted) D2L host for building links; DEFAULT_D2L_HOST on failure. */
+async function resolveUserD2LHost(): Promise<string> {
+  try {
+    const resolve = (client as { resolveHost?: () => Promise<string> }).resolveHost;
+    return typeof resolve === 'function' ? await resolve() : DEFAULT_D2L_HOST;
+  } catch {
+    return DEFAULT_D2L_HOST;
+  }
+}
 
 // ─── D2L raw types ────────────────────────────────────────────────────────────
 
@@ -210,7 +222,7 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
   };
 
   // Fetch assignments (dropbox)
-  const d2lHost = process.env.D2L_HOST || 'learn.uwaterloo.ca';
+  const d2lHost = await resolveUserD2LHost();
   try {
     const raw = (await client.getDropboxFolders(orgUnitId)) as RawAssignment[];
     const folders: RawAssignment[] = Array.isArray(raw) ? raw : [];
@@ -251,13 +263,12 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
       if (existingNames.has(quiz.Name.toLowerCase())) continue;
 
       let status: 'Not Started' | 'Submitted' | 'Graded' = 'Not Started';
-      try {
-        const attemptsRaw = (await client.getQuizAttempts(orgUnitId, parseInt((quiz as any).QuizId || (quiz as any).Id || '0'))) as
-          | { Objects: Array<{ Attempt: { AttemptNumber: number } }> }
-          | Array<{ Attempt: { AttemptNumber: number } }>;
-        const attempts = Array.isArray(attemptsRaw) ? attemptsRaw : (attemptsRaw.Objects || []);
-        if (attempts.length > 0) status = 'Submitted';
-      } catch { /* skip attempt check */ }
+      // 404 → no attempts. Any other failure leaves status 'Not Started' (Notion
+      // has no "unknown" status) but is logged by loadQuizAttemptSummary.
+      const attemptSummary = await loadQuizAttemptSummary(() =>
+        client.getQuizAttempts(orgUnitId, parseInt((quiz as any).QuizId || (quiz as any).Id || '0')),
+      );
+      if (!attemptSummary.unknown && attemptSummary.completed > 0) status = 'Submitted';
 
       const quizId = (quiz as any).QuizId || (quiz as any).Id || '0';
       mergeAssignments(courseData.assignments, {
@@ -326,7 +337,6 @@ async function fetchCourseData(orgUnitId: number, name: string, code: string): P
 
   // Fetch announcements
   try {
-    const d2lHost = process.env.D2L_HOST || 'learn.uwaterloo.ca';
     const raw = (await client.getNews(orgUnitId)) as RawNewsItem[];
     const news: RawNewsItem[] = Array.isArray(raw) ? raw : [];
     for (const item of news.slice(0, 5)) {
@@ -927,7 +937,10 @@ export async function backgroundNotionSync(userId: string): Promise<void> {
       }
 
       // Sync course pages
-      await syncCourses(notionToken, databaseId, courses);
+      const syncResult = await syncCourses(notionToken, databaseId, courses);
+      if (syncResult.failed > 0) {
+        console.error(`[NOTION] Background sync: ${syncResult.failed} of ${courses.length} course page(s) failed to sync`);
+      }
 
       // Reconcile "Due Soon" reminder rows — but ONLY on an authoritative sync.
       // Due Soon reconciliation is destructive (it archives existing generated rows
@@ -1069,9 +1082,29 @@ export const notionTools = {
           ? `No courses to sync.`
           : `Synced ${total} course page${total !== 1 ? 's' : ''} (${parts.join(', ')}).`;
 
+        // Surface per-course failures instead of reporting a clean success.
+        const failureInfo = result.failed > 0
+          ? {
+              partial: total > 0,
+              warning: `${result.failed} of ${courses.length} course page${courses.length !== 1 ? 's' : ''} failed to sync to Notion. ` +
+                `Those courses may be missing or out of date — try sync_to_notion again; if it keeps failing, check the database's permissions/properties.`,
+            }
+          : {};
+        if (result.failed > 0 && total === 0) {
+          return JSON.stringify({
+            success: false,
+            ...result,
+            ...failureInfo,
+            coursesChecked: activeCourses.length,
+            summary,
+            error: `All ${result.failed} course page${result.failed !== 1 ? 's' : ''} failed to sync to Notion.`,
+          }, null, 2);
+        }
+
         return JSON.stringify({
           success: true,
           ...result,
+          ...failureInfo,
           archived,
           upcomingTasks: upcomingCount,
           coursesChecked: activeCourses.length,

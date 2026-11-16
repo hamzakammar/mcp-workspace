@@ -3,12 +3,11 @@ import { chromium, BrowserContext } from "playwright";
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync } from "fs";
-import fs from "fs/promises";
-import os from "os";
 import { supabase } from "./utils/supabase.js";
-import { loadStorageStateFromS3, saveStorageStateToS3 } from "./utils/s3Storage.js";
+import { loadStorageStateObjectFromS3, saveStorageStateToS3 } from "./utils/s3Storage.js";
 import { decryptPassword, d2lPasswordContext } from "./utils/kms.js";
 import { logCredentialAccess } from "./utils/auditLog.js";
+import { DEFAULT_D2L_HOST, resolveAllowedD2LHost } from "./utils/d2lHost.js";
 
 const REMOTE_DEBUG = process.env.REMOTE_DEBUG === "true";
 
@@ -35,7 +34,7 @@ export async function getD2LToken(userId?: string): Promise<{ host: string; toke
     const rows = await resp.json() as Array<{ host: string; token: string; updated_at: string }>;
     if (rows.length > 0 && rows[0].token) {
       return {
-        host: rows[0].host || process.env.D2L_HOST || "learn.uwaterloo.ca",
+        host: rows[0].host || DEFAULT_D2L_HOST,
         token: rows[0].token,
         updated_at: rows[0].updated_at,
       };
@@ -62,7 +61,7 @@ export async function getD2LCredentials(userId?: string): Promise<{ host: string
           if (rows.length > 0 && rows[0].username && rows[0].password) {
             await logCredentialAccess(userId, "d2l_password", "read", "getD2LCredentials");
             return {
-              host: rows[0].host || process.env.D2L_HOST || "learn.uwaterloo.ca",
+              host: rows[0].host || DEFAULT_D2L_HOST,
               username: rows[0].username,
               password: await decryptPassword(rows[0].password, d2lPasswordContext(userId)),
             };
@@ -75,7 +74,7 @@ export async function getD2LCredentials(userId?: string): Promise<{ host: string
   }
 
   // Fall back to environment variables
-  const host = process.env.D2L_HOST || "learn.ul.ie";
+  const host = DEFAULT_D2L_HOST;
   const username = process.env.D2L_USERNAME;
   const password = process.env.D2L_PASSWORD;
 
@@ -116,7 +115,7 @@ const userValidatedInSession = new Set<string>();
  * unnecessary re-auth when D2L is temporarily unreachable.
  */
 async function validateTokenLive(token: string, host: string): Promise<boolean> {
-  const d2lHost = host || process.env.D2L_HOST || "learn.uwaterloo.ca";
+  const d2lHost = host || DEFAULT_D2L_HOST;
   try {
     const headers: Record<string, string> = {};
     try {
@@ -203,6 +202,84 @@ export async function isDuoRequired(userId: string): Promise<boolean> {
 }
 
 /**
+ * Resolve the D2L host a headless login should drive, refusing any stored host
+ * that is not on the allowlist (a tampered host would otherwise receive the
+ * user's WatIAM credentials / session cookies). Returns null when refused.
+ */
+export function resolveHeadlessLoginHost(storedHost: string | undefined | null, userId?: string): string | null {
+  const host = resolveAllowedD2LHost(storedHost || DEFAULT_D2L_HOST);
+  if (!host) {
+    console.error(`[AUTH] Refusing headless login for user ${userId ?? "default"}: stored D2L host is not allowed`);
+  }
+  return host;
+}
+
+// ─── Per-user headless-login lock ────────────────────────────────────────────
+// Shared by on-demand silent re-login (below) and the scheduled refresher
+// (jobs/sessionRefresher.ts refreshD2LSession) so at most one headless D2L
+// browser login runs per user at a time. Two concurrent logins race on the S3
+// storage state and the DB token, and each may trigger its own Duo push.
+const headlessLoginLocks = new Map<string, Promise<void>>();
+
+/**
+ * Run `fn` while holding the per-user headless-login lock. If another login for
+ * the same user is in flight, waits for it to finish first; `fn` receives
+ * `waited=true` in that case so it can re-check for a fresh token before
+ * launching another browser.
+ *
+ * `fn` gets at most `timeoutMs` (default HEADLESS_LOGIN_TIMEOUT_MS) once it holds
+ * the lock. On timeout the lock is released, the returned promise rejects, and
+ * `signal` is aborted so `fn` can close its browser (see closeBrowserOnAbort).
+ * A hung login therefore can't block a user's token requests forever.
+ */
+export const HEADLESS_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
+
+export async function withHeadlessLoginLock<T>(
+  userId: string,
+  fn: (waited: boolean, signal: AbortSignal) => Promise<T>,
+  opts: { timeoutMs?: number } = {}
+): Promise<T> {
+  const prev = headlessLoginLocks.get(userId);
+  let release!: () => void;
+  const mine = new Promise<void>((r) => { release = r; });
+  const tail = (prev ?? Promise.resolve()).then(() => mine);
+  headlessLoginLocks.set(userId, tail);
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    if (prev) await prev;
+    const timeoutMs = opts.timeoutMs ?? HEADLESS_LOGIN_TIMEOUT_MS;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        console.error(`[AUTH] Headless login for user ${userId} exceeded ${timeoutMs}ms — releasing lock`);
+        controller.abort();
+        reject(new Error("HEADLESS_LOGIN_TIMEOUT"));
+      }, timeoutMs);
+    });
+    const work = fn(!!prev, controller.signal);
+    work.catch(() => {}); // a late rejection after timeout must not be unhandled
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    release();
+    if (headlessLoginLocks.get(userId) === tail) headlessLoginLocks.delete(userId);
+  }
+}
+
+/** Best-effort: close `browser` if the lock's timeout fires while it is open. */
+export function closeBrowserOnAbort(signal: AbortSignal | undefined, browser: { close(): Promise<void> }): void {
+  if (!signal) return;
+  const close = () => { browser.close().catch(() => {}); };
+  if (signal.aborted) close();
+  else signal.addEventListener("abort", close, { once: true });
+}
+
+/** True while a headless login holds (or is queued on) the lock for this user. */
+export function isHeadlessLoginInFlight(userId: string): boolean {
+  return headlessLoginLocks.has(userId);
+}
+
+/**
  * Attempt a silent headless re-login.
  * Strategy:
  *   1. Load S3 ADFS browser state and navigate to D2L — if ADFS cookies still valid,
@@ -218,12 +295,33 @@ const silentReloginInFlight = new Map<string, Promise<string | null>>();
 function attemptSilentRelogin(userId: string): Promise<string | null> {
   const existing = silentReloginInFlight.get(userId);
   if (existing) return existing;
-  const run = attemptSilentReloginOnce(userId).finally(() => silentReloginInFlight.delete(userId));
+  const run = (async () => {
+    // Snapshot the stored token before queueing so that, if we end up waiting on
+    // another login, we can tell whether it actually produced a NEW token.
+    // (updated_at is unreliable: it is bumped by any update to the row.)
+    const before = await getD2LToken(userId).catch(() => null);
+    return withHeadlessLoginLock(userId, async (waited, signal) => {
+      if (waited) {
+        // Another login (e.g. the scheduled refresher) just ran for this user.
+        // If it stored a different token and didn't flag Duo, reuse it.
+        const fresh = await getD2LToken(userId);
+        if (fresh?.token && fresh.token !== before?.token && !(await isDuoRequired(userId))) {
+          console.error(`[AUTH] Reusing token written by concurrent login for user ${userId}`);
+          userTokenCache[userId] = { token: fresh.token, expiresAt: Date.now() + 82800000 };
+          return fresh.token;
+        }
+      }
+      return attemptSilentReloginOnce(userId, signal);
+    });
+  })()
+    // A timed-out login is a failed re-login, same as any other browser error.
+    .catch((e: any) => { console.error(`[AUTH] Silent re-login failed for user ${userId}: ${e?.message}`); return null; })
+    .finally(() => silentReloginInFlight.delete(userId));
   silentReloginInFlight.set(userId, run);
   return run;
 }
 
-async function attemptSilentReloginOnce(userId: string): Promise<string | null> {
+async function attemptSilentReloginOnce(userId: string, signal?: AbortSignal): Promise<string | null> {
   // Hard stop: if duo_required_at is already set, launching a headless browser
   // will hit the ADFS Duo wall and send another push notification. Bail immediately.
   const alreadyFlagged = await isDuoRequired(userId).catch(() => false);
@@ -235,15 +333,17 @@ async function attemptSilentReloginOnce(userId: string): Promise<string | null> 
   console.error(`[AUTH] Attempting silent re-login for user ${userId}`);
 
   const creds = await getD2LCredentials(userId);
-  const d2lHost = creds?.host || process.env.D2L_HOST || "learn.uwaterloo.ca";
+  const d2lHost = resolveHeadlessLoginHost(creds?.host, userId);
+  if (!d2lHost) return null;
   const chromiumPath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium";
   const NAV_TIMEOUT_MS = 30_000;
 
   // ── Path 1: Try S3 ADFS browser state (works for 30-90 days after a VNC login) ──
   // rejectIfLegacy: legacy unencrypted states have expired ADFS sessions and would
   // trigger a real Duo push notification in the headless browser.
-  const storageStatePath = await loadStorageStateFromS3(userId, undefined, { rejectIfLegacy: true });
-  if (storageStatePath) {
+  // Parsed in memory — decrypted state is never written to a shared temp file.
+  const storageState = await loadStorageStateObjectFromS3(userId, undefined, { rejectIfLegacy: true });
+  if (storageState) {
     console.error(`[AUTH] S3 browser state found for user ${userId}, trying headless S3-state refresh`);
     let browser;
     try {
@@ -252,7 +352,8 @@ async function attemptSilentReloginOnce(userId: string): Promise<string | null> 
         executablePath: chromiumPath,
         args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
       });
-      const context = await browser.newContext({ storageState: storageStatePath });
+      closeBrowserOnAbort(signal, browser);
+      const context = await browser.newContext({ storageState });
       const page = await context.newPage();
 
       await page.goto(`https://${d2lHost}/d2l/home`, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
@@ -275,10 +376,8 @@ async function attemptSilentReloginOnce(userId: string): Promise<string | null> 
 
         if (sessionVal && secureVal) {
           // Persist updated ADFS state back to S3
-          const tmpStatePath = join(os.tmpdir(), `silent-relogin-state-${userId}.json`);
-          await context.storageState({ path: tmpStatePath });
-          await saveStorageStateToS3(userId, tmpStatePath);
-          await fs.unlink(tmpStatePath).catch(() => {});
+          // Pass the state object directly — no plaintext temp file on disk.
+          await saveStorageStateToS3(userId, await context.storageState());
 
           const token = JSON.stringify({ d2lSessionVal: sessionVal, d2lSecureSessionVal: secureVal });
 
@@ -325,13 +424,13 @@ async function attemptSilentReloginOnce(userId: string): Promise<string | null> 
     return null;
   }
 
-  // If storageStatePath is null (legacy rejected or expired above), try loading without
+  // If storageState is null (legacy rejected or expired above), try loading without
   // restrictions: credential login needs the Duo "remember this device" cookie from the
   // state to bypass the Duo challenge, even if the ADFS session itself is expired.
-  let credStatePath = storageStatePath;
-  if (!credStatePath) {
-    credStatePath = await loadStorageStateFromS3(userId, undefined, { ignoreExpiry: true }) ?? undefined;
-    if (credStatePath) {
+  let credState = storageState;
+  if (!credState) {
+    credState = await loadStorageStateObjectFromS3(userId, undefined, { ignoreExpiry: true });
+    if (credState) {
       console.error(`[AUTH] Loaded expired/legacy S3 state for Duo cookie (credential login) for user ${userId}`);
     }
   }
@@ -343,10 +442,11 @@ async function attemptSilentReloginOnce(userId: string): Promise<string | null> 
       executablePath: chromiumPath,
       args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
     });
+    closeBrowserOnAbort(signal, browser);
     // Restore S3 storage state so the Duo "remember this device" cookie is present,
     // allowing credential fill to bypass the Duo challenge (same as VNC does).
     const context = await browser.newContext(
-      credStatePath ? { storageState: credStatePath } : {}
+      credState ? { storageState: credState } : {}
     );
     const page = await context.newPage();
 
@@ -378,7 +478,7 @@ async function attemptSilentReloginOnce(userId: string): Promise<string | null> 
 
       // UWaterloo ADFS requires full UPN format (user@uwaterloo.ca)
       const loginUsername = creds.username.includes('@') ? creds.username : `${creds.username}@uwaterloo.ca`;
-      console.error(`[AUTH] Using login username: ${loginUsername} (stored: ${creds.username})`);
+      console.error(`[AUTH] Using UPN-format login username for user ${userId}`);
       await page.fill('input[type="text"], input[name="UserName"], input[name="username"]', loginUsername).catch(() => {});
 
       // If password field is already visible (single-page ADFS form), skip the "Next" step.
@@ -463,10 +563,8 @@ async function attemptSilentReloginOnce(userId: string): Promise<string | null> 
 
       // Save browser state to S3 for future refreshes
       try {
-        const tmpStatePath = join(os.tmpdir(), `silent-relogin-state-${userId}.json`);
-        await context.storageState({ path: tmpStatePath });
-        await saveStorageStateToS3(userId, tmpStatePath);
-        await fs.unlink(tmpStatePath).catch(() => {});
+        // Pass the state object directly — no plaintext temp file on disk.
+        await saveStorageStateToS3(userId, await context.storageState());
         console.error(`[AUTH] Saved browser storage state to S3 for user ${userId}`);
       } catch (s3Err: any) {
         console.error(`[AUTH] Failed to save browser state to S3 for user ${userId}: ${s3Err?.message}`);
@@ -512,10 +610,8 @@ async function attemptSilentReloginOnce(userId: string): Promise<string | null> 
 
     // Save browser state to S3 for future refreshes
     try {
-      const tmpStatePath = join(os.tmpdir(), `silent-relogin-state-${userId}.json`);
-      await context.storageState({ path: tmpStatePath });
-      await saveStorageStateToS3(userId, tmpStatePath);
-      await fs.unlink(tmpStatePath).catch(() => {});
+      // Pass the state object directly — no plaintext temp file on disk.
+      await saveStorageStateToS3(userId, await context.storageState());
       console.error(`[AUTH] Saved browser storage state to S3 for user ${userId}`);
     } catch (s3Err: any) {
       console.error(`[AUTH] Failed to save browser state to S3 for user ${userId}: ${s3Err?.message}`);
@@ -663,7 +759,8 @@ export async function getToken(userId?: string): Promise<string> {
 
   // Load credentials
   const credentials = await getD2LCredentials(userId);
-  const D2L_HOST = credentials?.host || process.env.D2L_HOST || "learn.ul.ie";
+  const D2L_HOST = resolveHeadlessLoginHost(credentials?.host, userId);
+  if (!D2L_HOST) throw new Error("D2L host is not allowed");
   const D2L_USERNAME = credentials?.username || process.env.D2L_USERNAME;
   const D2L_PASSWORD = credentials?.password || process.env.D2L_PASSWORD;
   const HOME_URL = `https://${D2L_HOST}/d2l/home`;
@@ -1387,7 +1484,8 @@ export function getTokenExpiry(userId?: string): number {
 export async function getAuthenticatedContext(userId?: string): Promise<BrowserContext> {
   // Load credentials
   const credentials = await getD2LCredentials(userId);
-  const D2L_HOST = credentials?.host || process.env.D2L_HOST || "learn.ul.ie";
+  const D2L_HOST = resolveHeadlessLoginHost(credentials?.host, userId);
+  if (!D2L_HOST) throw new Error("D2L host is not allowed");
   const username = credentials?.username || process.env.D2L_USERNAME;
   const password = credentials?.password || process.env.D2L_PASSWORD;
   const HOME_URL = `https://${D2L_HOST}/d2l/home`;
@@ -1406,10 +1504,16 @@ export async function getAuthenticatedContext(userId?: string): Promise<BrowserC
     viewport: { width: 1280, height: 720 },
   });
 
-  const page = await context.newPage();
-
-  // Go to home to check auth status
-  await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
+  let page;
+  try {
+    page = await context.newPage();
+    // Go to home to check auth status
+    await page.goto(HOME_URL, { waitUntil: "domcontentloaded" });
+  } catch (err) {
+    // Don't leak the persistent Chromium (and its profile lock) on navigation failure.
+    await context.close().catch(() => {});
+    throw err;
+  }
 
   let currentUrl = page.url();
   if (isLoginPage(currentUrl)) {

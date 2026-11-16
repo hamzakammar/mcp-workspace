@@ -132,7 +132,14 @@ describe('dueClause', () => {
 describe('hasDropboxSubmission', () => {
   it('reads both D2L response shapes', () => {
     expect(hasDropboxSubmission([])).toBe(false);
-    expect(hasDropboxSubmission([{ Id: 1 }])).toBe(true);
+    // mysubmissions returns EntityDropbox entries; an entry alone (Unsubmitted /
+    // Draft, no files) is not a submission.
+    expect(hasDropboxSubmission([{ Id: 1 }])).toBe(false);
+    expect(hasDropboxSubmission([{ Status: 0, Submissions: [] }])).toBe(false);
+    expect(hasDropboxSubmission([{ Status: 2, Submissions: [] }])).toBe(false);
+    expect(hasDropboxSubmission([{ Status: 1, Submissions: [] }])).toBe(true);
+    expect(hasDropboxSubmission([{ Status: 3 }])).toBe(true);
+    expect(hasDropboxSubmission([{ Status: 0, Submissions: [{ Id: 9 }] }])).toBe(true);
     expect(hasDropboxSubmission({ HasSubmission: true })).toBe(true);
     expect(hasDropboxSubmission({ Submissions: [{}] })).toBe(true);
     expect(hasDropboxSubmission({ Submissions: [] })).toBe(false);

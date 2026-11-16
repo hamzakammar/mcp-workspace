@@ -237,6 +237,27 @@ describe("dynamic client registration", () => {
     expect(JSON.parse(r.text).error).toBe("invalid_redirect_uri");
   });
 
+  it.each([
+    "javascript:alert(1)",
+    "data:text/html,hi",
+    "file:///etc/passwd",
+    "vbscript:msgbox(1)",
+    "blob:https://horizon.test/abc",
+    "about:blank",
+  ])("rejects dangerous redirect scheme %s", async (uri) => {
+    const r = await req("POST", "/register", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris: [uri] }),
+    });
+    expect(r.status).toBe(400);
+    expect(JSON.parse(r.text).error).toBe("invalid_redirect_uri");
+  });
+
+  it("still accepts custom app schemes", async () => {
+    const c = await registerClient(["cursor://anysphere.cursor-retrieval/oauth/callback", "com.example.app:/cb"]);
+    expect(c.redirect_uris).toHaveLength(2);
+  });
+
   it("rejects a missing redirect_uris array", async () => {
     const r = await req("POST", "/register", {
       headers: { "content-type": "application/json" },
@@ -275,6 +296,68 @@ describe("authorization endpoint", () => {
     const r = await req("GET", `/authorize?${qs.toString()}`);
     expect(r.status).toBe(400);
     expect(r.headers.location).toBeUndefined();
+  });
+
+  it("shows the redirect destination host on the consent page", async () => {
+    const c = await registerClient(["https://app.example.com/oauth/cb?x=1"]);
+    const { challenge } = pkce();
+    const qs = new URLSearchParams({
+      response_type: "code",
+      client_id: c.client_id,
+      redirect_uri: c.redirect_uris[0],
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+    const page = await req("GET", `/authorize?${qs.toString()}`);
+    expect(page.status).toBe(200);
+    expect(page.text).toContain('<span class="dest">app.example.com</span>');
+    expect(page.headers["content-security-policy"]).toContain("frame-ancestors 'none'");
+    expect(page.headers["x-frame-options"]).toBe("DENY");
+  });
+
+  it("refuses a previously registered javascript: redirect URI", async () => {
+    const clientId = "hzn_client_legacy_" + randomBytes(4).toString("hex");
+    await store.createClient({
+      client_id: clientId,
+      client_secret_hash: null,
+      client_name: "legacy",
+      redirect_uris: ["javascript:alert(1)"],
+      grant_types: ["authorization_code"],
+      response_types: ["code"],
+      scope: "horizon:mcp",
+      token_endpoint_auth_method: "none",
+    });
+    // The fake stores JSON strings; getClient parses them back.
+    const { challenge } = pkce();
+    const qs = new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: "javascript:alert(1)",
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+    const r = await req("GET", `/authorize?${qs.toString()}`);
+    expect(r.status).toBe(400);
+    expect(r.headers.location).toBeUndefined();
+  });
+
+  it("returns 500 instead of hanging when the client lookup throws", async () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const orig = db.oauth_clients;
+    // Make the select blow up by replacing the table with a throwing proxy.
+    (db as any).oauth_clients = new Proxy([], { get() { throw new Error("db down"); } });
+    try {
+      const r = await req(
+        "POST",
+        "/token",
+        form({ grant_type: "refresh_token", refresh_token: "x", client_id: "whatever" })
+      );
+      expect(r.status).toBe(500);
+      expect(JSON.parse(r.text).error).toBe("server_error");
+    } finally {
+      db.oauth_clients = orig;
+      spy.mockRestore();
+    }
   });
 
   it("rejects bad credentials on the consent POST", async () => {
@@ -397,6 +480,184 @@ describe("refresh token rotation + revocation", () => {
     );
     expect(reuse.status).toBe(400);
     expect(JSON.parse(reuse.text).error).toBe("invalid_grant");
+  });
+
+  it("allows exactly one of two concurrent refreshes with the same token", async () => {
+    const c = await registerClient();
+    const { verifier, challenge } = pkce();
+    const code = await getAuthCode(c.client_id, c.redirect_uris[0], challenge, "alice@horizon.test");
+    const first = JSON.parse((await exchangeCode(c.client_id, code, c.redirect_uris[0], verifier)).text);
+
+    const body = form({ grant_type: "refresh_token", refresh_token: first.refresh_token, client_id: c.client_id });
+    const results = await Promise.all([req("POST", "/token", body), req("POST", "/token", body)]);
+    const statuses = results.map((r) => r.status).sort();
+    expect(statuses).toEqual([200, 400]);
+    expect(JSON.parse(results.find((r) => r.status === 400)!.text).error).toBe("invalid_grant");
+
+    // Benign double-refresh: the winner's tokens must remain valid.
+    const win = JSON.parse(results.find((r) => r.status === 200)!.text);
+    expect((await store.getAccessToken(sha256hex(win.access_token)))?.revoked).toBe(false);
+    expect((await store.getRefreshToken(sha256hex(win.refresh_token)))?.revoked).toBe(false);
+    const next = await req(
+      "POST",
+      "/token",
+      form({ grant_type: "refresh_token", refresh_token: win.refresh_token, client_id: c.client_id })
+    );
+    expect(next.status).toBe(200);
+  });
+
+  it("refuses a replay inside the grace window without revoking the family", async () => {
+    const c = await registerClient();
+    const { verifier, challenge } = pkce();
+    const code = await getAuthCode(c.client_id, c.redirect_uris[0], challenge, "alice@horizon.test");
+    const first = JSON.parse((await exchangeCode(c.client_id, code, c.redirect_uris[0], verifier)).text);
+    const body = form({ grant_type: "refresh_token", refresh_token: first.refresh_token, client_id: c.client_id });
+
+    const rot = JSON.parse((await req("POST", "/token", body)).text);
+    const replay = await req("POST", "/token", body);
+    expect(replay.status).toBe(400);
+    expect(JSON.parse(replay.text).error).toBe("invalid_grant");
+    expect((await store.getRefreshToken(sha256hex(rot.refresh_token)))?.revoked).toBe(false);
+    expect((await store.getAccessToken(sha256hex(rot.access_token)))?.revoked).toBe(false);
+  });
+
+  it("serializes refresh-token consumption at the store level", async () => {
+    const hash = sha256hex("hzn_rt_race_" + randomBytes(8).toString("hex"));
+    await store.saveRefreshToken({
+      token_hash: hash,
+      client_id: "c-race",
+      user_id: USERS["alice@horizon.test"],
+      scope: "horizon:mcp",
+      resource: RESOURCE,
+      rotated_from: null,
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const [a, b] = await Promise.all([store.consumeRefreshToken(hash), store.consumeRefreshToken(hash)]);
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    expect((await store.getRefreshToken(hash))?.revoked).toBe(true);
+  });
+
+  it("revokes the whole token family when a rotated refresh token is replayed after the grace window", async () => {
+    const c = await registerClient();
+    const { verifier, challenge } = pkce();
+    const code = await getAuthCode(c.client_id, c.redirect_uris[0], challenge, "alice@horizon.test");
+    const first = JSON.parse((await exchangeCode(c.client_id, code, c.redirect_uris[0], verifier)).text);
+
+    const rot = JSON.parse(
+      (
+        await req(
+          "POST",
+          "/token",
+          form({ grant_type: "refresh_token", refresh_token: first.refresh_token, client_id: c.client_id })
+        )
+      ).text
+    );
+    // Move the rotation outside the grace window, then replay the old token.
+    const child = db.oauth_refresh_tokens.find((r) => r.token_hash === sha256hex(rot.refresh_token));
+    child.created_at = new Date(Date.now() - 60_000).toISOString();
+    const replay = await req(
+      "POST",
+      "/token",
+      form({ grant_type: "refresh_token", refresh_token: first.refresh_token, client_id: c.client_id })
+    );
+    expect(replay.status).toBe(400);
+
+    // The descendant tokens are now revoked too.
+    expect((await store.getRefreshToken(sha256hex(rot.refresh_token)))?.revoked).toBe(true);
+    expect((await store.getAccessToken(sha256hex(rot.access_token)))?.revoked).toBe(true);
+    const again = await req(
+      "POST",
+      "/token",
+      form({ grant_type: "refresh_token", refresh_token: rot.refresh_token, client_id: c.client_id })
+    );
+    expect(again.status).toBe(400);
+  });
+
+  it("does not let another client revoke a token (RFC 7009: 200, no-op)", async () => {
+    const owner = await registerClient();
+    const other = await registerClient();
+    const { verifier, challenge } = pkce();
+    const code = await getAuthCode(owner.client_id, owner.redirect_uris[0], challenge, "alice@horizon.test");
+    const tok = JSON.parse((await exchangeCode(owner.client_id, code, owner.redirect_uris[0], verifier)).text);
+
+    const r1 = await req("POST", "/revoke", form({ token: tok.access_token, client_id: other.client_id }));
+    expect(r1.status).toBe(200);
+    expect((await store.getAccessToken(sha256hex(tok.access_token)))?.revoked).toBe(false);
+
+    const r2 = await req(
+      "POST",
+      "/revoke",
+      form({ token: tok.refresh_token, token_type_hint: "refresh_token", client_id: other.client_id })
+    );
+    expect(r2.status).toBe(200);
+    expect((await store.getRefreshToken(sha256hex(tok.refresh_token)))?.revoked).toBe(false);
+  });
+
+  it("revoking a refresh token also revokes the client's access tokens for that user", async () => {
+    const c = await registerClient();
+    const { verifier, challenge } = pkce();
+    const code = await getAuthCode(c.client_id, c.redirect_uris[0], challenge, "alice@horizon.test");
+    const tok = JSON.parse((await exchangeCode(c.client_id, code, c.redirect_uris[0], verifier)).text);
+
+    const rev = await req(
+      "POST",
+      "/revoke",
+      form({ token: tok.refresh_token, token_type_hint: "refresh_token", client_id: c.client_id })
+    );
+    expect(rev.status).toBe(200);
+    expect((await store.getRefreshToken(sha256hex(tok.refresh_token)))?.revoked).toBe(true);
+    expect((await store.getAccessToken(sha256hex(tok.access_token)))?.revoked).toBe(true);
+  });
+
+  it("rolls back refresh-token consumption when issuing the new pair fails", async () => {
+    const c = await registerClient();
+    const { verifier, challenge } = pkce();
+    const code = await getAuthCode(c.client_id, c.redirect_uris[0], challenge, "alice@horizon.test");
+    const first = JSON.parse((await exchangeCode(c.client_id, code, c.redirect_uris[0], verifier)).text);
+    const body = form({ grant_type: "refresh_token", refresh_token: first.refresh_token, client_id: c.client_id });
+
+    const accessBefore = db.oauth_access_tokens.length;
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const arr = db.oauth_refresh_tokens;
+    const origPush = arr.push;
+    arr.push = function () {
+      arr.push = origPush;
+      throw new Error("db down");
+    } as any;
+    try {
+      const failed = await req("POST", "/token", body);
+      expect(failed.status).toBe(500);
+    } finally {
+      arr.push = origPush;
+      spy.mockRestore();
+    }
+    // Old refresh token is usable again; the orphaned access token is revoked.
+    expect((await store.getRefreshToken(sha256hex(first.refresh_token)))?.revoked).toBe(false);
+    const orphans = db.oauth_access_tokens.slice(accessBefore);
+    expect(orphans.length).toBe(1);
+    expect(orphans[0].revoked).toBe(true);
+
+    const retry = await req("POST", "/token", body);
+    expect(retry.status).toBe(200);
+  });
+
+  it("returns 503 from /revoke when the client lookup fails (no possession-only fallback)", async () => {
+    const c = await registerClient();
+    const { verifier, challenge } = pkce();
+    const code = await getAuthCode(c.client_id, c.redirect_uris[0], challenge, "alice@horizon.test");
+    const tok = JSON.parse((await exchangeCode(c.client_id, code, c.redirect_uris[0], verifier)).text);
+
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const orig = db.oauth_clients;
+    (db as any).oauth_clients = new Proxy([], { get() { throw new Error("db down"); } });
+    try {
+      const r = await req("POST", "/revoke", form({ token: tok.access_token, client_id: c.client_id }));
+      expect(r.status).toBe(503);
+    } finally {
+      db.oauth_clients = orig;
+      spy.mockRestore();
+    }
+    expect((await store.getAccessToken(sha256hex(tok.access_token)))?.revoked).toBe(false);
   });
 
   it("revokes an access token via /revoke", async () => {
